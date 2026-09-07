@@ -55,6 +55,23 @@ configuration serialisation, and are redacted from representations. Supply
 credentials through host-protected facilities in production. Never commit a
 `.env` file or credentials.
 
+## Logging
+
+`syntra_build.infrastructure.logging.configure_logging` configures the
+`syntra_build` logger hierarchy from the validated `ApplicationConfig`. The
+production default emits one JSON object per line to standard error for
+systemd/journald collection; `logging.level` selects the standard minimum
+severity and `logging.structured = false` enables human-readable development
+output.
+
+Operations can establish task-local correlation, project, milestone, job, and
+gate identifiers with `logging_context`. Context is inherited by nested code,
+isolated between asynchronous tasks, and restored when its scope exits. Log
+calls should provide a stable `event` through `extra` and place structured
+details in `metadata`. Sensitive keys and M1 secret wrappers are redacted, but
+callers must still never put credentials, authorization values, private keys,
+environment dumps, or unrestricted provider payloads in logs.
+
 ## Project documentation
 
 - [Implementation specification](SPEC.md)
