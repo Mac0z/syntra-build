@@ -37,6 +37,24 @@ These checks require no network access or credentials after development
 dependencies have been installed. Never commit credentials or local `.env`
 files.
 
+## Configuration
+
+The application-facing configuration entry point is
+`syntra_build.infrastructure.config.load_config`. It returns one immutable,
+validated configuration object with groups for filesystem and database paths,
+external integrations, scheduling, retries, logging, metrics, backups, and
+resource thresholds. Production defaults use `/opt/syntra-build`,
+`/etc/syntra-build`, `/var/lib/syntra-build`, and `/var/log/syntra-build`;
+tests and development tools should inject temporary absolute roots instead.
+
+Configuration may be supplied explicitly or through the documented
+`SYNTRA_*` environment variables handled by the loader. Explicit values take
+precedence. Credentials are accepted separately as `SecretInputs` (or from
+the dedicated credential environment variables), are excluded from safe
+configuration serialisation, and are redacted from representations. Supply
+credentials through host-protected facilities in production. Never commit a
+`.env` file or credentials.
+
 ## Project documentation
 
 - [Implementation specification](SPEC.md)
