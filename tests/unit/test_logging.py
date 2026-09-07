@@ -25,6 +25,7 @@ from syntra_build.infrastructure.logging import (
     logging_context,
     new_correlation_id,
 )
+from syntra_build.infrastructure.logging.setup import JsonFormatter
 
 
 def config(
@@ -175,17 +176,24 @@ def test_positional_secret_wrapper_is_redacted_before_interpolation(
     assert emitted(stream)[0]["message"] == f"value={REDACTED}"
 
 
-def test_message_formatting_failure_is_safe(tmp_path: Path) -> None:
-    stream = StringIO()
-    configure_logging(config(tmp_path), stream=stream)
-
-    logging.getLogger("syntra_build.arguments").info(
-        "missing=%(missing)s",
-        {"ordinary": "visible"},
-        extra={"event": "formatting_failed"},
+def test_message_formatting_failure_is_safe() -> None:
+    record = logging.LogRecord(
+        name="syntra_build.arguments",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=0,
+        msg="missing=%(missing)s",
+        args=({"ordinary": "visible"},),
+        exc_info=None,
     )
+    record.event = "formatting_failed"
 
-    assert "[FORMATTING_ERROR]" in str(emitted(stream)[0]["message"])
+    output = JsonFormatter().format(record)
+    structured = json.loads(output)
+
+    assert structured["event"] == "formatting_failed"
+    assert "[FORMATTING_ERROR]" in structured["message"]
+    assert "visible" not in output
 
 
 def test_unsupported_positional_argument_fails_closed(tmp_path: Path) -> None:
