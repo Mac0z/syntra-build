@@ -55,6 +55,22 @@ configuration serialisation, and are redacted from representations. Supply
 credentials through host-protected facilities in production. Never commit a
 `.env` file or credentials.
 
+## Logging
+
+Syntra Build uses standard-library logging with JSON-lines structured output by
+default. Configure the application logger once with
+`syntra_build.infrastructure.logging.configure_logging`, passing the validated
+`ApplicationConfig` (or its `LoggingConfig`). The `logging.level` setting
+accepts `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`; production defaults
+to `INFO` on stderr for systemd/journald capture.
+
+Use `logging_context(...)` to scope correlation, project, milestone, job, and
+gate identifiers. Context is propagated and isolated with `contextvars`,
+including across asynchronous tasks. Structured metadata is converted through
+a bounded safe serializer, and secret-bearing keys and M1 secret wrappers are
+redacted. Credentials and raw sensitive provider or message payloads must never
+be written to logs.
+
 ## Project documentation
 
 - [Implementation specification](SPEC.md)
