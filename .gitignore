@@ -1,0 +1,38 @@
+# Virtual environments and local environment files
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Python caches and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test, type-check, lint, and coverage caches/output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# IDE and editor noise
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating-system noise
+.DS_Store
+Thumbs.db

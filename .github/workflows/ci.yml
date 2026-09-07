@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install development dependencies
+        run: python -m pip install -e '.[dev]'
+
+      - name: Run unit tests
+        run: python -m pytest
+
+      - name: Run lint checks
+        run: ruff check .
+
+      - name: Validate formatting
+        run: ruff format --check .
+
+      - name: Run static type checks
+        run: python -m mypy
