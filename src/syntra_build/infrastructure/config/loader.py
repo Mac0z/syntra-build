@@ -116,6 +116,11 @@ def load_config(
 ) -> ApplicationConfig:
     """Load one validated config; explicit values take precedence over environment."""
     source = values or {}
+    if "secrets" in source:
+        raise ConfigurationError(
+            "secrets must be supplied separately through SecretInputs or dedicated "
+            "secret environment variables"
+        )
     env = os.environ if environ is None else environ
     fs = _group(source, "filesystem")
     defaults = FilesystemConfig()
@@ -173,30 +178,11 @@ def load_config(
         ),
     )
 
-    secret_group = _group(source, "secrets")
     loaded_secrets = secrets or SecretInputs(
-        telegram_bot_token=_secret(
-            _pick(
-                secret_group, "telegram_bot_token", env, "SYNTRA_TELEGRAM_TOKEN", None
-            )
-        ),
-        architect_api_key=_secret(
-            _pick(
-                secret_group, "architect_api_key", env, "SYNTRA_ARCHITECT_API_KEY", None
-            )
-        ),
-        codex_provider_credential=_secret(
-            _pick(
-                secret_group,
-                "codex_provider_credential",
-                env,
-                "SYNTRA_CODEX_CREDENTIAL",
-                None,
-            )
-        ),
-        github_token=_secret(
-            _pick(secret_group, "github_token", env, "SYNTRA_GITHUB_TOKEN", None)
-        ),
+        telegram_bot_token=_secret(env.get("SYNTRA_TELEGRAM_TOKEN")),
+        architect_api_key=_secret(env.get("SYNTRA_ARCHITECT_API_KEY")),
+        codex_provider_credential=_secret(env.get("SYNTRA_CODEX_CREDENTIAL")),
+        github_token=_secret(env.get("SYNTRA_GITHUB_TOKEN")),
     )
     database = _group(source, "database")
     telegram = _group(source, "telegram")

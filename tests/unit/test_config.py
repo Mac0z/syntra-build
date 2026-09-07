@@ -139,6 +139,40 @@ def test_safe_inspection_excludes_synthetic_secrets(tmp_path: Path) -> None:
     assert "secrets" not in config.safe_dict()
 
 
+def test_ordinary_configuration_rejects_secrets(tmp_path: Path) -> None:
+    values = development_paths(tmp_path)
+    values["secrets"] = {"github_token": "synthetic-secret"}
+
+    with pytest.raises(ConfigurationError, match="secrets must be supplied separately"):
+        load_config(values, environ={})
+
+
+def test_explicit_secret_inputs_satisfy_enabled_integration(tmp_path: Path) -> None:
+    values = development_paths(tmp_path)
+    values["github"] = {"enabled": True, "owner": "Mac0z"}
+    token = SecretValue("synthetic-explicit-github-token")
+
+    config = load_config(
+        values,
+        environ={"SYNTRA_GITHUB_TOKEN": "ignored-environment-token"},
+        secrets=SecretInputs(github_token=token),
+    )
+
+    assert config.secrets.github_token is token
+
+
+def test_environment_secret_satisfies_enabled_integration(tmp_path: Path) -> None:
+    values = development_paths(tmp_path)
+    values["github"] = {"enabled": True, "owner": "Mac0z"}
+
+    config = load_config(
+        values,
+        environ={"SYNTRA_GITHUB_TOKEN": "synthetic-environment-github-token"},
+    )
+
+    assert config.secrets.github_token is not None
+
+
 def test_explicit_values_override_environment_deterministically(tmp_path: Path) -> None:
     values = development_paths(tmp_path)
     values["scheduler"] = {"codex_concurrency": 3}
