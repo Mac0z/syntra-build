@@ -18,6 +18,7 @@ from syntra_build.infrastructure.config import (
     load_config,
 )
 from syntra_build.infrastructure.logging import (
+    MAX_DEPTH_MARKER,
     REDACTED,
     configure_logging,
     current_logging_context,
@@ -135,6 +136,103 @@ def test_sensitive_keys_are_redacted_from_final_output(
     assert emitted(stream)[0]["metadata"] == {key: REDACTED, "count": 2}
 
 
+@pytest.mark.parametrize("sensitive_key", ["Authorization", "API_KEY", "GitHub_Token"])
+def test_formatted_mapping_arguments_are_redacted_before_interpolation(
+    tmp_path: Path, sensitive_key: str
+) -> None:
+    secret = f"synthetic-{sensitive_key}-secret"
+    stream = StringIO()
+    configure_logging(config(tmp_path), stream=stream)
+
+    logging.getLogger("syntra_build.arguments").info(
+        f"{sensitive_key}=%({sensitive_key})s ordinary=%(ordinary)s",
+        {sensitive_key: secret, "ordinary": "visible"},
+        extra={"event": "argument_redaction"},
+    )
+
+    output = stream.getvalue()
+    message = emitted(stream)[0]["message"]
+    assert secret not in output
+    assert REDACTED in str(message)
+    assert "ordinary=visible" in str(message)
+
+
+def test_positional_secret_wrapper_is_redacted_before_interpolation(
+    tmp_path: Path,
+) -> None:
+    secret = "synthetic-positional-secret"
+    stream = StringIO()
+    configure_logging(config(tmp_path), stream=stream)
+
+    logging.getLogger("syntra_build.arguments").info(
+        "value=%s",
+        SecretValue(secret),
+        extra={"event": "positional_redaction"},
+    )
+
+    output = stream.getvalue()
+    assert secret not in output
+    assert emitted(stream)[0]["message"] == f"value={REDACTED}"
+
+
+def test_message_formatting_failure_is_safe(tmp_path: Path) -> None:
+    stream = StringIO()
+    configure_logging(config(tmp_path), stream=stream)
+
+    logging.getLogger("syntra_build.arguments").info(
+        "missing=%(missing)s",
+        {"ordinary": "visible"},
+        extra={"event": "formatting_failed"},
+    )
+
+    assert "[FORMATTING_ERROR]" in str(emitted(stream)[0]["message"])
+
+
+def test_unsupported_positional_argument_fails_closed(tmp_path: Path) -> None:
+    class UnsafeObject:
+        def __str__(self) -> str:
+            return "synthetic-object-internal-secret"
+
+    stream = StringIO()
+    configure_logging(config(tmp_path), stream=stream)
+
+    logging.getLogger("syntra_build.arguments").info(
+        "value=%s", UnsafeObject(), extra={"event": "unsupported_argument"}
+    )
+
+    output = stream.getvalue()
+    assert "synthetic-object-internal-secret" not in output
+    assert "[UNSERIALIZABLE:UnsafeObject]" in output
+
+
+def test_non_assignment_secret_words_remain_useful(tmp_path: Path) -> None:
+    stream = StringIO()
+    configure_logging(config(tmp_path), stream=stream)
+
+    logging.getLogger("syntra_build.arguments").info(
+        "token validation failed", extra={"event": "validation_failed"}
+    )
+
+    assert emitted(stream)[0]["message"] == "token validation failed"
+
+
+def test_direct_diagnostic_message_and_default_event_are_sanitised(
+    tmp_path: Path,
+) -> None:
+    stream = StringIO()
+    configure_logging(config(tmp_path), stream=stream)
+
+    logging.getLogger("syntra_build.arguments").warning(
+        "password=synthetic-direct-secret"
+    )
+
+    output = stream.getvalue()
+    record = emitted(stream)[0]
+    assert "synthetic-direct-secret" not in output
+    assert REDACTED in str(record["message"])
+    assert REDACTED in str(record["event"])
+
+
 def test_secret_wrappers_and_supported_values_are_safe(tmp_path: Path) -> None:
     class Result(Enum):
         OK = "ok"
@@ -191,6 +289,54 @@ def test_exception_logging_has_identity_context_and_redacted_metadata(
     assert record["correlation_id"] == "error-correlation"
     assert record["error"] == {"type": "ValueError", "message": "useful failure"}
     assert "ValueError: useful failure" in str(record["exception"])
+
+
+@pytest.mark.parametrize(
+    "exception_message",
+    [
+        "token=synthetic-exception-secret",
+        "Authorization: Bearer synthetic-authorization-secret",
+    ],
+)
+def test_exception_diagnostic_text_redacts_secret_values(
+    tmp_path: Path, exception_message: str
+) -> None:
+    stream = StringIO()
+    configure_logging(config(tmp_path), stream=stream)
+    logger = logging.getLogger("syntra_build.errors")
+
+    with logging_context(correlation_id="sanitised-error"):
+        try:
+            raise ValueError(exception_message)
+        except ValueError:
+            logger.exception(
+                "Operation failed",
+                extra={"event": "sanitised_exception"},
+            )
+
+    output = stream.getvalue()
+    record = emitted(stream)[0]
+    assert "synthetic-exception-secret" not in output
+    assert "synthetic-authorization-secret" not in output
+    assert REDACTED in output
+    assert record["event"] == "sanitised_exception"
+    assert record["correlation_id"] == "sanitised-error"
+    assert isinstance(record["error"], dict)
+    assert record["error"]["type"] == "ValueError"
+
+
+def test_deeply_nested_metadata_stops_at_a_safe_depth(tmp_path: Path) -> None:
+    nested: dict[str, object] = {"ordinary": "visible"}
+    for _ in range(20):
+        nested = {"child": nested}
+    stream = StringIO()
+    configure_logging(config(tmp_path), stream=stream)
+
+    logging.getLogger("syntra_build.depth").info(
+        "deep metadata", extra={"event": "depth_test", "metadata": nested}
+    )
+
+    assert MAX_DEPTH_MARKER in stream.getvalue()
 
 
 def test_level_is_honoured_and_reconfiguration_does_not_duplicate(

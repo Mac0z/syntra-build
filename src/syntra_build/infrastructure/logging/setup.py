@@ -12,7 +12,11 @@ from typing import Final
 
 from syntra_build.infrastructure.config import ApplicationConfig
 from syntra_build.infrastructure.logging.context import current_logging_context
-from syntra_build.infrastructure.logging.redaction import safe_log_value
+from syntra_build.infrastructure.logging.redaction import (
+    safe_format_message,
+    safe_log_value,
+    sanitize_diagnostic_text,
+)
 
 LOGGER_NAMESPACE: Final = "syntra_build"
 _HANDLER_MARKER = "_syntra_build_handler"
@@ -23,8 +27,8 @@ _STANDARD_RECORD_FIELDS = frozenset(logging.makeLogRecord({}).__dict__) | {
 
 
 def _record_data(record: logging.LogRecord) -> dict[str, object]:
-    message = safe_log_value(record.getMessage())
-    event = safe_log_value(getattr(record, "event", record.msg))
+    message = safe_format_message(record.msg, record.args)
+    event = safe_format_message(getattr(record, "event", record.msg), ())
     data: dict[str, object] = {
         "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(),
         "level": record.levelname,
@@ -56,9 +60,13 @@ def _record_data(record: logging.LogRecord) -> dict[str, object]:
 
     if record.exc_info:
         error_type = record.exc_info[0].__name__ if record.exc_info[0] else "Exception"
-        error_message = str(record.exc_info[1]) if record.exc_info[1] else ""
+        error_message = (
+            sanitize_diagnostic_text(str(record.exc_info[1]))
+            if record.exc_info[1]
+            else ""
+        )
         data["error"] = safe_log_value({"type": error_type, "message": error_message})
-        data["exception"] = safe_log_value(self_format_exception(record))
+        data["exception"] = sanitize_diagnostic_text(self_format_exception(record))
     return data
 
 
