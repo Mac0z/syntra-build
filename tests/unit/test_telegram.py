@@ -13,6 +13,7 @@ from syntra_build.adapters.telegram import (
     HTTPResponse,
     TelegramAPIError,
     TelegramClient,
+    TelegramGateNotifier,
     TelegramInboundMessage,
     TelegramProtocolError,
     TelegramTransportError,
@@ -230,6 +231,33 @@ def test_send_text_posts_optional_fields_and_normalises_result(tmp_path: Path) -
         "reply_to_message_id": ["8"],
     }
     assert timeout == 10.0
+
+
+def test_gate_notifier_uses_existing_bounded_gateway(tmp_path: Path) -> None:
+    observed: list[tuple[dict[str, list[str]], float]] = []
+
+    def transport(request: Request, timeout: float) -> HTTPResponse:
+        observed.append((request_parameters(request), timeout))
+        return response({"message_id": 92, "chat": {"id": 300}})
+
+    notifier = TelegramGateNotifier(
+        client(tmp_path, transport),
+        chat_id=300,
+        thread_id=7,
+        reply_to_message_id=8,
+    )
+    assert notifier.send("gate notification") == "92"
+    assert observed == [
+        (
+            {
+                "chat_id": ["300"],
+                "text": ["gate notification"],
+                "message_thread_id": ["7"],
+                "reply_to_message_id": ["8"],
+            },
+            10.0,
+        )
+    ]
 
 
 def test_lifecycle_logs_exclude_text_and_token(

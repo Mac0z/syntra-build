@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
+from syntra_build.application.commands.models import Command, CommandType
 from syntra_build.domain.gate_state_machine import GateTransitionRequest
 from syntra_build.domain.gates import (
     DesignApprovalResponse,
@@ -23,7 +24,9 @@ from syntra_build.domain.milestones import MilestoneState
 from syntra_build.domain.projects import ProjectState
 from syntra_build.infrastructure.persistence.errors import (
     ClosedGateError,
+    DuplicateGateResponseError,
     GateMilestoneProjectMismatchError,
+    GateNotFoundError,
     PersistenceError,
 )
 from syntra_build.infrastructure.persistence.gates import SQLiteHumanGateRepository
@@ -152,6 +155,8 @@ class HumanGateService:
         response_text: str | None,
         responded_by: str,
         responded_at: datetime,
+        correlation_id: str | None = None,
+        source_reference: str | None = None,
     ) -> HumanGate:
         if responded_by not in self._authorised:
             raise PermissionError("responder is not authorised")
@@ -190,7 +195,8 @@ class HumanGateService:
                 responded_at,
                 "HUMAN",
                 responded_by,
-                message_id,
+                source_reference or message_id,
+                correlation_id,
             ),
             response,
         )
@@ -202,7 +208,8 @@ class HumanGateService:
                 responded_at,
                 "SYSTEM",
                 None,
-                message_id,
+                source_reference or message_id,
+                correlation_id,
             )
         )
         return self._repository.apply_transition(
@@ -213,7 +220,8 @@ class HumanGateService:
                 responded_at,
                 "SYSTEM",
                 None,
-                message_id,
+                source_reference or message_id,
+                correlation_id,
             )
         )
 
@@ -226,6 +234,7 @@ class HumanGateService:
         actor_type: str,
         actor_id: str | None,
         trigger: str | None = None,
+        correlation_id: str | None = None,
     ) -> GateTransitionRequest:
         return GateTransitionRequest(
             gate.id,
@@ -235,7 +244,7 @@ class HumanGateService:
             reason,
             actor_type,
             actor_id,
-            gate.correlation_id,
+            correlation_id or gate.correlation_id,
             at,
             gate.milestone_id,
             trigger,
@@ -243,6 +252,55 @@ class HumanGateService:
 
     def outstanding(self, project_id: ProjectId | None = None) -> tuple[HumanGate, ...]:
         return self._repository.outstanding(project_id)
+
+    def get(self, gate_id: GateId) -> HumanGate:
+        """Return one authoritative persisted gate for trusted correlation."""
+        return self._repository.get(gate_id)
+
+
+class HumanGateCommandHandler:
+    """Provider-neutral bridge from deterministic M6 commands to gate services."""
+
+    def __init__(self, gates: HumanGateService):
+        self._gates = gates
+
+    def waiting(self) -> str:
+        return format_waiting(self._gates.outstanding())
+
+    def respond(self, command: Command) -> str:
+        if command.type is not CommandType.RESPOND_GATE:
+            return "Invalid human gate command."
+        if command.gate_reference is None or command.gate_response is None:
+            return "Invalid gate response syntax."
+        try:
+            gate_id = GateId.from_string(command.gate_reference)
+            gate = self._gates.get(gate_id)
+            resolved = self._gates.respond(
+                gate_id,
+                project_id=gate.project_id,
+                milestone_id=gate.milestone_id,
+                message_id=command.source_message_id,
+                response_code=command.gate_response,
+                response_text=None,
+                responded_by=command.requested_by,
+                responded_at=command.requested_at,
+                correlation_id=command.correlation_id,
+                source_reference=(
+                    f"{command.source_platform}:{command.source_update_id}:"
+                    f"{command.source_message_id}"
+                ),
+            )
+        except GateNotFoundError:
+            return "Human gate not found."
+        except ClosedGateError:
+            return "Human gate is already closed and cannot be answered."
+        except DuplicateGateResponseError:
+            return "This response message was already processed."
+        except PermissionError:
+            return "You are not authorised to answer this human gate."
+        except ValueError, PersistenceError:
+            return "Human gate response was rejected."
+        return f"Human gate {resolved.id} resolved as {command.gate_response}."
 
 
 def format_waiting(gates: tuple[HumanGate, ...]) -> str:
