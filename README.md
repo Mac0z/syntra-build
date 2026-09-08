@@ -96,6 +96,15 @@ retry timing, and shared `JOB` transition history. Terminal attempts cannot be
 updated and no attempt may be deleted. Because SQLite migrations are forward
 only, downgrade requires restoring a version-3 backup.
 
+Schema version 5 adds M10 human gates, immutable responses, correlated gate
+identity, and shared `HUMAN_GATE` transition history. Schema version 6 adds the
+M11 immutable workflow-event envelope, durable external deduplication,
+correlation and causation identity, parent-integrity constraints, and mutable
+processing metadata for pending, processed, rejected, and retryable failed
+events. The dispatcher composes trusted SQLite state-machine effects and event
+completion in one unit of work. These forward-only migrations preserve prior
+state and history; rollback requires restoring a pre-migration backup.
+
 Project lifecycle changes are accepted only through the explicit domain
 transition policy and the SQLite project repository. The repository uses an
 expected-current-state check and commits the current state and its history row

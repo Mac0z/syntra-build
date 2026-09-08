@@ -10,14 +10,20 @@ from syntra_build.infrastructure.persistence.connection import (
     BUSY_TIMEOUT_MILLISECONDS,
     open_database,
     transaction,
+    transaction_scope,
 )
 from syntra_build.infrastructure.persistence.errors import (
     ActiveMilestoneConflictError,
     AttemptLimitExhaustedError,
     DatabaseConnectionError,
     DatabaseIntegrityError,
+    EventAlreadyProcessedError,
+    EventClaimConflictError,
+    EventNotFoundError,
+    EventParentMismatchError,
     ImmutableTerminalAttemptError,
     InvalidAttemptError,
+    InvalidEventCausationError,
     JobMilestoneProjectMismatchError,
     JobProjectMismatchError,
     MigrationError,
@@ -31,6 +37,7 @@ from syntra_build.infrastructure.persistence.errors import (
     TransactionError,
     UnsatisfiedMilestoneDependenciesError,
 )
+from syntra_build.infrastructure.persistence.events import SQLiteWorkflowEventRepository
 from syntra_build.infrastructure.persistence.gates import SQLiteHumanGateRepository
 from syntra_build.infrastructure.persistence.jobs import (
     JobStateTransition,
@@ -106,6 +113,7 @@ __all__ = [
     "SQLiteMilestoneRepository",
     "SQLiteJobRepository",
     "SQLiteHumanGateRepository",
+    "SQLiteWorkflowEventRepository",
     "JobStateTransition",
     "StaleJobStateError",
     "JobProjectMismatchError",
@@ -122,6 +130,12 @@ __all__ = [
     "current_schema_version",
     "open_database",
     "transaction",
+    "transaction_scope",
+    "EventAlreadyProcessedError",
+    "EventClaimConflictError",
+    "EventNotFoundError",
+    "EventParentMismatchError",
+    "InvalidEventCausationError",
     "validate_integrity_results",
     "validate_migrations",
 ]

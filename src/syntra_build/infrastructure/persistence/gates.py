@@ -22,7 +22,7 @@ from syntra_build.domain.gates import (
 from syntra_build.domain.identifiers import GateId, MilestoneId, ProjectId
 from syntra_build.domain.milestones import MilestoneState
 from syntra_build.domain.projects import ProjectState
-from syntra_build.infrastructure.persistence.connection import transaction
+from syntra_build.infrastructure.persistence.connection import transaction_scope
 from syntra_build.infrastructure.persistence.errors import (
     DuplicateGateResponseError,
     GateMilestoneProjectMismatchError,
@@ -126,7 +126,7 @@ class SQLiteHumanGateRepository:
         )
 
     def apply_transition(self, request: GateTransitionRequest) -> HumanGate:
-        with transaction(self._connection):
+        with transaction_scope(self._connection):
             self._transition(request)
         return self.get(request.gate_id)
 
@@ -190,7 +190,7 @@ class SQLiteHumanGateRepository:
         ):
             raise StaleGateStateError("responses require NOTIFIED to RESPONDED")
         try:
-            with transaction(self._connection):
+            with transaction_scope(self._connection):
                 self._connection.execute(
                     """INSERT INTO human_gate_responses
                  (id,gate_id,message_id,response_code,response_text,selected_option,attachments_json,

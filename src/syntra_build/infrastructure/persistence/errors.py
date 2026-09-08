@@ -95,3 +95,27 @@ class ClosedGateError(PersistenceError):
 
 class DuplicateGateResponseError(PersistenceError):
     pass
+
+
+class EventNotFoundError(PersistenceError):
+    """The requested workflow event does not exist."""
+
+
+class EventParentMismatchError(PersistenceError):
+    """An event's related entity does not belong to its project."""
+
+
+class InvalidEventCausationError(PersistenceError):
+    """An event cause is missing, self-referential, or cross-project."""
+
+
+class EventAlreadyProcessedError(PersistenceError):
+    """A terminal event was offered for another dispatch."""
+
+
+class EventClaimConflictError(PersistenceError):
+    """Another caller owns the event processing claim."""
+
+
+class EventDispatchError(PersistenceError):
+    """Event processing failed in a classifiable manner."""

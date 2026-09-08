@@ -63,3 +63,18 @@ def transaction(connection: sqlite3.Connection) -> Iterator[None]:
         if connection.in_transaction:
             connection.rollback()
         raise PersistenceError("database transaction failed") from error
+
+
+@contextmanager
+def transaction_scope(connection: sqlite3.Connection) -> Iterator[None]:
+    """Join a caller-owned unit of work, or own a transaction when standalone.
+
+    State-machine repositories use this scope so the event dispatcher can compose
+    their guarded mutations with event completion without weakening ``transaction``'s
+    protection against accidental nesting.
+    """
+    if connection.in_transaction:
+        yield
+        return
+    with transaction(connection):
+        yield

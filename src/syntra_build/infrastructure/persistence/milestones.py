@@ -15,7 +15,7 @@ from syntra_build.domain.milestone_state_machine import (
     validate_milestone_transition,
 )
 from syntra_build.domain.milestones import Milestone, MilestoneState
-from syntra_build.infrastructure.persistence.connection import transaction
+from syntra_build.infrastructure.persistence.connection import transaction_scope
 from syntra_build.infrastructure.persistence.errors import (
     ActiveMilestoneConflictError,
     MilestoneDependencyError,
@@ -156,7 +156,7 @@ class SQLiteMilestoneRepository:
 
     def apply_transition(self, request: MilestoneTransitionRequest) -> Milestone:
         try:
-            with transaction(self._connection):
+            with transaction_scope(self._connection):
                 row = self._connection.execute(
                     "SELECT * FROM milestones WHERE id=?", (str(request.milestone_id),)
                 ).fetchone()

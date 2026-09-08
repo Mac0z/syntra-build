@@ -299,5 +299,6 @@ def test_upgrade_from_m8_preserves_existing_history(tmp_path: Path) -> None:
         )
     )
     apply_migrations(db)
-    assert current_schema_version(db) == 5 and len(projects.transitions(P1)) == 1
+    assert current_schema_version(db) == len(MIGRATIONS)
+    assert len(projects.transitions(P1)) == 1
     db.close()
