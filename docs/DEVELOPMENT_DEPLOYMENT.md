@@ -30,10 +30,21 @@ Install the token without putting it in an argument, environment variable, or
 shell history:
 
 ```bash
-sudo install -o syntra-build -g syntra-build -m 0600 /dev/stdin \
-  /etc/syntra-build/telegram-token
-# type/paste the token, then press Ctrl-D; input is not echoed by install itself
+sudo -v
+read -rsp "Telegram bot token: " SYNTRA_TOKEN
+printf '\n'
+printf '%s\n' "$SYNTRA_TOKEN" | sudo install -o syntra-build -g syntra-build \
+  -m 0600 /dev/stdin /etc/syntra-build/telegram-token
+unset SYNTRA_TOKEN
 ```
+
+`read -s` disables terminal echo while the token is entered. The command text
+stored in shell history contains only the variable name, and the unexported
+value is passed over standard input rather than as a process argument. Running
+`sudo -v` before the pipeline prevents a password prompt from competing for
+that standard input. `install` creates the destination with mode `0600` and
+the runtime identity as owner without printing its contents; the final command
+removes the token from the current shell variable.
 
 The token file is loaded into the existing `SecretInputs`/`SecretValue` model.
 The smoke command rejects group/world-readable token files. Never inspect or
