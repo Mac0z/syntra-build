@@ -94,8 +94,15 @@ a protected secret input, never as ordinary project configuration.
 The M5 adapter performs bounded long polls and plain-text sends only. It
 normalizes authorized text updates and exposes provider update/message IDs so a
 later durable consumer can manage offsets and duplicate delivery. It neither
-stores offsets nor routes commands; deterministic command routing arrives in
-M6.
+stores offsets nor owns command routing or durable duplicate processing.
+
+## Commands
+
+The provider-neutral application router supports `ping`, `health`, `projects`,
+`status <project>`, `pause <project>`, `resume <project>`, and
+`cancel <project>`. An optional leading slash is accepted. Project reads and
+state-change requests use injected application service boundaries; routing does
+not itself apply project lifecycle transitions.
 
 ## Project documentation
 
