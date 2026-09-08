@@ -85,7 +85,9 @@ tests must never use the production database. Schema changes belong in explicit
 migrations and should not normally be made by editing a database manually.
 
 Schema version 2 adds the M7 `projects` and append-only `state_transitions`
-tables. The migration is additive for version-1 databases. Downgrading an
+tables. Schema version 3 adds M8 milestones and normalized dependencies, and
+extends transition history for both project and milestone records. Upgrades
+preserve existing M7 history. Downgrading an
 already-used database is not supported; restore a pre-migration backup rather
 than deleting transition history or manually changing the schema.
 

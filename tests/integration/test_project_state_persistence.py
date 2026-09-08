@@ -58,7 +58,7 @@ def test_clean_schema_and_upgrade_from_pre_m7(tmp_path: Path) -> None:
         apply_migrations(db, MIGRATIONS[:1])
         assert current_schema_version(db) == 1
         apply_migrations(db)
-        assert current_schema_version(db) == 2
+        assert current_schema_version(db) == len(MIGRATIONS)
         project_columns = {row[1] for row in db.execute("PRAGMA table_info(projects)")}
         assert {
             "state",

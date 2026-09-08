@@ -2,6 +2,8 @@
 
 from syntra_build.domain.errors import (
     DomainValidationError,
+    InvalidBlockedRecoveryError,
+    InvalidMilestoneTransitionError,
     InvalidProjectTransitionError,
 )
 from syntra_build.domain.events import WorkflowEvent
@@ -15,6 +17,13 @@ from syntra_build.domain.identifiers import (
     WorkflowEventId,
 )
 from syntra_build.domain.jobs import Job, JobState
+from syntra_build.domain.milestone_state_machine import (
+    ACTIVE_MILESTONE_STATES,
+    VALID_MILESTONE_TRANSITIONS,
+    MilestoneTransitionRequest,
+    is_milestone_transition_allowed,
+    validate_milestone_transition,
+)
 from syntra_build.domain.milestones import Milestone, MilestoneState
 from syntra_build.domain.project_state_machine import (
     VALID_PROJECT_TRANSITIONS,
@@ -27,6 +36,8 @@ from syntra_build.domain.projects import Project, ProjectState
 __all__ = [
     "DomainValidationError",
     "InvalidProjectTransitionError",
+    "InvalidBlockedRecoveryError",
+    "InvalidMilestoneTransitionError",
     "GateId",
     "GateState",
     "GateType",
@@ -37,6 +48,9 @@ __all__ = [
     "Milestone",
     "MilestoneId",
     "MilestoneState",
+    "MilestoneTransitionRequest",
+    "ACTIVE_MILESTONE_STATES",
+    "VALID_MILESTONE_TRANSITIONS",
     "Project",
     "ProjectId",
     "ProjectState",
@@ -46,5 +60,7 @@ __all__ = [
     "WorkflowEvent",
     "WorkflowEventId",
     "is_transition_allowed",
+    "is_milestone_transition_allowed",
+    "validate_milestone_transition",
     "validate_transition",
 ]

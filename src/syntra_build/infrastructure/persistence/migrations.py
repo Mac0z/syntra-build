@@ -81,6 +81,88 @@ MIGRATIONS: tuple[Migration, ...] = (
                 SELECT RAISE(ABORT, 'state transitions are append-only'); END""",
         ),
     ),
+    Migration(
+        version=3,
+        name="003_milestone_state_machine",
+        statements=(
+            "DROP TRIGGER state_transitions_no_update",
+            "DROP TRIGGER state_transitions_no_delete",
+            "DROP INDEX state_transitions_project_created",
+            "ALTER TABLE state_transitions RENAME TO state_transitions_m7",
+            """CREATE TABLE milestones (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                sequence_number INTEGER NOT NULL CHECK (sequence_number >= 0),
+                code TEXT NOT NULL,
+                title TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN (
+                    'PENDING','READY','PREPARING_TASK','PREPARING_WORKSPACE','CODING',
+                    'VALIDATING_CHANGES','COMMITTING','PUSHING','PR_CREATING',
+                    'CI_RUNNING','CI_REWORK','ARCHITECT_REVIEW','REVIEW_REWORK',
+                    'HUMAN_DECISION','HUMAN_TEST','MERGE_READY','MERGING',
+                    'MERGE_VERIFY','COMPLETE','BLOCKED','FAILED','CANCELLED')),
+                resume_state TEXT CHECK (resume_state IS NULL OR resume_state IN (
+                    'PENDING','READY','PREPARING_TASK','PREPARING_WORKSPACE','CODING',
+                    'VALIDATING_CHANGES','COMMITTING','PUSHING','PR_CREATING',
+                    'CI_RUNNING','CI_REWORK','ARCHITECT_REVIEW','REVIEW_REWORK',
+                    'HUMAN_DECISION','HUMAN_TEST','MERGE_READY','MERGING','MERGE_VERIFY')),
+                activity TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(project_id, code), UNIQUE(project_id, sequence_number)
+            ) STRICT""",
+            """CREATE UNIQUE INDEX one_active_milestone_per_project
+                ON milestones(project_id) WHERE state NOT IN
+                ('PENDING','COMPLETE','FAILED','CANCELLED')""",
+            """CREATE TABLE milestone_dependencies (
+                milestone_id TEXT NOT NULL REFERENCES milestones(id),
+                depends_on_milestone_id TEXT NOT NULL REFERENCES milestones(id),
+                PRIMARY KEY (milestone_id, depends_on_milestone_id),
+                CHECK (milestone_id <> depends_on_milestone_id)
+            ) STRICT""",
+            """CREATE TABLE state_transitions (
+                id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL CHECK (
+                    entity_type IN ('PROJECT','MILESTONE')),
+                entity_id TEXT NOT NULL,
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT REFERENCES milestones(id),
+                previous_state TEXT NOT NULL,
+                new_state TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                trigger_event_id TEXT,
+                actor_type TEXT NOT NULL,
+                actor_id TEXT,
+                correlation_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                metadata_json TEXT,
+                CHECK ((entity_type='PROJECT' AND entity_id=project_id
+                        AND milestone_id IS NULL)
+                    OR (entity_type='MILESTONE' AND entity_id=milestone_id
+                        AND milestone_id IS NOT NULL))
+            ) STRICT""",
+            """INSERT INTO state_transitions
+                (id,entity_type,entity_id,project_id,milestone_id,previous_state,new_state,
+                 reason,trigger_event_id,actor_type,actor_id,correlation_id,created_at,metadata_json)
+                SELECT id,entity_type,entity_id,project_id,NULL,
+                 previous_state,new_state,
+                 reason,trigger_event_id,actor_type,actor_id,correlation_id,created_at,metadata_json
+                FROM state_transitions_m7""",
+            "DROP TABLE state_transitions_m7",
+            """CREATE INDEX state_transitions_project_created
+                ON state_transitions(project_id, created_at)""",
+            """CREATE INDEX state_transitions_milestone_created
+                ON state_transitions(milestone_id, created_at)""",
+            """CREATE TRIGGER state_transitions_no_update
+                BEFORE UPDATE ON state_transitions BEGIN
+                SELECT RAISE(ABORT, 'state transitions are append-only'); END""",
+            """CREATE TRIGGER state_transitions_no_delete
+                BEFORE DELETE ON state_transitions BEGIN
+                SELECT RAISE(ABORT, 'state transitions are append-only'); END""",
+        ),
+    ),
 )
 
 

@@ -50,6 +50,10 @@ class Milestone:
     state: MilestoneState
     created_at: datetime
     updated_at: datetime
+    resume_state: MilestoneState | None = None
+    activity: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         require_identifier(self.id, MilestoneId, "id")
@@ -68,3 +72,16 @@ class Milestone:
         require_timestamp_order(
             self.created_at, self.updated_at, "created_at", "updated_at"
         )
+        if self.resume_state is not None:
+            require_enum(self.resume_state, MilestoneState, "resume_state")
+            if self.resume_state is MilestoneState.BLOCKED:
+                raise DomainValidationError("resume_state cannot be BLOCKED")
+        if self.activity is not None and not isinstance(self.activity, str):
+            raise DomainValidationError("activity must be a string or None")
+        for name, value in (
+            ("started_at", self.started_at),
+            ("completed_at", self.completed_at),
+        ):
+            if value is not None:
+                require_utc(value, name)
+                require_timestamp_order(self.created_at, value, "created_at", name)

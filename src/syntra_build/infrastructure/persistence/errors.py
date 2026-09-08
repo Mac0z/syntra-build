@@ -23,3 +23,23 @@ class DatabaseIntegrityError(PersistenceError):
 
 class StaleProjectStateError(PersistenceError):
     """The project no longer has the caller's expected state."""
+
+
+class StaleMilestoneStateError(PersistenceError):
+    """The milestone no longer has the caller's expected state."""
+
+
+class MilestoneProjectMismatchError(PersistenceError):
+    """A milestone operation named a project other than its owner."""
+
+
+class ActiveMilestoneConflictError(PersistenceError):
+    """A project already has an active implementation milestone."""
+
+
+class UnsatisfiedMilestoneDependenciesError(PersistenceError):
+    """A milestone cannot activate until every dependency is complete."""
+
+
+class MilestoneDependencyError(PersistenceError):
+    """A milestone dependency is invalid or could not be stored."""
