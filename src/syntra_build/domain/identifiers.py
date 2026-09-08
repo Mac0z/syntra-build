@@ -62,3 +62,8 @@ class GateId(_UUIDIdentifier):
 @dataclass(frozen=True, slots=True)
 class WorkflowEventId(_UUIDIdentifier):
     """Stable internal identity for a workflow event."""
+
+
+@dataclass(frozen=True, slots=True)
+class StateTransitionId(_UUIDIdentifier):
+    """Stable identity for an immutable state-transition record."""
