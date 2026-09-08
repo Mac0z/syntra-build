@@ -3,8 +3,10 @@
 from syntra_build.domain.errors import (
     DomainValidationError,
     InvalidBlockedRecoveryError,
+    InvalidJobTransitionError,
     InvalidMilestoneTransitionError,
     InvalidProjectTransitionError,
+    InvalidRetryMetadataError,
 )
 from syntra_build.domain.events import WorkflowEvent
 from syntra_build.domain.gates import GateState, GateType, HumanGate
@@ -16,7 +18,20 @@ from syntra_build.domain.identifiers import (
     StateTransitionId,
     WorkflowEventId,
 )
-from syntra_build.domain.jobs import Job, JobState
+from syntra_build.domain.job_state_machine import (
+    TERMINAL_JOB_STATES,
+    VALID_JOB_TRANSITIONS,
+    JobTransitionRequest,
+    validate_job_transition,
+)
+from syntra_build.domain.jobs import (
+    Job,
+    JobAttempt,
+    JobAttemptState,
+    JobState,
+    WorkerClass,
+    consumes_worker_capacity,
+)
 from syntra_build.domain.milestone_state_machine import (
     ACTIVE_MILESTONE_STATES,
     VALID_MILESTONE_TRANSITIONS,
@@ -45,6 +60,16 @@ __all__ = [
     "Job",
     "JobId",
     "JobState",
+    "JobAttempt",
+    "JobAttemptState",
+    "WorkerClass",
+    "JobTransitionRequest",
+    "VALID_JOB_TRANSITIONS",
+    "TERMINAL_JOB_STATES",
+    "validate_job_transition",
+    "consumes_worker_capacity",
+    "InvalidJobTransitionError",
+    "InvalidRetryMetadataError",
     "Milestone",
     "MilestoneId",
     "MilestoneState",

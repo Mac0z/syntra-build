@@ -271,6 +271,6 @@ def test_upgrade_from_m7_preserves_project_history_and_api(tmp_path: Path) -> No
             )
         )
         apply_migrations(db)
-        assert current_schema_version(db) == 3
+        assert current_schema_version(db) == len(MIGRATIONS)
         assert projects.get(P1).state is ProjectState.DESIGNING
         assert len(projects.transitions(P1)) == 1

@@ -91,6 +91,11 @@ preserve existing M7 history. Downgrading an
 already-used database is not supported; restore a pre-migration backup rather
 than deleting transition history or manually changing the schema.
 
+Schema version 4 adds M9 jobs, append-only job attempts, typed worker classes,
+retry timing, and shared `JOB` transition history. Terminal attempts cannot be
+updated and no attempt may be deleted. Because SQLite migrations are forward
+only, downgrade requires restoring a version-3 backup.
+
 Project lifecycle changes are accepted only through the explicit domain
 transition policy and the SQLite project repository. The repository uses an
 expected-current-state check and commits the current state and its history row

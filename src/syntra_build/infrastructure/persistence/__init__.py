@@ -13,16 +13,27 @@ from syntra_build.infrastructure.persistence.connection import (
 )
 from syntra_build.infrastructure.persistence.errors import (
     ActiveMilestoneConflictError,
+    AttemptLimitExhaustedError,
     DatabaseConnectionError,
     DatabaseIntegrityError,
+    ImmutableTerminalAttemptError,
+    InvalidAttemptError,
+    JobMilestoneProjectMismatchError,
+    JobProjectMismatchError,
     MigrationError,
     MilestoneDependencyError,
     MilestoneProjectMismatchError,
     PersistenceError,
+    StaleJobStateError,
     StaleMilestoneStateError,
     StaleProjectStateError,
+    TerminalJobMutationError,
     TransactionError,
     UnsatisfiedMilestoneDependenciesError,
+)
+from syntra_build.infrastructure.persistence.jobs import (
+    JobStateTransition,
+    SQLiteJobRepository,
 )
 from syntra_build.infrastructure.persistence.migrations import (
     MIGRATIONS,
@@ -92,6 +103,15 @@ __all__ = [
     "UnsatisfiedMilestoneDependenciesError",
     "MilestoneStateTransition",
     "SQLiteMilestoneRepository",
+    "SQLiteJobRepository",
+    "JobStateTransition",
+    "StaleJobStateError",
+    "JobProjectMismatchError",
+    "JobMilestoneProjectMismatchError",
+    "TerminalJobMutationError",
+    "AttemptLimitExhaustedError",
+    "InvalidAttemptError",
+    "ImmutableTerminalAttemptError",
     "ProjectStateTransition",
     "SQLiteProjectRepository",
     "apply_migrations",

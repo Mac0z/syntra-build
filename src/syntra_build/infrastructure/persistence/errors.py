@@ -43,3 +43,31 @@ class UnsatisfiedMilestoneDependenciesError(PersistenceError):
 
 class MilestoneDependencyError(PersistenceError):
     """A milestone dependency is invalid or could not be stored."""
+
+
+class StaleJobStateError(PersistenceError):
+    """The job no longer has the caller's expected state."""
+
+
+class JobProjectMismatchError(PersistenceError):
+    """A job operation named a project other than its owner."""
+
+
+class JobMilestoneProjectMismatchError(PersistenceError):
+    """A job's milestone belongs to another project."""
+
+
+class TerminalJobMutationError(PersistenceError):
+    """An operation attempted to mutate a terminal job."""
+
+
+class AttemptLimitExhaustedError(PersistenceError):
+    """A job cannot begin another configured attempt."""
+
+
+class InvalidAttemptError(PersistenceError):
+    """An attempt number or lifecycle operation is invalid."""
+
+
+class ImmutableTerminalAttemptError(PersistenceError):
+    """A terminal attempt cannot be changed."""

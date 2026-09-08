@@ -15,3 +15,11 @@ class InvalidMilestoneTransitionError(ValueError):
 
 class InvalidBlockedRecoveryError(InvalidMilestoneTransitionError):
     """A blocked milestone was not restored to its persisted recovery target."""
+
+
+class InvalidJobTransitionError(ValueError):
+    """A requested job transition violates the lifecycle policy."""
+
+
+class InvalidRetryMetadataError(InvalidJobTransitionError):
+    """Retry state lacks a future attempt or durable failure metadata."""

@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """Small, ordered migration runner for Syntra Build's SQLite schema."""
 
 from __future__ import annotations
@@ -161,6 +162,75 @@ MIGRATIONS: tuple[Migration, ...] = (
             """CREATE TRIGGER state_transitions_no_delete
                 BEFORE DELETE ON state_transitions BEGIN
                 SELECT RAISE(ABORT, 'state transitions are append-only'); END""",
+        ),
+    ),
+    Migration(
+        version=4,
+        name="004_job_state_machine",
+        statements=(
+            "DROP TRIGGER state_transitions_no_update",
+            "DROP TRIGGER state_transitions_no_delete",
+            "DROP INDEX state_transitions_project_created",
+            "DROP INDEX state_transitions_milestone_created",
+            "ALTER TABLE state_transitions RENAME TO state_transitions_m8",
+            "CREATE UNIQUE INDEX milestones_project_identity ON milestones(project_id,id)",
+            """CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT REFERENCES milestones(id),
+                job_type TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('QUEUED','DISPATCHED','RUNNING',
+                    'WAITING_EXTERNAL','SUCCEEDED','RETRY_WAIT','FAILED','CANCELLED','ABANDONED')),
+                priority INTEGER NOT NULL CHECK(priority >= 0), correlation_id TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL CHECK(attempt_number >= 0),
+                max_attempts INTEGER NOT NULL CHECK(max_attempts >= 1 AND attempt_number <= max_attempts),
+                scheduled_at TEXT, started_at TEXT, completed_at TEXT, next_retry_at TEXT,
+                timeout_seconds INTEGER CHECK(timeout_seconds IS NULL OR timeout_seconds > 0),
+                worker_class TEXT NOT NULL CHECK(worker_class IN
+                    ('ARCHITECT','CODEX','GIT','GITHUB','CI','MESSAGING','RECOVERY','INTERNAL')),
+                payload_json TEXT NOT NULL, result_json TEXT NOT NULL, last_error_id TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id,milestone_id) REFERENCES milestones(project_id,id)
+            ) STRICT""",
+            """CREATE TABLE job_attempts (
+                id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id),
+                attempt_number INTEGER NOT NULL CHECK(attempt_number >= 1),
+                state TEXT NOT NULL CHECK(state IN ('RUNNING','SUCCEEDED','RETRYABLE_FAILURE',
+                    'FAILED','CANCELLED','ABANDONED')),
+                started_at TEXT NOT NULL, completed_at TEXT, external_request_id TEXT,
+                process_id TEXT, exit_code INTEGER, result_json TEXT NOT NULL,
+                error_id TEXT, logs_reference TEXT, UNIQUE(job_id,attempt_number)
+            ) STRICT""",
+            """CREATE TABLE state_transitions (
+                id TEXT PRIMARY KEY, entity_type TEXT NOT NULL CHECK(entity_type IN ('PROJECT','MILESTONE','JOB')),
+                entity_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT REFERENCES milestones(id), job_id TEXT REFERENCES jobs(id),
+                previous_state TEXT NOT NULL, new_state TEXT NOT NULL, reason TEXT NOT NULL,
+                trigger_event_id TEXT, actor_type TEXT NOT NULL, actor_id TEXT,
+                correlation_id TEXT NOT NULL, created_at TEXT NOT NULL, metadata_json TEXT,
+                CHECK ((entity_type='PROJECT' AND entity_id=project_id AND milestone_id IS NULL AND job_id IS NULL)
+                    OR (entity_type='MILESTONE' AND entity_id=milestone_id AND milestone_id IS NOT NULL AND job_id IS NULL)
+                    OR (entity_type='JOB' AND entity_id=job_id AND job_id IS NOT NULL))
+            ) STRICT""",
+            """INSERT INTO state_transitions
+                (id,entity_type,entity_id,project_id,milestone_id,job_id,previous_state,new_state,
+                 reason,trigger_event_id,actor_type,actor_id,correlation_id,created_at,metadata_json)
+                SELECT id,entity_type,entity_id,project_id,milestone_id,NULL,previous_state,new_state,
+                 reason,trigger_event_id,actor_type,actor_id,correlation_id,created_at,metadata_json
+                FROM state_transitions_m8""",
+            "DROP TABLE state_transitions_m8",
+            "CREATE INDEX state_transitions_project_created ON state_transitions(project_id,created_at)",
+            "CREATE INDEX state_transitions_milestone_created ON state_transitions(milestone_id,created_at)",
+            "CREATE INDEX state_transitions_job_created ON state_transitions(job_id,created_at)",
+            "CREATE INDEX jobs_project_state ON jobs(project_id,state)",
+            """CREATE TRIGGER state_transitions_no_update BEFORE UPDATE ON state_transitions BEGIN
+                SELECT RAISE(ABORT,'state transitions are append-only'); END""",
+            """CREATE TRIGGER state_transitions_no_delete BEFORE DELETE ON state_transitions BEGIN
+                SELECT RAISE(ABORT,'state transitions are append-only'); END""",
+            """CREATE TRIGGER terminal_attempts_no_update BEFORE UPDATE ON job_attempts
+                WHEN OLD.state <> 'RUNNING' BEGIN SELECT RAISE(ABORT,'terminal attempts are immutable'); END""",
+            """CREATE TRIGGER job_attempts_no_delete BEFORE DELETE ON job_attempts BEGIN
+                SELECT RAISE(ABORT,'job attempts are append-only'); END""",
         ),
     ),
 )
