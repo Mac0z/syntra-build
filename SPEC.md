@@ -26,10 +26,12 @@ Implementation must use the following precedence when source documents differ:
 4. `SECURITY.md`, `STATE_MACHINE.md`, `INTERFACES.md`, `DATA_MODEL.md`, `ARCHITECTURE.md`, `WORKFLOW.md`, `OPERATIONS.md`, and `VISION.md`.
 5. Provider-specific implementation assumptions.
 
-Two superseding decisions are especially important:
+The following superseding decisions are especially important:
 
 - **Python 3.14** is the runtime baseline. Any older reference to Python 3.12 is superseded.
 - **GitHub** is the canonical source-control platform for Syntra Build itself and generated projects. Any older Forgejo source-control assumption is superseded.
+- **Architect approval is evidence, not a milestone state.** `ARCHITECT_APPROVED` may be recorded as a workflow event, review verdict or persisted piece of approval evidence, but it is not a member of the milestone-state vocabulary. The milestone remains within the approved state model and may progress toward `MERGE_READY` only after Syntra has validated all required evidence for the current revision.
+- **Telegram transport does not own command routing or durable duplicate processing.** The Telegram adapter is responsible for bounded provider interaction, authorization, normalization, sending, and exposing stable provider identifiers and caller-managed update offsets. Deterministic command routing begins in M6. Durable consumed-update/duplicate state belongs to the trusted consuming workflow/persistence layer and must not be held authoritatively in the Telegram adapter.
 
 If a genuine unresolved conflict remains, implementation must stop at the affected scope and raise a human/Architect decision rather than silently choosing.
 
@@ -631,52 +633,99 @@ A milestone may be split into smaller milestones if implementation proves broade
 
 ### M5 — Telegram gateway
 
-**Objective:** Bring up the real human interface early so all later milestones can be exercised from the phone.
+**Objective:** Bring up the real Telegram transport early so later application workflows can be exercised through the approved human interface without coupling core logic to Telegram provider payloads.
 
 **Dependencies:** M1, M2, M3, M4
 
 **Required deliverables:**
 - Telegram adapter using long polling unless a later deployment decision changes it
-- authorised user/chat allowlist
-- inbound message normalisation
-- outbound message sending
-- duplicate update detection
-- basic `/ping` and `/health` responses
+- authorised numeric Telegram user allowlist
+- inbound text-message normalisation
+- outbound plain-text message sending
+- bounded polling with caller-supplied update offset
+- stable Telegram update and message identifiers exposed for later durable duplicate handling
+- timezone-aware UTC conversion of Telegram timestamps
+- typed transport, protocol and provider errors
 - Telegram token loaded only through protected secret handling
+- safe structured logging that excludes credentials, credential-bearing URLs, unrestricted provider payloads and message bodies
+
+**Transport ownership rules:**
+- one adapter call performs one bounded Telegram interaction;
+- the adapter must not contain an infinite polling/scheduler loop;
+- the adapter must not contain hidden durable retry policy;
+- the adapter must not persist update offsets;
+- the adapter must not maintain authoritative in-memory duplicate state;
+- supplying the same offset may therefore return the same provider update again;
+- the trusted consumer is responsible for persisting consumed-update progress and ensuring an update is applied to workflow state at most once.
 
 **Acceptance criteria:**
-- An authorised user can send `/ping` and receive a deterministic response.
-- An authorised user can request `/health` and receive local service health.
-- An unauthorised Telegram user cannot query or mutate system state.
-- Duplicate delivery of the same Telegram update is processed once.
-- Telegram token is absent from logs and database records.
+- An authorised Telegram user can produce a correctly normalised inbound text message.
+- An unauthorised Telegram user is not treated as an authorised instruction source.
+- Telegram long polling uses the configured bounded timeout.
+- A caller can supply an update offset and it is passed to Telegram correctly.
+- Multiple provider updates retain deterministic provider order.
+- Unsupported or non-text update forms are ignored or rejected according to the adapter contract without crashing the service.
+- Outbound plain-text messages can be sent with the required chat, thread and reply identifiers.
+- Telegram timestamps are normalised to timezone-aware UTC values.
+- Malformed provider responses and Telegram API failures produce typed, safe errors.
+- Network failures preserve useful exception causality without exposing the Telegram token.
+- Telegram token, credential-bearing URLs and unrestricted message contents are absent from logs.
+- Repeating a poll with the same caller-managed offset does not rely on hidden adapter state to suppress a duplicate.
+- All tests are offline, deterministic and credential-free.
 
-**Human acceptance:** Confirm the Telegram bot is reachable from the user's iPhone and responds correctly to the early test commands.
+**Human acceptance:** None beyond PR review. Command handling and application-level behaviour are introduced by later milestones.
 
-**Exit gate:** All listed acceptance criteria pass in CI and the PR is approved against this specification.
+**Exit gate:** Transport-level acceptance criteria pass in CI and the PR is approved against this specification.
 
 ### M6 — Basic command and intent routing
 
-**Objective:** Introduce a deterministic command-routing layer behind Telegram before AI interpretation is used.
+**Objective:** Introduce a deterministic application-level command-routing layer behind the Telegram transport before AI interpretation is used.
 
 **Dependencies:** M5
 
 **Required deliverables:**
-- normalised command model
-- routing for `health`, `projects`, `status <project>`, `pause <project>`, `resume <project>` and `cancel <project>` with unsupported commands returning help
-- exact project resolution by canonical name/ID
+- normalised command model independent of Telegram provider payloads
+- deterministic parsing/routing for `ping`, `health`, `projects`, `status <project>`, `pause <project>`, `resume <project>` and `cancel <project>`
+- optional leading `/` accepted for Telegram-style commands where appropriate
+- unsupported or malformed commands return deterministic help
+- exact project resolution by stable internal ID or approved canonical project name
 - read-only and state-changing command distinction
 - audit event for state-changing command requests
+- clear separation between command parsing, command routing and Telegram transport
+- command handlers expressed through application-facing services/contracts rather than Telegram-specific logic
 - extensible intent-router interface for later natural-language interpretation
+- no AI interpretation for commands that can be resolved deterministically
+
+**`ping` semantics:**
+- `ping` verifies that the messaging-to-routing path is responsive;
+- it returns a deterministic response;
+- it does not imply that every external dependency is healthy.
+
+**`health` semantics:**
+- `health` reports the current local Syntra service-health view available at this milestone;
+- it must not fabricate health for components that have not yet been implemented;
+- richer operational health/readiness remains part of later operational milestones.
+
+**Duplicate-processing ownership:**
+- M6 must not implement authoritative duplicate handling inside the Telegram adapter;
+- commands must retain the source Telegram `update_id`/message identity or an equivalent stable source reference so the later persistence/workflow consumer can record consumption atomically;
+- once durable message/event persistence is introduced, successful processing and consumed-update progression must be owned by trusted Syntra state rather than process memory.
 
 **Acceptance criteria:**
+- `ping` returns the deterministic routing response for an authorised inbound command.
+- `health` returns the deterministic health information actually available at this stage.
+- supported commands are parsed independently of Telegram raw JSON.
 - Telegram commands reach the correct application service without Telegram-specific types entering the domain layer.
-- `projects` lists persisted projects.
+- `projects` lists persisted projects once the required project-read service exists.
 - Unknown or ambiguous project names do not mutate state.
-- Unsupported commands produce a useful response.
+- Unsupported commands return deterministic help.
 - State-changing commands are authorised and persisted before execution.
+- unauthorised Telegram input never reaches command execution.
+- command routing remains offline-testable without the real Telegram API.
+- no project state transition is performed merely by parsing a command; state mutation occurs through the appropriate application service boundary.
+- no AI interpretation is used for the deterministic command set.
 
-**Human acceptance:** None beyond PR review unless the milestone exposes behaviour that cannot be validated automatically.
+**Human acceptance:** None beyond PR review unless an exposed routing behaviour cannot be validated automatically.
 
 **Exit gate:** All listed acceptance criteria pass in CI and the PR is approved against this specification.
 
