@@ -303,6 +303,74 @@ MIGRATIONS: tuple[Migration, ...] = (
                 SELECT RAISE(ABORT,'human gate responses are append-only'); END""",
         ),
     ),
+    Migration(
+        version=6,
+        name="006_workflow_event_framework",
+        statements=(
+            "CREATE UNIQUE INDEX jobs_project_identity ON jobs(project_id,id)",
+            """CREATE TABLE workflow_events (
+                id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                source TEXT NOT NULL CHECK(source IN
+                    ('INTERNAL','TELEGRAM','GITHUB','CI','ARCHITECT','CODEX','RECOVERY','SYSTEM')),
+                correlation_id TEXT NOT NULL,
+                causation_event_id TEXT,
+                external_deduplication_key TEXT,
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT,
+                job_id TEXT,
+                gate_id TEXT,
+                occurred_at TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+                processing_status TEXT NOT NULL DEFAULT 'PENDING' CHECK(processing_status IN
+                    ('PENDING','PROCESSED','REJECTED','FAILED')),
+                processing_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(processing_attempt_count >= 0),
+                processed_at TEXT,
+                last_processing_error TEXT,
+                processing_claim_token TEXT,
+                processing_claimed_at TEXT,
+                UNIQUE(project_id,id),
+                FOREIGN KEY(project_id,milestone_id) REFERENCES milestones(project_id,id),
+                FOREIGN KEY(project_id,job_id) REFERENCES jobs(project_id,id),
+                FOREIGN KEY(project_id,gate_id) REFERENCES human_gates(project_id,id),
+                FOREIGN KEY(project_id,causation_event_id) REFERENCES workflow_events(project_id,id),
+                CHECK(causation_event_id IS NULL OR causation_event_id <> id),
+                CHECK((source IN ('INTERNAL','RECOVERY','SYSTEM'))
+                    OR external_deduplication_key IS NOT NULL),
+                CHECK((processing_status IN ('PROCESSED','REJECTED') AND processed_at IS NOT NULL)
+                    OR (processing_status IN ('PENDING','FAILED') AND processed_at IS NULL))
+            ) STRICT""",
+            """CREATE UNIQUE INDEX workflow_events_external_deduplication
+                ON workflow_events(external_deduplication_key)
+                WHERE external_deduplication_key IS NOT NULL""",
+            "CREATE INDEX workflow_events_processing ON workflow_events(processing_status,received_at,id)",
+            "CREATE INDEX workflow_events_project ON workflow_events(project_id,received_at,id)",
+            "CREATE INDEX workflow_events_correlation ON workflow_events(correlation_id,received_at,id)",
+            """CREATE TRIGGER workflow_events_immutable_envelope BEFORE UPDATE ON workflow_events
+                WHEN NEW.id<>OLD.id OR NEW.event_type<>OLD.event_type OR NEW.source<>OLD.source
+                  OR NEW.correlation_id<>OLD.correlation_id
+                  OR NEW.causation_event_id IS NOT OLD.causation_event_id
+                  OR NEW.external_deduplication_key IS NOT OLD.external_deduplication_key
+                  OR NEW.project_id<>OLD.project_id OR NEW.milestone_id IS NOT OLD.milestone_id
+                  OR NEW.job_id IS NOT OLD.job_id OR NEW.gate_id IS NOT OLD.gate_id
+                  OR NEW.occurred_at<>OLD.occurred_at OR NEW.received_at<>OLD.received_at
+                  OR NEW.payload_json<>OLD.payload_json
+                BEGIN SELECT RAISE(ABORT,'workflow event envelope is immutable'); END""",
+            """CREATE TRIGGER workflow_events_no_delete BEFORE DELETE ON workflow_events BEGIN
+                SELECT RAISE(ABORT,'workflow events are append-only'); END""",
+            """CREATE TRIGGER workflow_events_job_milestone_consistency BEFORE INSERT ON workflow_events
+                WHEN NEW.job_id IS NOT NULL AND NEW.milestone_id IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM jobs WHERE id=NEW.job_id
+                    AND project_id=NEW.project_id AND milestone_id=NEW.milestone_id)
+                BEGIN SELECT RAISE(ABORT,'event job and milestone are inconsistent'); END""",
+            """CREATE TRIGGER workflow_events_gate_milestone_consistency BEFORE INSERT ON workflow_events
+                WHEN NEW.gate_id IS NOT NULL AND NEW.milestone_id IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM human_gates WHERE id=NEW.gate_id
+                    AND project_id=NEW.project_id AND milestone_id=NEW.milestone_id)
+                BEGIN SELECT RAISE(ABORT,'event gate and milestone are inconsistent'); END""",
+        ),
+    ),
 )
 
 

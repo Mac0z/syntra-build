@@ -15,7 +15,7 @@ from syntra_build.domain import (
 )
 from syntra_build.domain._validation import require_utc
 from syntra_build.domain.project_state_machine import validate_transition
-from syntra_build.infrastructure.persistence.connection import transaction
+from syntra_build.infrastructure.persistence.connection import transaction_scope
 from syntra_build.infrastructure.persistence.errors import (
     PersistenceError,
     StaleProjectStateError,
@@ -95,7 +95,7 @@ class SQLiteProjectRepository:
     def apply_transition(self, request: ProjectTransitionRequest) -> Project:
         """Conditionally update state and append history in the same transaction."""
         try:
-            with transaction(self._connection):
+            with transaction_scope(self._connection):
                 row = self._connection.execute(
                     "SELECT state,resume_state FROM projects WHERE id = ?",
                     (str(request.project_id),),

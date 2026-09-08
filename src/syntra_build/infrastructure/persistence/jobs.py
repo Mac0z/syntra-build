@@ -23,7 +23,7 @@ from syntra_build.domain.jobs import (
     JobState,
     WorkerClass,
 )
-from syntra_build.infrastructure.persistence.connection import transaction
+from syntra_build.infrastructure.persistence.connection import transaction_scope
 from syntra_build.infrastructure.persistence.errors import (
     AttemptLimitExhaustedError,
     ImmutableTerminalAttemptError,
@@ -169,7 +169,7 @@ class SQLiteJobRepository:
 
     def apply_transition(self, request: JobTransitionRequest) -> Job:
         try:
-            with transaction(self._connection):
+            with transaction_scope(self._connection):
                 row = self._row(request.job_id, request.project_id)
                 state = JobState(row["state"])
                 if state is not request.expected_state:
@@ -191,7 +191,7 @@ class SQLiteJobRepository:
         if request.target_state is not JobState.ABANDONED:
             raise InvalidAttemptError("abandonment target must be ABANDONED")
         try:
-            with transaction(self._connection):
+            with transaction_scope(self._connection):
                 row = self._row(request.job_id, request.project_id)
                 state = JobState(row["state"])
                 if state is not request.expected_state:

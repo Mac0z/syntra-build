@@ -8,7 +8,14 @@ from syntra_build.domain.errors import (
     InvalidProjectTransitionError,
     InvalidRetryMetadataError,
 )
-from syntra_build.domain.events import WorkflowEvent
+from syntra_build.domain.events import (
+    DuplicateEvent,
+    EventProcessingStatus,
+    InsertedEvent,
+    PersistedWorkflowEvent,
+    WorkflowEvent,
+    WorkflowEventSource,
+)
 from syntra_build.domain.gate_state_machine import (
     VALID_GATE_TRANSITIONS,
     GateTransitionRequest,
@@ -108,6 +115,11 @@ __all__ = [
     "VALID_PROJECT_TRANSITIONS",
     "WorkflowEvent",
     "WorkflowEventId",
+    "WorkflowEventSource",
+    "EventProcessingStatus",
+    "PersistedWorkflowEvent",
+    "InsertedEvent",
+    "DuplicateEvent",
     "is_transition_allowed",
     "is_milestone_transition_allowed",
     "validate_milestone_transition",
