@@ -16,6 +16,7 @@ from syntra_build.infrastructure.persistence.errors import (
     DatabaseIntegrityError,
     MigrationError,
     PersistenceError,
+    StaleProjectStateError,
     TransactionError,
 )
 from syntra_build.infrastructure.persistence.migrations import (
@@ -24,6 +25,10 @@ from syntra_build.infrastructure.persistence.migrations import (
     apply_migrations,
     current_schema_version,
     validate_migrations,
+)
+from syntra_build.infrastructure.persistence.projects import (
+    ProjectStateTransition,
+    SQLiteProjectRepository,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -70,6 +75,9 @@ __all__ = [
     "MigrationError",
     "PersistenceError",
     "TransactionError",
+    "StaleProjectStateError",
+    "ProjectStateTransition",
+    "SQLiteProjectRepository",
     "apply_migrations",
     "bootstrap_database",
     "check_database_integrity",

@@ -19,3 +19,7 @@ class MigrationError(PersistenceError):
 
 class DatabaseIntegrityError(PersistenceError):
     """Raised when SQLite reports an integrity problem."""
+
+
+class StaleProjectStateError(PersistenceError):
+    """The project no longer has the caller's expected state."""

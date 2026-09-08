@@ -34,6 +34,53 @@ MIGRATIONS: tuple[Migration, ...] = (
             ) STRICT""",
         ),
     ),
+    Migration(
+        version=2,
+        name="002_project_state_machine",
+        statements=(
+            """CREATE TABLE projects (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN (
+                    'NEW','DESIGNING','DESIGN_APPROVAL','PROVISIONING','READY',
+                    'BUILDING','WAITING_HUMAN','PAUSED','BLOCKED','COMPLETING',
+                    'COMPLETE','FAILED','CANCELLED'
+                )),
+                resume_state TEXT CHECK (resume_state IS NULL OR resume_state IN (
+                    'NEW','DESIGNING','DESIGN_APPROVAL','PROVISIONING','READY',
+                    'BUILDING','WAITING_HUMAN','BLOCKED','COMPLETING'
+                )),
+                activity TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_state_change_at TEXT NOT NULL
+            ) STRICT""",
+            """CREATE TABLE state_transitions (
+                id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL CHECK (entity_type = 'PROJECT'),
+                entity_id TEXT NOT NULL,
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                previous_state TEXT NOT NULL,
+                new_state TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                trigger_event_id TEXT,
+                actor_type TEXT NOT NULL,
+                actor_id TEXT,
+                correlation_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                metadata_json TEXT,
+                CHECK (entity_id = project_id)
+            ) STRICT""",
+            """CREATE INDEX state_transitions_project_created
+                ON state_transitions(project_id, created_at)""",
+            """CREATE TRIGGER state_transitions_no_update
+                BEFORE UPDATE ON state_transitions BEGIN
+                SELECT RAISE(ABORT, 'state transitions are append-only'); END""",
+            """CREATE TRIGGER state_transitions_no_delete
+                BEFORE DELETE ON state_transitions BEGIN
+                SELECT RAISE(ABORT, 'state transitions are append-only'); END""",
+        ),
+    ),
 )
 
 

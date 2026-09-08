@@ -47,10 +47,14 @@ def test_bootstrap_creation_and_idempotency(tmp_path: Path) -> None:
         assert cfg.database.sqlite_path.exists() and current_schema_version(db) == len(
             MIGRATIONS
         )
-        assert db.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM schema_migrations").fetchone()[
+            0
+        ] == len(MIGRATIONS)
     with bootstrap_database(cfg) as db:
-        assert current_schema_version(db) == 1
-        assert db.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 1
+        assert current_schema_version(db) == len(MIGRATIONS)
+        assert db.execute("SELECT count(*) FROM schema_migrations").fetchone()[
+            0
+        ] == len(MIGRATIONS)
 
 
 def test_connection_configuration_is_consistent(tmp_path: Path) -> None:
@@ -67,9 +71,17 @@ def test_connection_configuration_is_consistent(tmp_path: Path) -> None:
 
 
 def test_migration_order_validation() -> None:
-    second = Migration(2, "002_second", ("CREATE TABLE second (id INTEGER)",))
-    validate_migrations((*MIGRATIONS, second))
-    for invalid in ((second, MIGRATIONS[0]), (MIGRATIONS[0], MIGRATIONS[0])):
+    next_version = len(MIGRATIONS) + 1
+    next_migration = Migration(
+        next_version,
+        f"{next_version:03}_next",
+        ("CREATE TABLE next_table (id INTEGER)",),
+    )
+    validate_migrations((*MIGRATIONS, next_migration))
+    for invalid in (
+        (next_migration, *MIGRATIONS),
+        (MIGRATIONS[0], MIGRATIONS[0]),
+    ):
         with pytest.raises(MigrationError, match="unique, contiguous, and ordered"):
             validate_migrations(invalid)
 
@@ -78,15 +90,15 @@ def test_failed_migration_is_atomic(tmp_path: Path) -> None:
     migrations = (
         *MIGRATIONS,
         Migration(
-            2,
-            "002_fails",
+            len(MIGRATIONS) + 1,
+            "next_fails",
             ("CREATE TABLE partial (id INTEGER)", "INSERT INTO missing VALUES (1)"),
         ),
     )
     with open_database(tmp_path / "failure.db") as db:
-        with pytest.raises(MigrationError, match="migration 2"):
+        with pytest.raises(MigrationError, match=f"migration {len(MIGRATIONS) + 1}"):
             apply_migrations(db, migrations)
-        assert current_schema_version(db) == 1
+        assert current_schema_version(db) == len(MIGRATIONS)
         assert (
             db.execute(
                 "SELECT count(*) FROM sqlite_master WHERE name='partial'"
@@ -98,12 +110,16 @@ def test_failed_migration_is_atomic(tmp_path: Path) -> None:
 def test_unsupported_histories_are_rejected(tmp_path: Path) -> None:
     with open_database(tmp_path / "newer.db") as db:
         apply_migrations(db)
-        db.execute("INSERT INTO schema_migrations VALUES (?,?)", (2, "002_unknown"))
+        unknown_version = len(MIGRATIONS) + 1
+        db.execute(
+            "INSERT INTO schema_migrations VALUES (?,?)",
+            (unknown_version, "unknown"),
+        )
         with pytest.raises(MigrationError, match="newer"):
             apply_migrations(db)
     with open_database(tmp_path / "wrong.db") as db:
         apply_migrations(db)
-        db.execute("UPDATE schema_migrations SET name='wrong'")
+        db.execute("UPDATE schema_migrations SET name='wrong' WHERE version=1")
         with pytest.raises(MigrationError, match="unknown or inconsistent"):
             apply_migrations(db)
 
