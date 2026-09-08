@@ -12,12 +12,17 @@ from syntra_build.infrastructure.persistence.connection import (
     transaction,
 )
 from syntra_build.infrastructure.persistence.errors import (
+    ActiveMilestoneConflictError,
     DatabaseConnectionError,
     DatabaseIntegrityError,
     MigrationError,
+    MilestoneDependencyError,
+    MilestoneProjectMismatchError,
     PersistenceError,
+    StaleMilestoneStateError,
     StaleProjectStateError,
     TransactionError,
+    UnsatisfiedMilestoneDependenciesError,
 )
 from syntra_build.infrastructure.persistence.migrations import (
     MIGRATIONS,
@@ -25,6 +30,10 @@ from syntra_build.infrastructure.persistence.migrations import (
     apply_migrations,
     current_schema_version,
     validate_migrations,
+)
+from syntra_build.infrastructure.persistence.milestones import (
+    MilestoneStateTransition,
+    SQLiteMilestoneRepository,
 )
 from syntra_build.infrastructure.persistence.projects import (
     ProjectStateTransition,
@@ -68,6 +77,7 @@ def bootstrap_database(config: ApplicationConfig) -> sqlite3.Connection:
 
 __all__ = [
     "BUSY_TIMEOUT_MILLISECONDS",
+    "ActiveMilestoneConflictError",
     "MIGRATIONS",
     "DatabaseConnectionError",
     "DatabaseIntegrityError",
@@ -76,6 +86,12 @@ __all__ = [
     "PersistenceError",
     "TransactionError",
     "StaleProjectStateError",
+    "StaleMilestoneStateError",
+    "MilestoneDependencyError",
+    "MilestoneProjectMismatchError",
+    "UnsatisfiedMilestoneDependenciesError",
+    "MilestoneStateTransition",
+    "SQLiteMilestoneRepository",
     "ProjectStateTransition",
     "SQLiteProjectRepository",
     "apply_migrations",

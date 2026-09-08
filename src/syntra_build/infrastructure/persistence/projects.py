@@ -190,7 +190,9 @@ class SQLiteProjectRepository:
 
     def transitions(self, project_id: ProjectId) -> tuple[ProjectStateTransition, ...]:
         rows = self._connection.execute(
-            "SELECT * FROM state_transitions WHERE project_id=? ORDER BY created_at,id",
+            """SELECT * FROM state_transitions
+               WHERE entity_type='PROJECT' AND project_id=?
+               ORDER BY created_at,id""",
             (str(project_id),),
         ).fetchall()
         return tuple(

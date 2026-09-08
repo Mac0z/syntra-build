@@ -7,3 +7,11 @@ class DomainValidationError(ValueError):
 
 class InvalidProjectTransitionError(ValueError):
     """A requested project transition violates the lifecycle policy."""
+
+
+class InvalidMilestoneTransitionError(ValueError):
+    """A requested milestone transition violates the lifecycle policy."""
+
+
+class InvalidBlockedRecoveryError(InvalidMilestoneTransitionError):
+    """A blocked milestone was not restored to its persisted recovery target."""
