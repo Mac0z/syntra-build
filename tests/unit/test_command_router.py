@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from inspect import signature
 from uuid import UUID
 
 import pytest
@@ -82,6 +83,19 @@ class FakeHealth:
     def current_health(self) -> str:
         self.calls += 1
         return self.value
+
+
+@dataclass
+class FutureIntentResolver:
+    """Future-facing protocol implementation that M6 deliberately never wires in."""
+
+    calls: int = 0
+
+    def resolve(self, message: InboundMessage) -> Command | None:
+        self.calls += 1
+        raise AssertionError(
+            f"M6 must not interpret unknown input from {message.sender_id}"
+        )
 
 
 def inbound(text: str = "ping") -> InboundMessage:
@@ -236,6 +250,18 @@ def test_unavailable_service_does_not_claim_success_or_mutate_project() -> None:
 def test_invalid_input_returns_help_without_services(text: str) -> None:
     router, queries, commands, audit, health = make_router()
     assert router.route(inbound(text)).text == HELP_TEXT
+    assert not queries.calls and not commands.calls and not audit.requests
+    assert health.calls == 0
+
+
+def test_unknown_input_does_not_invoke_future_intent_resolution() -> None:
+    future_resolver = FutureIntentResolver()
+    router, queries, commands, audit, health = make_router()
+
+    assert router.route(inbound("what is happening with FlowTrack")).text == HELP_TEXT
+
+    assert "intent_resolver" not in signature(CommandRouter).parameters
+    assert future_resolver.calls == 0
     assert not queries.calls and not commands.calls and not audit.requests
     assert health.calls == 0
 

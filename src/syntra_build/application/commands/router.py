@@ -10,11 +10,10 @@ from syntra_build.application.commands.models import (
     CommandType,
     InboundMessage,
 )
-from syntra_build.application.commands.parser import CommandParser, ParseFailure
+from syntra_build.application.commands.parser import CommandParser
 from syntra_build.application.commands.services import (
     CommandAuditRequest,
     CommandAuditSink,
-    IntentResolver,
     LocalHealthService,
     ProjectCommandService,
     ProjectQueryService,
@@ -44,24 +43,16 @@ class CommandRouter:
         audit_sink: CommandAuditSink,
         health: LocalHealthService,
         parser: CommandParser | None = None,
-        intent_resolver: IntentResolver | None = None,
     ) -> None:
         self._queries = project_queries
         self._commands = project_commands
         self._audit = audit_sink
         self._health = health
         self._parser = parser or CommandParser()
-        self._intent_resolver = intent_resolver
 
     def route(self, message: InboundMessage) -> CommandResponse:
         parsed = self._parser.parse(message)
         command = parsed.command
-        if (
-            command is None
-            and parsed.failure is ParseFailure.UNKNOWN
-            and self._intent_resolver is not None
-        ):
-            command = self._intent_resolver.resolve(message)
         if command is None:
             correlation_id = new_correlation_id()
             _LOGGER.info(
