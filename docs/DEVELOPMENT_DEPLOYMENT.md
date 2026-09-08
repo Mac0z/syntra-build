@@ -6,8 +6,16 @@ service.
 
 ## Prerequisites and provisioning
 
-Install Git and a distribution-provided Python 3.14 including `venv`, then
-verify the exact interpreter rather than relying on `python3`:
+Install Git, Python 3.14, and the matching Ubuntu `venv` package. On Ubuntu
+26.04 this requires `python3.14-venv`; having the Python interpreter installed
+does not guarantee that `ensurepip`/`venv` support is present.
+
+```bash
+sudo apt update
+sudo apt install git python3.14 python3.14-venv
+```
+
+Then verify the exact interpreter rather than relying on `python3`:
 
 ```bash
 uname -m                         # must report aarch64
@@ -26,25 +34,41 @@ Telegram user ID. The file uses the existing typed M1 field names. The default
 M1 filesystem and database paths already resolve to the approved `/opt`,
 `/etc`, `/var/lib`, and `/var/log` layout, so they need not be duplicated.
 
-Install the token without putting it in an argument, environment variable, or
-shell history:
+Install the token without putting it in an argument or shell history. First
+create the destination with its final ownership and permissions, then write the
+silently entered token through standard input:
 
 ```bash
-sudo -v
+sudo -n true
+
+sudo -n install \
+  -o syntra-build -g syntra-build -m 0600 \
+  /dev/null /etc/syntra-build/telegram-token
+
 read -rsp "Telegram bot token: " SYNTRA_TOKEN
 printf '\n'
-printf '%s\n' "$SYNTRA_TOKEN" | sudo install -o syntra-build -g syntra-build \
-  -m 0600 /dev/stdin /etc/syntra-build/telegram-token
+
+printf '%s\n' "$SYNTRA_TOKEN" | \
+  sudo -n tee /etc/syntra-build/telegram-token >/dev/null
+
 unset SYNTRA_TOKEN
+
+sudo stat -c '%U %G %a %n' /etc/syntra-build/telegram-token
 ```
 
-`read -s` disables terminal echo while the token is entered. The command text
-stored in shell history contains only the variable name, and the unexported
-value is passed over standard input rather than as a process argument. Running
-`sudo -v` before the pipeline prevents a password prompt from competing for
-that standard input. `install` creates the destination with mode `0600` and
-the runtime identity as owner without printing its contents; the final command
-removes the token from the current shell variable.
+The expected result is:
+
+```text
+syntra-build syntra-build 600 /etc/syntra-build/telegram-token
+```
+
+`read -s` disables terminal echo. The token remains in an unexported shell
+variable only for the duration of the command and is passed to `tee` over
+standard input rather than as a process argument. `sudo -n` prevents sudo from
+trying to consume the token stream as a password prompt and fails immediately
+if passwordless sudo is unavailable. The destination already has mode `0600`
+before the token is written, and `tee` output is discarded so the token is not
+printed.
 
 The token file is loaded into the existing `SecretInputs`/`SecretValue` model.
 The smoke command rejects group/world-readable token files. Never inspect or
@@ -108,7 +132,10 @@ only M5-authorised normalized text messages through the M6 seam, replies using
 M5 `send_text`, and exits. `/health` truthfully reports only that local M6A
 initialization is available. Project reads/mutations have no M7 implementation.
 There is no saved offset or seen-update cache, so a later manual run may see an
-update again until durable consumption is implemented.
+update again until durable consumption is implemented. The first bounded poll
+may legitimately report `0 authorised updates` if Telegram has not yet surfaced
+the newly sent update; rerunning the bounded command is acceptable for this
+manual acceptance test.
 
 ## Verification, logs, and repeat updates
 
