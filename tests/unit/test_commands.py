@@ -63,6 +63,22 @@ def test_missing_argument_is_malformed(text: str) -> None:
     assert CommandParser().parse(message(text)).failure is ParseFailure.MALFORMED
 
 
+@pytest.mark.parametrize("text", ["gate", "gate only-id", "gate id response extra"])
+def test_malformed_gate_response_is_rejected(text: str) -> None:
+    assert CommandParser().parse(message(text)).failure is ParseFailure.MALFORMED
+
+
+@pytest.mark.parametrize("response", ["APPROVE", "REQUEST_CHANGES", "PASS", "FAIL"])
+def test_gate_response_parser_preserves_exact_identity(response: str) -> None:
+    result = CommandParser(lambda: "correlation-1").parse(
+        message(f"gate 00000000-0000-0000-0000-000000000001 {response}")
+    )
+    assert result.command is not None
+    assert result.command.type is CommandType.RESPOND_GATE
+    assert result.command.gate_reference == "00000000-0000-0000-0000-000000000001"
+    assert result.command.gate_response == response
+
+
 @pytest.mark.parametrize("text", ["ping extra", "health nonsense", "projects all"])
 def test_unexpected_argument_is_malformed(text: str) -> None:
     assert CommandParser().parse(message(text)).failure is ParseFailure.MALFORMED
@@ -80,11 +96,13 @@ def test_mutability_classification_is_explicit_and_complete() -> None:
         CommandType.HEALTH,
         CommandType.LIST_PROJECTS,
         CommandType.PROJECT_STATUS,
+        CommandType.WAITING,
     }
     assert STATE_CHANGING_COMMANDS == {
         CommandType.PAUSE_PROJECT,
         CommandType.RESUME_PROJECT,
         CommandType.CANCEL_PROJECT,
+        CommandType.RESPOND_GATE,
     }
     assert READ_ONLY_COMMANDS.isdisjoint(STATE_CHANGING_COMMANDS)
 

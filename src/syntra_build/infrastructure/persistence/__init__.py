@@ -31,6 +31,7 @@ from syntra_build.infrastructure.persistence.errors import (
     TransactionError,
     UnsatisfiedMilestoneDependenciesError,
 )
+from syntra_build.infrastructure.persistence.gates import SQLiteHumanGateRepository
 from syntra_build.infrastructure.persistence.jobs import (
     JobStateTransition,
     SQLiteJobRepository,
@@ -104,6 +105,7 @@ __all__ = [
     "MilestoneStateTransition",
     "SQLiteMilestoneRepository",
     "SQLiteJobRepository",
+    "SQLiteHumanGateRepository",
     "JobStateTransition",
     "StaleJobStateError",
     "JobProjectMismatchError",

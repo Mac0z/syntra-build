@@ -34,6 +34,7 @@ _COMMANDS = {
     "pause": (CommandType.PAUSE_PROJECT, True),
     "resume": (CommandType.RESUME_PROJECT, True),
     "cancel": (CommandType.CANCEL_PROJECT, True),
+    "waiting": (CommandType.WAITING, False),
 }
 
 
@@ -53,6 +54,23 @@ class CommandParser:
         else:
             token = head.casefold()
         definition = _COMMANDS.get(token)
+        if token == "gate":
+            arguments = parts[1].split() if len(parts) == 2 else []
+            if len(arguments) != 2:
+                return ParseResult(failure=ParseFailure.MALFORMED)
+            return ParseResult(
+                command=Command(
+                    type=CommandType.RESPOND_GATE,
+                    gate_reference=arguments[0],
+                    gate_response=arguments[1].upper(),
+                    requested_by=message.sender_id,
+                    requested_at=message.received_at,
+                    source_platform=message.source_platform,
+                    source_update_id=message.source_update_id,
+                    source_message_id=message.source_message_id,
+                    correlation_id=self._correlation_id_factory(),
+                )
+            )
         if definition is None:
             return ParseResult(failure=ParseFailure.UNKNOWN)
         command_type, needs_project = definition

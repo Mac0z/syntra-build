@@ -69,6 +69,11 @@ class LocalHealthService(Protocol):
     def current_health(self) -> str: ...
 
 
+class HumanGateCommandService(Protocol):
+    def waiting(self) -> str: ...
+    def respond(self, command: Command) -> str: ...
+
+
 class IntentResolver(Protocol):
     """Future extension used only after deterministic parsing is unrecognized."""
 

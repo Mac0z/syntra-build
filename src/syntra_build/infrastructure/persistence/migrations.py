@@ -233,6 +233,76 @@ MIGRATIONS: tuple[Migration, ...] = (
                 SELECT RAISE(ABORT,'job attempts are append-only'); END""",
         ),
     ),
+    Migration(
+        version=5,
+        name="005_human_gate_state_machine",
+        statements=(
+            "DROP TRIGGER state_transitions_no_update",
+            "DROP TRIGGER state_transitions_no_delete",
+            "DROP INDEX state_transitions_project_created",
+            "DROP INDEX state_transitions_milestone_created",
+            "DROP INDEX state_transitions_job_created",
+            "ALTER TABLE state_transitions RENAME TO state_transitions_m9",
+            """CREATE TABLE human_gates (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT, gate_type TEXT NOT NULL CHECK(gate_type IN
+                ('DESIGN_APPROVAL','PRODUCT_DECISION','TECHNICAL_DECISION','HUMAN_TEST',
+                 'FINAL_ACCEPTANCE','RECOVERY_DECISION')),
+                state TEXT NOT NULL CHECK(state IN
+                ('PENDING','NOTIFIED','RESPONDED','VALIDATED','RESOLVED','EXPIRED','CANCELLED')),
+                title TEXT NOT NULL, prompt TEXT NOT NULL,
+                expected_response_type TEXT NOT NULL CHECK(expected_response_type IN
+                ('DESIGN_APPROVAL','HUMAN_TEST','OPTION')),
+                options_json TEXT NOT NULL, architect_recommendation TEXT,
+                resume_project_state TEXT, resume_milestone_state TEXT,
+                created_at TEXT NOT NULL, notified_at TEXT, responded_at TEXT, resolved_at TEXT,
+                created_by TEXT NOT NULL, correlation_id TEXT NOT NULL, artifact_reference TEXT,
+                FOREIGN KEY(project_id,milestone_id) REFERENCES milestones(project_id,id)
+            ) STRICT""",
+            "CREATE UNIQUE INDEX human_gates_project_identity ON human_gates(project_id,id)",
+            """CREATE TABLE human_gate_responses (
+                id TEXT PRIMARY KEY, gate_id TEXT NOT NULL REFERENCES human_gates(id),
+                message_id TEXT NOT NULL UNIQUE, response_code TEXT NOT NULL,
+                response_text TEXT, selected_option TEXT, attachments_json TEXT NOT NULL,
+                responded_by TEXT NOT NULL, responded_at TEXT NOT NULL,
+                validated INTEGER NOT NULL CHECK(validated IN (0,1)), validation_notes TEXT
+            ) STRICT""",
+            """CREATE TABLE state_transitions (
+                id TEXT PRIMARY KEY, entity_type TEXT NOT NULL CHECK(entity_type IN
+                ('PROJECT','MILESTONE','JOB','HUMAN_GATE')),
+                entity_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT REFERENCES milestones(id), job_id TEXT REFERENCES jobs(id),
+                gate_id TEXT REFERENCES human_gates(id), previous_state TEXT NOT NULL,
+                new_state TEXT NOT NULL, reason TEXT NOT NULL, trigger_event_id TEXT,
+                actor_type TEXT NOT NULL, actor_id TEXT, correlation_id TEXT NOT NULL,
+                created_at TEXT NOT NULL, metadata_json TEXT,
+                CHECK ((entity_type='PROJECT' AND entity_id=project_id AND milestone_id IS NULL AND job_id IS NULL AND gate_id IS NULL)
+                    OR (entity_type='MILESTONE' AND entity_id=milestone_id AND milestone_id IS NOT NULL AND job_id IS NULL AND gate_id IS NULL)
+                    OR (entity_type='JOB' AND entity_id=job_id AND job_id IS NOT NULL AND gate_id IS NULL)
+                    OR (entity_type='HUMAN_GATE' AND entity_id=gate_id AND gate_id IS NOT NULL))
+            ) STRICT""",
+            """INSERT INTO state_transitions
+                (id,entity_type,entity_id,project_id,milestone_id,job_id,gate_id,previous_state,new_state,
+                 reason,trigger_event_id,actor_type,actor_id,correlation_id,created_at,metadata_json)
+                SELECT id,entity_type,entity_id,project_id,milestone_id,job_id,NULL,previous_state,new_state,
+                 reason,trigger_event_id,actor_type,actor_id,correlation_id,created_at,metadata_json
+                FROM state_transitions_m9""",
+            "DROP TABLE state_transitions_m9",
+            "CREATE INDEX state_transitions_project_created ON state_transitions(project_id,created_at)",
+            "CREATE INDEX state_transitions_milestone_created ON state_transitions(milestone_id,created_at)",
+            "CREATE INDEX state_transitions_job_created ON state_transitions(job_id,created_at)",
+            "CREATE INDEX state_transitions_gate_created ON state_transitions(gate_id,created_at)",
+            "CREATE INDEX human_gates_outstanding ON human_gates(state,created_at)",
+            """CREATE TRIGGER state_transitions_no_update BEFORE UPDATE ON state_transitions BEGIN
+                SELECT RAISE(ABORT,'state transitions are append-only'); END""",
+            """CREATE TRIGGER state_transitions_no_delete BEFORE DELETE ON state_transitions BEGIN
+                SELECT RAISE(ABORT,'state transitions are append-only'); END""",
+            """CREATE TRIGGER human_gate_responses_no_update BEFORE UPDATE ON human_gate_responses BEGIN
+                SELECT RAISE(ABORT,'human gate responses are immutable'); END""",
+            """CREATE TRIGGER human_gate_responses_no_delete BEFORE DELETE ON human_gate_responses BEGIN
+                SELECT RAISE(ABORT,'human gate responses are append-only'); END""",
+        ),
+    ),
 )
 
 

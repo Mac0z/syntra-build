@@ -9,7 +9,22 @@ from syntra_build.domain.errors import (
     InvalidRetryMetadataError,
 )
 from syntra_build.domain.events import WorkflowEvent
-from syntra_build.domain.gates import GateState, GateType, HumanGate
+from syntra_build.domain.gate_state_machine import (
+    VALID_GATE_TRANSITIONS,
+    GateTransitionRequest,
+    is_gate_transition_allowed,
+    validate_gate_transition,
+)
+from syntra_build.domain.gates import (
+    DesignApprovalResponse,
+    ExpectedResponseType,
+    GateState,
+    GateType,
+    HumanGate,
+    HumanGateResponse,
+    HumanTestResponse,
+    validate_response,
+)
 from syntra_build.domain.identifiers import (
     GateId,
     JobId,
@@ -57,6 +72,15 @@ __all__ = [
     "GateState",
     "GateType",
     "HumanGate",
+    "HumanGateResponse",
+    "ExpectedResponseType",
+    "DesignApprovalResponse",
+    "HumanTestResponse",
+    "GateTransitionRequest",
+    "VALID_GATE_TRANSITIONS",
+    "is_gate_transition_allowed",
+    "validate_gate_transition",
+    "validate_response",
     "Job",
     "JobId",
     "JobState",

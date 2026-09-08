@@ -15,6 +15,8 @@ class CommandType(StrEnum):
     PAUSE_PROJECT = "PAUSE_PROJECT"
     RESUME_PROJECT = "RESUME_PROJECT"
     CANCEL_PROJECT = "CANCEL_PROJECT"
+    WAITING = "WAITING"
+    RESPOND_GATE = "RESPOND_GATE"
 
 
 READ_ONLY_COMMANDS = frozenset(
@@ -23,6 +25,7 @@ READ_ONLY_COMMANDS = frozenset(
         CommandType.HEALTH,
         CommandType.LIST_PROJECTS,
         CommandType.PROJECT_STATUS,
+        CommandType.WAITING,
     }
 )
 STATE_CHANGING_COMMANDS = frozenset(
@@ -30,6 +33,7 @@ STATE_CHANGING_COMMANDS = frozenset(
         CommandType.PAUSE_PROJECT,
         CommandType.RESUME_PROJECT,
         CommandType.CANCEL_PROJECT,
+        CommandType.RESPOND_GATE,
     }
 )
 
@@ -76,6 +80,8 @@ class Command:
     source_message_id: str
     correlation_id: str
     project_reference: str | None = None
+    gate_reference: str | None = None
+    gate_response: str | None = None
 
     @property
     def is_state_changing(self) -> bool:
