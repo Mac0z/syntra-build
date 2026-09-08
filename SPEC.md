@@ -32,6 +32,7 @@ The following superseding decisions are especially important:
 - **GitHub** is the canonical source-control platform for Syntra Build itself and generated projects. Any older Forgejo source-control assumption is superseded.
 - **Architect approval is evidence, not a milestone state.** `ARCHITECT_APPROVED` may be recorded as a workflow event, review verdict or persisted piece of approval evidence, but it is not a member of the milestone-state vocabulary. The milestone remains within the approved state model and may progress toward `MERGE_READY` only after Syntra has validated all required evidence for the current revision.
 - **Telegram transport does not own command routing or durable duplicate processing.** The Telegram adapter is responsible for bounded provider interaction, authorization, normalization, sending, and exposing stable provider identifiers and caller-managed update offsets. Deterministic command routing begins in M6. Durable consumed-update/duplicate state belongs to the trusted consuming workflow/persistence layer and must not be held authoritatively in the Telegram adapter.
+- **Target-host validation begins after M6.** M6A is a development-deployment checkpoint on the Syntra Raspberry Pi, used to prove Python 3.14/ARM64 packaging, filesystem permissions, SQLite bootstrap and the real Telegram `ping` path before state-machine work continues. It is not the final production deployment model: managed `systemd` operation, operational health/metrics, hardened upgrades and self-hosting remain later milestones.
 
 If a genuine unresolved conflict remains, implementation must stop at the affected scope and raise a human/Architect decision rather than silently choosing.
 
@@ -729,11 +730,55 @@ A milestone may be split into smaller milestones if implementation proves broade
 
 **Exit gate:** All listed acceptance criteria pass in CI and the PR is approved against this specification.
 
+### M6A — Syntra host development deployment
+
+**Objective:** Deploy the merged M0-M6 stack to the target Syntra Raspberry Pi and prove the real host/runtime/Telegram path before introducing authoritative project state-machine behaviour.
+
+**Dependencies:** M6
+
+**Required deliverables:**
+- documented manual deployment from an exact GitHub `main` commit SHA to the target host
+- Python 3.14 virtual environment and package installation on Linux ARM64
+- dedicated unprivileged Syntra runtime identity consistent with the security model
+- development runtime layout using `/opt/syntra-build`, `/etc/syntra-build`, `/var/lib/syntra-build` and `/var/log/syntra-build`
+- protected local configuration/secrets with the Telegram bot token kept outside Git and ordinary serialised configuration
+- SQLite bootstrap using the existing migration/integrity path against the target data directory
+- deterministic local smoke command proving configuration, logging, database and M6 routing can initialise on the host
+- bounded Telegram smoke runner that performs one polling interaction, routes an authorised M6 command and sends the resulting response through M5
+- deployment/runbook instructions covering install/update, exact revision verification, smoke execution and safe failure reporting
+- tests for any new deterministic deployment/smoke wiring that can run in CI without a real host or Telegram credential
+
+**Development-deployment boundaries:**
+- M6A is a host-validation checkpoint, not the final production service lifecycle;
+- deployment is manual and operator-driven at this stage; GitHub Actions must not SSH to or automatically deploy the Syntra host;
+- the host checkout/install must be tied to an explicit Git commit SHA so the tested revision is known;
+- the smoke runner performs bounded interactions only and must not introduce an infinite Telegram polling loop or scheduler;
+- no `systemd` service is required by M6A; managed long-running `systemd` operation remains an operational milestone requirement;
+- M6A must not implement M7 project transitions, later state machines, durable Telegram-offset processing, workflow-event dispatch, scheduler behavior, Architect/Codex/GitHub orchestration or self-hosting;
+- real credentials remain host-local and must never be committed, printed or included in CI artifacts/logs.
+
+**Acceptance criteria:**
+- The exact approved `main` revision can be installed on the Syntra Raspberry Pi using Python 3.14 on Linux ARM64.
+- The runtime directories exist with ownership/permissions that allow Syntra to run unprivileged without making secrets broadly readable.
+- Production-like configuration loads successfully from the host layout while the Telegram token remains outside ordinary serialised configuration.
+- A fresh SQLite database can be bootstrapped under `/var/lib/syntra-build`, uses the existing migration path, reports WAL mode and passes the existing integrity check.
+- A local smoke invocation initialises configuration/logging/database/routing and verifies deterministic `ping` routing returns `pong` without contacting Telegram.
+- A bounded real Telegram smoke test allows an authorised user to send `/ping` and receive `pong` through the M5 transport and M6 router.
+- `/health` and unsupported-command help can be exercised through the same bounded smoke path without inventing future health semantics.
+- An unauthorised Telegram sender is not routed as an instruction source.
+- Telegram credentials, credential-bearing URLs and unrestricted message bodies are absent from repository content, command output and application logs.
+- Re-running the documented installation/bootstrap process against the same revision is safe and does not corrupt the database or runtime layout.
+- All CI-testable behavior remains deterministic and credential-free, and all M0-M6 tests continue to pass.
+
+**Human acceptance:** On the real Syntra host, confirm from the authorised Telegram account that `/ping` returns `pong`, `/health` returns the truthful current local health response, and an unsupported command returns deterministic help. Confirm the deployed revision matches the approved GitHub `main` SHA.
+
+**Exit gate:** CI passes for the implementation PR, the PR is approved and merged, and the documented target-host smoke test succeeds against that merged revision.
+
 ### M7 — Project state machine
 
 **Objective:** Implement the authoritative project lifecycle and guards.
 
-**Dependencies:** M4, M6
+**Dependencies:** M4, M6A
 
 **Required deliverables:**
 - project states from `STATE_MACHINE.md`
