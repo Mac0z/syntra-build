@@ -88,7 +88,9 @@ WAITING_EXTERNAL
 
 Architect, Codex, GitHub and Telegram may produce events.
 
-Those events are interpreted by Syntra.
+Those events are interpreted and validated by Syntra.
+
+External actors never directly assign authoritative project, milestone, job or human-gate state.
 
 For example:
 
@@ -97,7 +99,7 @@ Architect response:
 APPROVE
 ```
 
-does not directly change a milestone to `COMPLETE`.
+does not directly change a milestone to `COMPLETE`, `MERGE_READY`, or to a separate Architect-approval state.
 
 Instead:
 
@@ -106,10 +108,28 @@ Architect response
     ↓
 Syntra validates response
     ↓
-Milestone → ARCHITECT_APPROVED
+ARCHITECT_APPROVED event / review evidence recorded
     ↓
-Syntra evaluates remaining gates
+Syntra verifies the approval applies to the current exact PR revision
+    ↓
+Syntra evaluates remaining CI and human-gate prerequisites
+    ↓
+Milestone → MERGE_READY
+    only when every required prerequisite is satisfied
 ```
+
+`ARCHITECT_APPROVED` is therefore an event/verdict and persisted piece of review evidence.
+
+It is **not** a milestone state.
+
+The authoritative milestone-state vocabulary is the one defined in Section 7 and does not contain `ARCHITECT_APPROVED`.
+
+This distinction preserves separation between:
+
+- **state** — Syntra's authoritative current workflow position;
+- **evidence/events** — facts such as CI success, Architect approval or human-test success that may permit a later state transition.
+
+A new relevant code revision may invalidate previously recorded evidence according to policy without requiring an invented intermediate milestone state.
 
 ---
 
