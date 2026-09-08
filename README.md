@@ -84,6 +84,19 @@ Development and tests should configure safe local or temporary database paths;
 tests must never use the production database. Schema changes belong in explicit
 migrations and should not normally be made by editing a database manually.
 
+## Telegram gateway
+
+Telegram is the initial messaging transport. Enable it through the central
+configuration and provide an allowlist of stable, numeric Telegram user IDs;
+usernames are not authorization identities. Supply the bot token separately as
+a protected secret input, never as ordinary project configuration.
+
+The M5 adapter performs bounded long polls and plain-text sends only. It
+normalizes authorized text updates and exposes provider update/message IDs so a
+later durable consumer can manage offsets and duplicate delivery. It neither
+stores offsets nor routes commands; deterministic command routing arrives in
+M6.
+
 ## Project documentation
 
 - [Implementation specification](SPEC.md)
