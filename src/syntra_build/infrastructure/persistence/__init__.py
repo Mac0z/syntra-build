@@ -1,0 +1,81 @@
+"""SQLite persistence bootstrap and explicit connection ownership."""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+
+from syntra_build.infrastructure.config import ApplicationConfig
+from syntra_build.infrastructure.persistence.connection import (
+    BUSY_TIMEOUT_MILLISECONDS,
+    open_database,
+    transaction,
+)
+from syntra_build.infrastructure.persistence.errors import (
+    DatabaseConnectionError,
+    DatabaseIntegrityError,
+    MigrationError,
+    PersistenceError,
+    TransactionError,
+)
+from syntra_build.infrastructure.persistence.migrations import (
+    MIGRATIONS,
+    Migration,
+    apply_migrations,
+    current_schema_version,
+    validate_migrations,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def validate_integrity_results(results: list[str]) -> None:
+    """Validate the deterministic result returned by SQLite ``quick_check``."""
+    if results != ["ok"]:
+        raise DatabaseIntegrityError("database quick integrity check failed")
+
+
+def check_database_integrity(connection: sqlite3.Connection) -> None:
+    """Run SQLite's lightweight startup integrity validation."""
+    try:
+        rows = connection.execute("PRAGMA quick_check").fetchall()
+    except sqlite3.Error as error:
+        raise DatabaseIntegrityError(
+            "database integrity could not be checked"
+        ) from error
+    validate_integrity_results([str(row[0]).casefold() for row in rows])
+    _LOGGER.info(
+        "Database integrity checked", extra={"event": "database_integrity_checked"}
+    )
+
+
+def bootstrap_database(config: ApplicationConfig) -> sqlite3.Connection:
+    """Open, migrate, validate, and return a caller-owned database connection."""
+    connection = open_database(config.database.sqlite_path)
+    try:
+        apply_migrations(connection)
+        check_database_integrity(connection)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+__all__ = [
+    "BUSY_TIMEOUT_MILLISECONDS",
+    "MIGRATIONS",
+    "DatabaseConnectionError",
+    "DatabaseIntegrityError",
+    "Migration",
+    "MigrationError",
+    "PersistenceError",
+    "TransactionError",
+    "apply_migrations",
+    "bootstrap_database",
+    "check_database_integrity",
+    "current_schema_version",
+    "open_database",
+    "transaction",
+    "validate_integrity_results",
+    "validate_migrations",
+]
