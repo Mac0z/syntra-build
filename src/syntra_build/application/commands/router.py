@@ -14,6 +14,7 @@ from syntra_build.application.commands.parser import CommandParser
 from syntra_build.application.commands.services import (
     CommandAuditRequest,
     CommandAuditSink,
+    HumanGateCommandService,
     LocalHealthService,
     ProjectCommandService,
     ProjectQueryService,
@@ -29,7 +30,9 @@ projects
 status <project>
 pause <project>
 resume <project>
-cancel <project>"""
+cancel <project>
+waiting
+gate <gate-id> <response>"""
 
 _LOGGER = logging.getLogger("syntra_build.application.commands")
 
@@ -42,12 +45,14 @@ class CommandRouter:
         project_commands: ProjectCommandService,
         audit_sink: CommandAuditSink,
         health: LocalHealthService,
+        gate_commands: HumanGateCommandService | None = None,
         parser: CommandParser | None = None,
     ) -> None:
         self._queries = project_queries
         self._commands = project_commands
         self._audit = audit_sink
         self._health = health
+        self._gate_commands = gate_commands
         self._parser = parser or CommandParser()
 
     def route(self, message: InboundMessage) -> CommandResponse:
@@ -97,6 +102,18 @@ class CommandRouter:
             return self._health.current_health()
         if command.type is CommandType.LIST_PROJECTS:
             return self._format_projects(self._queries.list_projects())
+        if command.type is CommandType.WAITING:
+            return (
+                self._gate_commands.waiting()
+                if self._gate_commands
+                else "No human actions are currently waiting."
+            )
+        if command.type is CommandType.RESPOND_GATE:
+            return (
+                self._gate_commands.respond(command)
+                if self._gate_commands
+                else "Human gate handling is not available."
+            )
         project = self._resolve(command)
         if isinstance(project, str):
             return project

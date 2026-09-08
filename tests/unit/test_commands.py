@@ -80,11 +80,13 @@ def test_mutability_classification_is_explicit_and_complete() -> None:
         CommandType.HEALTH,
         CommandType.LIST_PROJECTS,
         CommandType.PROJECT_STATUS,
+        CommandType.WAITING,
     }
     assert STATE_CHANGING_COMMANDS == {
         CommandType.PAUSE_PROJECT,
         CommandType.RESUME_PROJECT,
         CommandType.CANCEL_PROJECT,
+        CommandType.RESPOND_GATE,
     }
     assert READ_ONLY_COMMANDS.isdisjoint(STATE_CHANGING_COMMANDS)
 

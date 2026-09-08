@@ -71,3 +71,27 @@ class InvalidAttemptError(PersistenceError):
 
 class ImmutableTerminalAttemptError(PersistenceError):
     """A terminal attempt cannot be changed."""
+
+
+class GateNotFoundError(PersistenceError):
+    pass
+
+
+class GateProjectMismatchError(PersistenceError):
+    pass
+
+
+class GateMilestoneProjectMismatchError(PersistenceError):
+    pass
+
+
+class StaleGateStateError(PersistenceError):
+    pass
+
+
+class ClosedGateError(PersistenceError):
+    pass
+
+
+class DuplicateGateResponseError(PersistenceError):
+    pass

@@ -23,3 +23,15 @@ class InvalidJobTransitionError(ValueError):
 
 class InvalidRetryMetadataError(InvalidJobTransitionError):
     """Retry state lacks a future attempt or durable failure metadata."""
+
+
+class InvalidGateTransitionError(ValueError):
+    """A requested human-gate transition violates the lifecycle policy."""
+
+
+class InvalidGateResponseError(ValueError):
+    """A human response does not satisfy the gate's deterministic schema."""
+
+
+class InvalidResumeTargetError(ValueError):
+    """A gate resume target is not valid for the associated workflow."""
