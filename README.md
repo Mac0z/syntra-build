@@ -72,6 +72,18 @@ details in `metadata`. Sensitive keys and M1 secret wrappers are redacted, but
 callers must still never put credentials, authorization values, private keys,
 environment dumps, or unrestricted provider payloads in logs.
 
+## Persistence
+
+SQLite is Syntra Build's persistent state store. Database bootstrap uses the
+validated `database.sqlite_path` configuration, enables foreign keys and WAL
+mode, applies source-controlled migrations automatically, and performs a
+lightweight integrity check. The returned connection is caller-owned and must
+be closed when no longer needed.
+
+Development and tests should configure safe local or temporary database paths;
+tests must never use the production database. Schema changes belong in explicit
+migrations and should not normally be made by editing a database manually.
+
 ## Project documentation
 
 - [Implementation specification](SPEC.md)
