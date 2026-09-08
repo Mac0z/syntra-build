@@ -55,6 +55,13 @@ configuration serialisation, and are redacted from representations. Supply
 credentials through host-protected facilities in production. Never commit a
 `.env` file or credentials.
 
+The M12 scheduler reads durable `QUEUED` jobs on every bounded cycle; there is
+no authoritative in-memory queue. Its per-worker defaults are Architect 2,
+Codex 2, Git/repository provisioning 1, GitHub/merge 1, CI 8, messaging 8,
+recovery 2, and internal 4. These positive bounded values are configured in the
+central `scheduler` group. Scheduling is priority/FIFO in M12; cross-project
+fairness and retry timing policy are deliberately deferred to M13.
+
 ## Logging
 
 `syntra_build.infrastructure.logging.configure_logging` configures the

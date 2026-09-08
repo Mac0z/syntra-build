@@ -49,6 +49,10 @@ ENVIRONMENT_KEYS = frozenset(
         "SYNTRA_CODEX_CONCURRENCY",
         "SYNTRA_REPOSITORY_PROVISIONING_CONCURRENCY",
         "SYNTRA_MERGE_CONCURRENCY",
+        "SYNTRA_CI_CONCURRENCY",
+        "SYNTRA_MESSAGING_CONCURRENCY",
+        "SYNTRA_RECOVERY_CONCURRENCY",
+        "SYNTRA_INTERNAL_CONCURRENCY",
         "SYNTRA_INFRASTRUCTURE_RETRY_ATTEMPTS",
         "SYNTRA_CODEX_TIMEOUT_SECONDS",
     }
@@ -309,6 +313,40 @@ def load_config(
                 "scheduler.merge_concurrency",
                 _pick(
                     scheduler, "merge_concurrency", env, "SYNTRA_MERGE_CONCURRENCY", 1
+                ),
+            ),
+            ci_concurrency=_int(
+                "scheduler.ci_concurrency",
+                _pick(scheduler, "ci_concurrency", env, "SYNTRA_CI_CONCURRENCY", 8),
+            ),
+            messaging_concurrency=_int(
+                "scheduler.messaging_concurrency",
+                _pick(
+                    scheduler,
+                    "messaging_concurrency",
+                    env,
+                    "SYNTRA_MESSAGING_CONCURRENCY",
+                    8,
+                ),
+            ),
+            recovery_concurrency=_int(
+                "scheduler.recovery_concurrency",
+                _pick(
+                    scheduler,
+                    "recovery_concurrency",
+                    env,
+                    "SYNTRA_RECOVERY_CONCURRENCY",
+                    2,
+                ),
+            ),
+            internal_concurrency=_int(
+                "scheduler.internal_concurrency",
+                _pick(
+                    scheduler,
+                    "internal_concurrency",
+                    env,
+                    "SYNTRA_INTERNAL_CONCURRENCY",
+                    4,
                 ),
             ),
         ),

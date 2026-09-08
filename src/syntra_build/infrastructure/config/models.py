@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import ClassVar
 
+from syntra_build.domain.jobs import WorkerClass
+
 
 class ConfigurationError(ValueError):
     """Raised when application configuration is unsafe or malformed."""
@@ -206,6 +208,10 @@ class SchedulerConfig:
     codex_concurrency: int = 2
     repository_provisioning_concurrency: int = 1
     merge_concurrency: int = 1
+    ci_concurrency: int = 8
+    messaging_concurrency: int = 8
+    recovery_concurrency: int = 2
+    internal_concurrency: int = 4
 
     MAX_CONCURRENCY: ClassVar[int] = 128
 
@@ -215,12 +221,29 @@ class SchedulerConfig:
             "codex_concurrency",
             "repository_provisioning_concurrency",
             "merge_concurrency",
+            "ci_concurrency",
+            "messaging_concurrency",
+            "recovery_concurrency",
+            "internal_concurrency",
         ):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= self.MAX_CONCURRENCY:
                 raise ConfigurationError(
                     f"scheduler.{name} must be between 1 and {self.MAX_CONCURRENCY}"
                 )
+
+    def worker_class_limits(self) -> dict[WorkerClass, int]:
+        """Map M1 operation names onto M9 worker-class capacity."""
+        return {
+            WorkerClass.ARCHITECT: self.architect_concurrency,
+            WorkerClass.CODEX: self.codex_concurrency,
+            WorkerClass.GIT: self.repository_provisioning_concurrency,
+            WorkerClass.GITHUB: self.merge_concurrency,
+            WorkerClass.CI: self.ci_concurrency,
+            WorkerClass.MESSAGING: self.messaging_concurrency,
+            WorkerClass.RECOVERY: self.recovery_concurrency,
+            WorkerClass.INTERNAL: self.internal_concurrency,
+        }
 
 
 @dataclass(frozen=True, slots=True)
