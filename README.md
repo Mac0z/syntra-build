@@ -106,6 +106,7 @@ not itself apply project lifecycle transitions.
 
 ## Project documentation
 
+- [M6A target-host development deployment](docs/DEVELOPMENT_DEPLOYMENT.md)
 - [Implementation specification](SPEC.md)
 - [Engineering instructions](AGENTS.md)
 - [Design documents](docs/)
