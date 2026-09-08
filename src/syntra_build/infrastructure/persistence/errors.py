@@ -49,6 +49,10 @@ class StaleJobStateError(PersistenceError):
     """The job no longer has the caller's expected state."""
 
 
+class JobProjectStateIneligibleError(PersistenceError):
+    """The owning project changed to a state that forbids this job claim."""
+
+
 class JobProjectMismatchError(PersistenceError):
     """A job operation named a project other than its owner."""
 

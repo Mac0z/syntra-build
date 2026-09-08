@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from syntra_build.domain import WorkerClass
 from syntra_build.infrastructure.config import (
     ConfigurationError,
     FilesystemConfig,
@@ -36,6 +37,16 @@ def test_default_configuration_loads_without_credentials() -> None:
     assert not config.telegram.enabled
     assert not config.architect.enabled
     assert not config.github.enabled
+    assert config.scheduler.worker_class_limits() == {
+        WorkerClass.ARCHITECT: 2,
+        WorkerClass.CODEX: 2,
+        WorkerClass.GIT: 1,
+        WorkerClass.GITHUB: 1,
+        WorkerClass.CI: 8,
+        WorkerClass.MESSAGING: 8,
+        WorkerClass.RECOVERY: 2,
+        WorkerClass.INTERNAL: 4,
+    }
 
 
 def test_development_paths_are_canonical_and_derived(tmp_path: Path) -> None:

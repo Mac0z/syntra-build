@@ -26,6 +26,7 @@ from syntra_build.infrastructure.persistence.errors import (
     InvalidEventCausationError,
     JobMilestoneProjectMismatchError,
     JobProjectMismatchError,
+    JobProjectStateIneligibleError,
     MigrationError,
     MilestoneDependencyError,
     MilestoneProjectMismatchError,
@@ -41,6 +42,7 @@ from syntra_build.infrastructure.persistence.events import SQLiteWorkflowEventRe
 from syntra_build.infrastructure.persistence.gates import SQLiteHumanGateRepository
 from syntra_build.infrastructure.persistence.jobs import (
     JobStateTransition,
+    SchedulableJob,
     SQLiteJobRepository,
 )
 from syntra_build.infrastructure.persistence.migrations import (
@@ -115,8 +117,10 @@ __all__ = [
     "SQLiteHumanGateRepository",
     "SQLiteWorkflowEventRepository",
     "JobStateTransition",
+    "SchedulableJob",
     "StaleJobStateError",
     "JobProjectMismatchError",
+    "JobProjectStateIneligibleError",
     "JobMilestoneProjectMismatchError",
     "TerminalJobMutationError",
     "AttemptLimitExhaustedError",

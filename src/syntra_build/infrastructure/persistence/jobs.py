@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -23,6 +23,7 @@ from syntra_build.domain.jobs import (
     JobState,
     WorkerClass,
 )
+from syntra_build.domain.projects import ProjectState
 from syntra_build.infrastructure.persistence.connection import transaction_scope
 from syntra_build.infrastructure.persistence.errors import (
     AttemptLimitExhaustedError,
@@ -30,6 +31,7 @@ from syntra_build.infrastructure.persistence.errors import (
     InvalidAttemptError,
     JobMilestoneProjectMismatchError,
     JobProjectMismatchError,
+    JobProjectStateIneligibleError,
     PersistenceError,
     StaleJobStateError,
     TerminalJobMutationError,
@@ -67,6 +69,14 @@ class JobStateTransition:
     created_at: datetime
     trigger_event_id: str | None
     metadata: Mapping[str, object] | None
+
+
+@dataclass(frozen=True, slots=True)
+class SchedulableJob:
+    """Typed queue candidate with a non-authoritative project-state snapshot."""
+
+    job: Job
+    project_state: ProjectState
 
 
 class SQLiteJobRepository:
@@ -143,6 +153,65 @@ class SQLiteJobRepository:
             json.loads(row["result_json"]),
             row["last_error_id"],
         )
+
+    def eligible(
+        self, now: datetime, limit: int | None = None
+    ) -> tuple[SchedulableJob, ...]:
+        """Return due queued jobs in stable priority/FIFO order."""
+        if now.tzinfo is None or now.utcoffset() != UTC.utcoffset(now):
+            raise ValueError("scheduler eligibility time must be UTC")
+        if limit is not None and (type(limit) is not int or limit < 1):
+            raise ValueError("scheduler eligibility limit must be positive")
+        sql = """SELECT jobs.id,projects.state AS project_state
+                 FROM jobs JOIN projects ON projects.id=jobs.project_id
+                 WHERE jobs.state='QUEUED'
+                   AND (jobs.scheduled_at IS NULL OR jobs.scheduled_at<=?)
+                 ORDER BY jobs.priority DESC,
+                          COALESCE(jobs.scheduled_at,jobs.created_at) ASC,
+                          jobs.created_at ASC,jobs.id ASC"""
+        parameters: list[object] = [_ts(now)]
+        if limit is not None:
+            sql += " LIMIT ?"
+            parameters.append(limit)
+        rows = self._connection.execute(sql, parameters).fetchall()
+        return tuple(
+            SchedulableJob(
+                self.get(JobId.from_string(row["id"])),
+                ProjectState(row["project_state"]),
+            )
+            for row in rows
+        )
+
+    def claim_for_dispatch(
+        self,
+        request: JobTransitionRequest,
+        allowed_project_states: Collection[ProjectState],
+    ) -> Job:
+        """Atomically revalidate project policy and claim a queued job."""
+        if (
+            request.expected_state is not JobState.QUEUED
+            or request.target_state is not JobState.DISPATCHED
+        ):
+            raise ValueError("scheduler claim must transition QUEUED to DISPATCHED")
+        allowed = frozenset(allowed_project_states)
+        try:
+            with transaction_scope(self._connection):
+                project_row = self._connection.execute(
+                    "SELECT state FROM projects WHERE id=?", (str(request.project_id),)
+                ).fetchone()
+                if project_row is None:
+                    raise PersistenceError("project does not exist")
+                if ProjectState(project_row["state"]) not in allowed:
+                    raise JobProjectStateIneligibleError(
+                        "project state does not permit job dispatch"
+                    )
+                return self.apply_transition(request)
+        except JobProjectStateIneligibleError, PersistenceError, ValueError:
+            raise
+        except sqlite3.Error as error:
+            raise PersistenceError(
+                "job dispatch claim could not be persisted"
+            ) from error
 
     def attempts(self, job_id: JobId, project_id: ProjectId) -> tuple[JobAttempt, ...]:
         self.get(job_id, project_id)
