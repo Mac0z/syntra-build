@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 from syntra_build.domain import (
     Project,
+    ProjectCreationContext,
     ProjectId,
     ProjectState,
     ProjectTransitionRequest,
@@ -34,19 +35,6 @@ class ProjectStateTransition:
     correlation_id: str
     created_at: datetime
     trigger_event_id: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class ProjectCreationContext:
-    project_id: ProjectId
-    owner_id: str
-    initial_request: str
-    messaging_platform: str
-    conversation_id: str
-    thread_id: str | None
-    source_update_id: str
-    source_message_id: str
-    created_at: datetime
 
 
 def _timestamp(value: datetime) -> str:

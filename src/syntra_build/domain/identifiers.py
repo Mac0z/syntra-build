@@ -67,3 +67,18 @@ class WorkflowEventId(_UUIDIdentifier):
 @dataclass(frozen=True, slots=True)
 class StateTransitionId(_UUIDIdentifier):
     """Stable identity for an immutable state-transition record."""
+
+
+@dataclass(frozen=True, slots=True)
+class MessageId(_UUIDIdentifier):
+    """Stable identity for a persisted design message."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectDocumentId(_UUIDIdentifier):
+    """Stable identity for an immutable project-document revision."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectDecisionId(_UUIDIdentifier):
+    """Stable identity for a structured project design decision."""

@@ -1,5 +1,15 @@
 """Provider-independent core domain records for Syntra Build."""
 
+from syntra_build.domain.design import (
+    DecisionSource,
+    DesignMessage,
+    DocumentStatus,
+    DocumentType,
+    MessageDirection,
+    ProjectDecision,
+    ProjectDesignContext,
+    ProjectDocument,
+)
 from syntra_build.domain.errors import (
     DomainValidationError,
     InvalidBlockedRecoveryError,
@@ -35,7 +45,10 @@ from syntra_build.domain.gates import (
 from syntra_build.domain.identifiers import (
     GateId,
     JobId,
+    MessageId,
     MilestoneId,
+    ProjectDecisionId,
+    ProjectDocumentId,
     ProjectId,
     StateTransitionId,
     WorkflowEventId,
@@ -68,9 +81,20 @@ from syntra_build.domain.project_state_machine import (
     is_transition_allowed,
     validate_transition,
 )
-from syntra_build.domain.projects import Project, ProjectState
+from syntra_build.domain.projects import Project, ProjectCreationContext, ProjectState
 
 __all__ = [
+    "DecisionSource",
+    "DesignMessage",
+    "DocumentStatus",
+    "DocumentType",
+    "MessageDirection",
+    "MessageId",
+    "ProjectDecision",
+    "ProjectDecisionId",
+    "ProjectDesignContext",
+    "ProjectDocument",
+    "ProjectDocumentId",
     "DomainValidationError",
     "InvalidProjectTransitionError",
     "InvalidBlockedRecoveryError",
@@ -108,6 +132,7 @@ __all__ = [
     "ACTIVE_MILESTONE_STATES",
     "VALID_MILESTONE_TRANSITIONS",
     "Project",
+    "ProjectCreationContext",
     "ProjectId",
     "ProjectState",
     "ProjectTransitionRequest",
