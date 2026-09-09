@@ -2222,6 +2222,13 @@ Used to detect workflow loops.
 
 These serve different purposes and should not be conflated.
 
+M13 stores these as explicit `milestones.codex_cycle_count`,
+`ci_rework_count`, `architect_rework_count`, and `human_test_rework_count`
+columns. Job failure classification, retry exhaustion, and its concise reason are
+likewise explicit job columns. Migration 007 is forward-only but additive; rollback
+requires restoring a pre-migration backup because SQLite does not drop these columns
+during normal application operation.
+
 ---
 
 # 55. Document and Repository Consistency

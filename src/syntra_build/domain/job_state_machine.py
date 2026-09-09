@@ -11,6 +11,7 @@ from syntra_build.domain._validation import (
     require_utc,
 )
 from syntra_build.domain.errors import InvalidJobTransitionError
+from syntra_build.domain.failures import FailureClassification
 from syntra_build.domain.identifiers import JobId, ProjectId
 from syntra_build.domain.jobs import JobState, StructuredMetadata
 
@@ -64,6 +65,9 @@ class JobTransitionRequest:
     external_request_id: str | None = None
     process_id: str | None = None
     logs_reference: str | None = None
+    failure_classification: FailureClassification | None = None
+    retry_exhausted: bool = False
+    exhaustion_reason: str | None = None
 
     def __post_init__(self) -> None:
         require_identifier(self.job_id, JobId, "job_id")

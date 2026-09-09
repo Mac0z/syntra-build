@@ -54,6 +54,11 @@ class Milestone:
     activity: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    codex_cycle_count: int = 0
+    ci_rework_count: int = 0
+    architect_rework_count: int = 0
+    human_test_rework_count: int = 0
+    exhaustion_reason: str | None = None
 
     def __post_init__(self) -> None:
         require_identifier(self.id, MilestoneId, "id")
@@ -85,3 +90,12 @@ class Milestone:
             if value is not None:
                 require_utc(value, name)
                 require_timestamp_order(self.created_at, value, "created_at", name)
+        for name in (
+            "codex_cycle_count",
+            "ci_rework_count",
+            "architect_rework_count",
+            "human_test_rework_count",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise DomainValidationError(f"{name} must be a non-negative integer")

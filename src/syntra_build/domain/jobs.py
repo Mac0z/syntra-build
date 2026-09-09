@@ -14,6 +14,7 @@ from syntra_build.domain._validation import (
     require_utc,
 )
 from syntra_build.domain.errors import DomainValidationError
+from syntra_build.domain.failures import FailureClassification
 from syntra_build.domain.identifiers import JobId, MilestoneId, ProjectId
 
 
@@ -85,6 +86,9 @@ class Job:
     payload: StructuredMetadata | None = None
     result: StructuredMetadata | None = None
     last_error_id: str | None = None
+    failure_classification: FailureClassification | None = None
+    retry_exhausted: bool = False
+    exhaustion_reason: str | None = None
 
     def __post_init__(self) -> None:
         require_identifier(self.id, JobId, "id")
@@ -140,6 +144,12 @@ class Job:
                 )
         object.__setattr__(self, "payload", _metadata(self.payload, "payload"))
         object.__setattr__(self, "result", _metadata(self.result, "result"))
+        if self.failure_classification is not None:
+            require_enum(
+                self.failure_classification,
+                FailureClassification,
+                "failure_classification",
+            )
 
     @property
     def attempt_count(self) -> int:

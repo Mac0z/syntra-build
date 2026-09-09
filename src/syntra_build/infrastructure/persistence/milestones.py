@@ -117,6 +117,11 @@ class SQLiteMilestoneRepository:
             row["activity"],
             _datetime(row["started_at"]),
             _datetime(row["completed_at"]),
+            row["codex_cycle_count"],
+            row["ci_rework_count"],
+            row["architect_rework_count"],
+            row["human_test_rework_count"],
+            row["exhaustion_reason"],
         )
 
     def add_dependency(
@@ -265,6 +270,62 @@ class SQLiteMilestoneRepository:
             raise PersistenceError(
                 "milestone transition could not be persisted"
             ) from error
+        return self.get(request.milestone_id, request.project_id)
+
+    def apply_rework_transition(
+        self,
+        request: MilestoneTransitionRequest,
+        counter: str,
+        limit: int,
+        *,
+        exhaustion_reason: str,
+    ) -> Milestone:
+        """Atomically increment one logical-cycle counter and transition or block."""
+        columns = {
+            "codex": "codex_cycle_count",
+            "ci": "ci_rework_count",
+            "architect": "architect_rework_count",
+            "human_test": "human_test_rework_count",
+        }
+        if counter not in columns or type(limit) is not int or limit < 1:
+            raise ValueError("invalid rework counter policy")
+        column = columns[counter]
+        with transaction_scope(self._connection):
+            row = self._connection.execute(
+                f"SELECT state,{column} AS count FROM milestones "
+                "WHERE id=? AND project_id=?",
+                (str(request.milestone_id), str(request.project_id)),
+            ).fetchone()
+            if row is None:
+                raise MilestoneProjectMismatchError(
+                    "milestone does not belong to project"
+                )
+            count = int(row["count"])
+            target = request.target_state
+            if count >= limit:
+                target = MilestoneState.BLOCKED
+            effective = MilestoneTransitionRequest(
+                request.milestone_id,
+                request.project_id,
+                request.expected_state,
+                target,
+                request.reason,
+                request.actor_type,
+                request.actor_id,
+                request.correlation_id,
+                request.occurred_at,
+                request.trigger_event_id,
+                request.metadata,
+            )
+            self.apply_transition(effective)
+            self._connection.execute(
+                f"UPDATE milestones SET {column}=?,exhaustion_reason=? WHERE id=?",
+                (
+                    count if target is MilestoneState.BLOCKED else count + 1,
+                    exhaustion_reason if target is MilestoneState.BLOCKED else None,
+                    str(request.milestone_id),
+                ),
+            )
         return self.get(request.milestone_id, request.project_id)
 
     def update_activity(

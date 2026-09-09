@@ -249,9 +249,12 @@ class SchedulerConfig:
 @dataclass(frozen=True, slots=True)
 class RetryConfig:
     infrastructure_attempts: int = 4
-    initial_backoff_seconds: float = 5.0
-    backoff_multiplier: float = 2.0
-    maximum_backoff_seconds: float = 600.0
+    backoff_schedule_seconds: tuple[float, ...] = (5.0, 30.0, 120.0, 600.0)
+    jitter_factor: float = 0.2
+    codex_cycle_limit: int = 5
+    ci_rework_limit: int = 5
+    architect_rework_limit: int = 5
+    human_test_rework_limit: int = 5
 
     def __post_init__(self) -> None:
         if (
@@ -261,14 +264,29 @@ class RetryConfig:
             raise ConfigurationError(
                 "retries.infrastructure_attempts must be between 1 and 100"
             )
-        _positive("retries.initial_backoff_seconds", self.initial_backoff_seconds)
-        if self.backoff_multiplier < 1:
-            raise ConfigurationError("retries.backoff_multiplier must be at least 1")
-        _positive("retries.maximum_backoff_seconds", self.maximum_backoff_seconds)
-        if self.maximum_backoff_seconds < self.initial_backoff_seconds:
-            raise ConfigurationError(
-                "retries.maximum_backoff_seconds must not be less than initial backoff"
+        if not self.backoff_schedule_seconds or any(
+            value < 0 for value in self.backoff_schedule_seconds
+        ):
+            raise ConfigurationError("retries.backoff_schedule_seconds is invalid")
+        if any(
+            left > right
+            for left, right in zip(
+                self.backoff_schedule_seconds, self.backoff_schedule_seconds[1:]
             )
+        ):
+            raise ConfigurationError(
+                "retries.backoff_schedule_seconds must not decrease"
+            )
+        if not 0 <= self.jitter_factor <= 1:
+            raise ConfigurationError("retries.jitter_factor must be between 0 and 1")
+        for name in (
+            "codex_cycle_limit",
+            "ci_rework_limit",
+            "architect_rework_limit",
+            "human_test_rework_limit",
+        ):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ConfigurationError(f"retries.{name} must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
