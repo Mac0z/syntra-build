@@ -43,8 +43,8 @@ from syntra_build.domain import ProjectId
 from syntra_build.infrastructure.config import (
     ApplicationConfig,
     SecretInputs,
-    SecretValue,
     load_config,
+    read_protected_secret_file,
 )
 from syntra_build.infrastructure.logging import configure_logging
 from syntra_build.infrastructure.persistence import (
@@ -265,14 +265,6 @@ def validate_revision(value: str) -> str:
     return revision
 
 
-def _read_secret_file(path: Path, label: str) -> SecretValue | None:
-    if not path.exists():
-        return None
-    if path.stat().st_mode & 0o077:
-        raise RuntimeError(f"{label} file permissions are too broad")
-    return SecretValue(path.read_text(encoding="utf-8").strip())
-
-
 def _load_host_config(
     config_path: Path, token_path: Path, github_token_path: Path
 ) -> ApplicationConfig:
@@ -283,8 +275,8 @@ def _load_host_config(
         raw,
         environ={},
         secrets=SecretInputs(
-            telegram_bot_token=_read_secret_file(token_path, "Telegram token"),
-            github_token=_read_secret_file(github_token_path, "GitHub token"),
+            telegram_bot_token=read_protected_secret_file(token_path, "Telegram token"),
+            github_token=read_protected_secret_file(github_token_path, "GitHub token"),
         ),
     )
 

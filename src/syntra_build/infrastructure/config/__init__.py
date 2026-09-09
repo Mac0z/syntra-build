@@ -1,6 +1,9 @@
 """Typed, validated application configuration."""
 
-from syntra_build.infrastructure.config.loader import load_config
+from syntra_build.infrastructure.config.loader import (
+    load_config,
+    read_protected_secret_file,
+)
 from syntra_build.infrastructure.config.models import (
     ApplicationConfig,
     ArchitectConfig,
@@ -38,4 +41,5 @@ __all__ = [
     "SecretValue",
     "TelegramConfig",
     "load_config",
+    "read_protected_secret_file",
 ]

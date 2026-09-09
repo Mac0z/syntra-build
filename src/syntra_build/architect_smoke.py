@@ -10,7 +10,12 @@ from syntra_build.adapters.architect import OpenAIArchitectProvider
 from syntra_build.application.architect import ArchitectDesignService
 from syntra_build.application.design import ProjectDesignContextService
 from syntra_build.domain import ProjectId
-from syntra_build.infrastructure.config import SecretInputs, SecretValue, load_config
+from syntra_build.infrastructure.config import (
+    ApplicationConfig,
+    SecretInputs,
+    load_config,
+    read_protected_secret_file,
+)
 from syntra_build.infrastructure.persistence import (
     SQLiteArchitectInteractionRepository,
     SQLiteDesignMessageRepository,
@@ -19,6 +24,41 @@ from syntra_build.infrastructure.persistence import (
     SQLiteProjectRepository,
     bootstrap_database,
 )
+
+
+def _load_host_config(
+    config_path: Path,
+    architect_key_path: Path,
+    telegram_token_path: Path,
+    github_token_path: Path,
+) -> ApplicationConfig:
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    return load_config(
+        raw,
+        environ={},
+        secrets=SecretInputs(
+            architect_api_key=read_protected_secret_file(
+                architect_key_path, "Architect API key"
+            ),
+            telegram_bot_token=read_protected_secret_file(
+                telegram_token_path, "Telegram token"
+            ),
+            github_token=read_protected_secret_file(github_token_path, "GitHub token"),
+        ),
+    )
+
+
+def _build_provider(config: ApplicationConfig) -> OpenAIArchitectProvider:
+    key = config.secrets.architect_api_key
+    if key is None:
+        raise RuntimeError("OpenAI Architect credential is unavailable")
+    assert config.architect.model is not None
+    return OpenAIArchitectProvider(
+        api_key=key.value,
+        model=config.architect.model,
+        reasoning_effort=config.architect.reasoning_effort,
+        timeout_seconds=config.architect.api_timeout_seconds,
+    )
 
 
 def main() -> int:
@@ -33,12 +73,22 @@ def main() -> int:
     parser.add_argument(
         "--api-key-file", type=Path, default=Path("/etc/syntra-build/openai-api-key")
     )
+    parser.add_argument(
+        "--telegram-token-file",
+        type=Path,
+        default=Path("/etc/syntra-build/telegram-token"),
+    )
+    parser.add_argument(
+        "--github-token-file",
+        type=Path,
+        default=Path("/etc/syntra-build/github-token"),
+    )
     args = parser.parse_args()
-    if args.api_key_file.stat().st_mode & 0o077:
-        raise RuntimeError("Architect API key file must have mode 0600")
-    key = SecretValue(args.api_key_file.read_text().strip())
-    config = load_config(
-        json.loads(args.config.read_text()), secrets=SecretInputs(architect_api_key=key)
+    config = _load_host_config(
+        args.config,
+        args.api_key_file,
+        args.telegram_token_file,
+        args.github_token_file,
     )
     if (
         not config.architect.enabled
@@ -56,12 +106,7 @@ def main() -> int:
             SQLiteProjectDecisionRepository(connection),
             SQLiteProjectDocumentRepository(connection),
         )
-        provider = OpenAIArchitectProvider(
-            api_key=key.value,
-            model=config.architect.model,
-            reasoning_effort=config.architect.reasoning_effort,
-            timeout_seconds=config.architect.api_timeout_seconds,
-        )
+        provider = _build_provider(config)
         result = ArchitectDesignService(
             context,
             SQLiteArchitectInteractionRepository(connection),
