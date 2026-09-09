@@ -22,8 +22,8 @@ from syntra_build.adapters.github import (
 )
 from syntra_build.adapters.telegram import TelegramClient, TelegramInboundMessage
 from syntra_build.adapters.telegram.application import route_authorized_message
-from syntra_build.application.commands import CommandRouter
 from syntra_build.application.commands.models import Command, InboundMessage
+from syntra_build.application.commands.router import CommandRouter
 from syntra_build.application.commands.services import (
     CommandAuditRequest,
     ProjectCommandResult,

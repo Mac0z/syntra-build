@@ -14,11 +14,9 @@ from syntra_build.adapters.telegram.application import (
     to_application_message,
 )
 from syntra_build.application.commands import (
-    HELP_TEXT,
     Command,
     CommandAuditRequest,
     CommandParser,
-    CommandRouter,
     CommandType,
     InboundMessage,
     ProjectCommandResult,
@@ -26,6 +24,7 @@ from syntra_build.application.commands import (
     ProjectSummary,
     ResolutionOutcome,
 )
+from syntra_build.application.commands.router import HELP_TEXT, CommandRouter
 from syntra_build.domain import ProjectId, ProjectState
 
 NOW = datetime(2026, 9, 8, 12, tzinfo=UTC)
