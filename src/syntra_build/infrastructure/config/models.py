@@ -167,9 +167,12 @@ class ArchitectConfig:
     provider: str | None = None
     model: str | None = None
     api_timeout_seconds: float = 120.0
+    reasoning_effort: str = "high"
 
     def __post_init__(self) -> None:
         _positive("architect.api_timeout_seconds", self.api_timeout_seconds)
+        if self.reasoning_effort not in {"low", "medium", "high"}:
+            raise ConfigurationError("architect.reasoning_effort is invalid")
         if self.enabled and (not self.provider or not self.model):
             raise ConfigurationError(
                 "architect.provider and architect.model are required when enabled"

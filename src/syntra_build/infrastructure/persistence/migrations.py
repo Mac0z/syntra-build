@@ -549,6 +549,18 @@ MIGRATIONS: tuple[Migration, ...] = (
                 SELECT RAISE(ABORT,'project decisions are preservation-oriented'); END""",
         ),
     ),
+    Migration(
+        version=11,
+        name="011_architect_adapter",
+        statements=(
+            """CREATE TABLE architect_sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), purpose TEXT NOT NULL CHECK(purpose='DESIGN'), provider TEXT NOT NULL, model TEXT NOT NULL, external_session_id TEXT, created_at TEXT NOT NULL, last_used_at TEXT NOT NULL, status TEXT NOT NULL, metadata_json TEXT) STRICT""",
+            """CREATE TABLE architect_requests (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), session_id TEXT REFERENCES architect_sessions(id), request_type TEXT NOT NULL CHECK(request_type='DESIGN'), provider TEXT NOT NULL, model TEXT NOT NULL, reasoning_level TEXT NOT NULL, request_schema_version TEXT NOT NULL, request_payload_json TEXT NOT NULL, correlation_id TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, external_request_id TEXT, status TEXT NOT NULL CHECK(status IN ('STARTED','SUCCEEDED','FAILED')), failure_classification TEXT, UNIQUE(project_id,correlation_id,id)) STRICT""",
+            "CREATE INDEX architect_requests_project_created ON architect_requests(project_id,started_at,id)",
+            """CREATE TABLE architect_responses (id TEXT PRIMARY KEY, architect_request_id TEXT NOT NULL UNIQUE REFERENCES architect_requests(id), response_type TEXT NOT NULL CHECK(response_type='DESIGN'), response_schema_version TEXT NOT NULL, normalised_payload_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status='ACCEPTED'), created_at TEXT NOT NULL, validation_status TEXT NOT NULL CHECK(validation_status='VALID'), provider TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER, total_tokens INTEGER, CHECK(input_tokens IS NULL OR input_tokens>=0), CHECK(cached_input_tokens IS NULL OR cached_input_tokens>=0), CHECK(output_tokens IS NULL OR output_tokens>=0), CHECK(reasoning_tokens IS NULL OR reasoning_tokens>=0), CHECK(total_tokens IS NULL OR total_tokens>=0)) STRICT""",
+            """CREATE TRIGGER architect_responses_no_update BEFORE UPDATE ON architect_responses BEGIN SELECT RAISE(ABORT,'architect responses are append-only'); END""",
+            """CREATE TRIGGER architect_responses_no_delete BEFORE DELETE ON architect_responses BEGIN SELECT RAISE(ABORT,'architect responses are append-only'); END""",
+        ),
+    ),
 )
 
 

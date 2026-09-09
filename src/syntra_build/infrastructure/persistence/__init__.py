@@ -7,6 +7,9 @@ import sqlite3
 
 from syntra_build.domain import ProjectCreationContext
 from syntra_build.infrastructure.config import ApplicationConfig
+from syntra_build.infrastructure.persistence.architect import (
+    SQLiteArchitectInteractionRepository,
+)
 from syntra_build.infrastructure.persistence.connection import (
     BUSY_TIMEOUT_MILLISECONDS,
     open_database,
@@ -127,6 +130,7 @@ __all__ = [
     "SQLiteHumanGateRepository",
     "SQLiteWorkflowEventRepository",
     "SQLiteProviderCursorRepository",
+    "SQLiteArchitectInteractionRepository",
     "SQLiteDesignMessageRepository",
     "SQLiteProjectDecisionRepository",
     "SQLiteProjectDocumentRepository",
