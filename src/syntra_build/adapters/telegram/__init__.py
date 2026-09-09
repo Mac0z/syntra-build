@@ -11,7 +11,9 @@ from syntra_build.adapters.telegram.errors import (
 from syntra_build.adapters.telegram.gates import TelegramGateNotifier
 from syntra_build.adapters.telegram.models import (
     TelegramInboundMessage,
+    TelegramPolledUpdate,
     TelegramSentMessage,
+    TelegramUpdateDisposition,
 )
 
 __all__ = [
@@ -21,8 +23,10 @@ __all__ = [
     "TelegramConfigurationError",
     "TelegramError",
     "TelegramInboundMessage",
+    "TelegramPolledUpdate",
     "TelegramGateNotifier",
     "TelegramProtocolError",
     "TelegramSentMessage",
+    "TelegramUpdateDisposition",
     "TelegramTransportError",
 ]

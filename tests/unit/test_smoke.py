@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 
 from syntra_build.adapters.github import GitHubHTTPResponse
-from syntra_build.adapters.telegram import TelegramInboundMessage
+from syntra_build.adapters.telegram import (
+    TelegramInboundMessage,
+    TelegramPolledUpdate,
+    TelegramUpdateDisposition,
+)
 from syntra_build.application.commands import InboundMessage
 from syntra_build.infrastructure.config import (
     ApplicationConfig,
@@ -86,22 +90,50 @@ def test_local_smoke_fails_before_bootstrap_for_missing_root(tmp_path: Path) -> 
     assert not called
 
 
+def _routable(message: TelegramInboundMessage) -> TelegramPolledUpdate:
+    return TelegramPolledUpdate(
+        message.update_id, TelegramUpdateDisposition.ROUTABLE, message
+    )
+
+
+class _FakeCursors:
+    def __init__(self, value: int | None = None) -> None:
+        self.value = value
+
+    def get(self, provider: str) -> int | None:
+        assert provider == "telegram"
+        return self.value
+
+    def advance(self, provider: str, update_id: int) -> int:
+        assert provider == "telegram"
+        self.value = update_id if self.value is None else max(self.value, update_id)
+        return self.value
+
+
 class _FakeTelegramClient:
     def __init__(self, messages: tuple[TelegramInboundMessage, ...]) -> None:
-        self.messages = messages
+        self.updates = tuple(_routable(message) for message in messages)
         self.polls = 0
+        self.offsets: list[int | None] = []
         self.sent: list[dict[str, object]] = []
 
     def poll_updates(
         self, *, offset: int | None = None
-    ) -> tuple[TelegramInboundMessage, ...]:
+    ) -> tuple[TelegramPolledUpdate, ...]:
         self.polls += 1
-        assert offset is None
-        return self.messages
+        self.offsets.append(offset)
+        return self.updates
 
     def send_text(self, **values: object) -> object:
         self.sent.append(values)
         return object()
+
+
+class _FailingSecondSendClient(_FakeTelegramClient):
+    def send_text(self, **values: object) -> object:
+        if len(self.sent) == 1:
+            raise RuntimeError("synthetic send failure")
+        return super().send_text(**values)
 
 
 def test_telegram_once_polls_once_routes_and_preserves_destination() -> None:
@@ -116,8 +148,10 @@ def test_telegram_once_polls_once_routes_and_preserves_destination() -> None:
     )
     client = _FakeTelegramClient((message,))
 
-    assert run_telegram_once(client, build_smoke_router()) == 1
+    cursors = _FakeCursors()
+    assert run_telegram_once(client, build_smoke_router(), cursors) == 1
     assert client.polls == 1
+    assert client.offsets == [None]
     assert client.sent == [
         {
             "chat_id": 33,
@@ -126,12 +160,78 @@ def test_telegram_once_polls_once_routes_and_preserves_destination() -> None:
             "reply_to_message_id": 22,
         }
     ]
+    assert cursors.value == 11
+
+
+def test_successful_updates_advance_to_highest_and_next_poll_uses_successor() -> None:
+    messages = tuple(
+        TelegramInboundMessage(
+            update_id=value,
+            message_id=value,
+            chat_id=33,
+            user_id=44,
+            text="/ping",
+            received_at=datetime.now(UTC),
+        )
+        for value in (101, 102)
+    )
+    cursors = _FakeCursors(100)
+    assert (
+        run_telegram_once(_FakeTelegramClient(messages), build_smoke_router(), cursors)
+        == 2
+    )
+    assert cursors.value == 102
+
+    fresh_client = _FakeTelegramClient(())
+    assert run_telegram_once(fresh_client, build_smoke_router(), cursors) == 0
+    assert fresh_client.offsets == [103]
+    assert cursors.value == 102
 
 
 def test_telegram_once_empty_authorised_result_sends_nothing() -> None:
     client = _FakeTelegramClient(())
-    assert run_telegram_once(client, build_smoke_router()) == 0
+    assert run_telegram_once(client, build_smoke_router(), _FakeCursors(100)) == 0
     assert client.polls == 1
+    assert client.offsets == [101]
+    assert client.sent == []
+
+
+def test_telegram_once_stops_at_failure_and_replays_from_failed_update() -> None:
+    messages = tuple(
+        TelegramInboundMessage(
+            update_id=value,
+            message_id=value,
+            chat_id=33,
+            user_id=44,
+            text="/ping",
+            received_at=datetime.now(UTC),
+        )
+        for value in (101, 102, 103)
+    )
+    cursors = _FakeCursors(100)
+    client = _FailingSecondSendClient(messages)
+    with pytest.raises(RuntimeError, match="synthetic send failure"):
+        run_telegram_once(client, build_smoke_router(), cursors)
+    assert cursors.value == 101
+    assert len(client.sent) == 1
+
+    retry = _FakeTelegramClient(())
+    assert run_telegram_once(retry, build_smoke_router(), cursors) == 0
+    assert retry.offsets == [102]
+
+
+@pytest.mark.parametrize(
+    "disposition",
+    [TelegramUpdateDisposition.UNSUPPORTED, TelegramUpdateDisposition.UNAUTHORISED],
+)
+def test_deliberately_ignored_update_advances_without_routing(
+    disposition: TelegramUpdateDisposition,
+) -> None:
+    client = _FakeTelegramClient(())
+    client.updates = (TelegramPolledUpdate(101, disposition),)
+    cursors = _FakeCursors(100)
+    assert run_telegram_once(client, build_smoke_router(), cursors) == 0
+    assert cursors.value == 101
     assert client.sent == []
 
 
@@ -140,7 +240,7 @@ def test_smoke_health_is_truthful_and_project_services_are_unavailable() -> None
     message = TelegramInboundMessage(1, 2, 3, 4, "/health", datetime.now(UTC))
     client = _FakeTelegramClient((message,))
 
-    run_telegram_once(client, router)
+    run_telegram_once(client, router, _FakeCursors())
 
     assert client.sent[0]["text"] == (
         "development runtime available (local initialization passed)"

@@ -140,15 +140,53 @@ sudo -u syntra-build /opt/syntra-build/venv/bin/python \
   -m syntra_build.smoke telegram-once
 ```
 
-This makes exactly one M5 `getUpdates` poll, preserves provider order, passes
-only M5-authorised normalized text messages through the M6 seam, replies using
-M5 `send_text`, and exits. `/health` truthfully reports only that local
+This makes exactly one M5 `getUpdates` poll, handles updates monotonically by
+`update_id`, passes only M5-authorised normalized text messages through the M6
+seam, replies using M5 `send_text`, and exits. `/health` truthfully reports only that local
 initialization is available. M14 creation and query commands use durable SQLite
 repositories and the real read-only GitHub name checker; duplicate creation
-updates use their M11 external identity. The first bounded poll
+updates use their M11 external identity.
+
+The `provider_cursors` SQLite table durably records the highest Telegram
+`update_id` that Syntra safely finished handling. On the next process invocation,
+Syntra supplies `last_processed_update_id + 1` as the native Telegram
+`getUpdates(offset=...)` value. Telegram therefore filters old updates; Syntra
+does not download a historical queue and discard it locally. A new database has
+no cursor, so its first bounded poll
 may legitimately report `0 authorised updates` if Telegram has not yet surfaced
 the newly sent update; rerunning the bounded command is acceptable for this
 manual acceptance test.
+
+Authorised commands are acknowledged only after routing and response sending
+finish. Deliberately unsupported and unauthorised updates are never routed, but
+are safely acknowledged so they cannot block polling forever. If processing or
+sending fails, that update and every later update remain unacknowledged and the
+next process resumes from the failed update. A crash after a durable application
+effect but before cursor advancement can replay an update (and can repeat a
+response), so this is intentionally at-least-once rather than exactly-once.
+M11/M14 external-event deduplication remains required to prevent duplicate
+durable application effects at that failure boundary.
+
+### M14.1 cursor host acceptance
+
+After deploying the exact approved revision, run the local smoke, then run
+`telegram-once` three times as separate Python processes. The first run may
+consume the existing backlog; without sending anything, the second and third
+runs must each report `0 authorised updates`. Send `/status M14 Acceptance` and
+run it again: exactly one new command must be processed and the reply must be:
+
+```text
+Project: M14 Acceptance
+State: DESIGNING
+```
+
+Without sending another message, run `telegram-once` again and once more after a
+fresh restart/reinvocation. Both must report `0 authorised updates`. Together
+these checks demonstrate native offset filtering, one-time backlog consumption,
+new-command handling, and cursor persistence across process boundaries. Normal
+redeployment preserves the cursor whenever it preserves the configured SQLite
+data file; bootstrap automatically applies the cursor migration and needs no
+manual database edit.
 
 ## Verification, logs, and repeat updates
 
@@ -169,8 +207,8 @@ run bootstrap if a root is missing; fix ownership if data/log roots are not
 writable; restore token mode `0600`; verify the numeric allowlist; and inspect
 only the redacted structured log for Telegram/network or SQLite failures.
 
-M6A deliberately provides no `systemd` unit, daemon or polling loop, persistent
-Telegram consumption/deduplication, scheduler, M7 state transitions,
+M6A deliberately provides no `systemd` unit, daemon or polling loop, scheduler,
+M7 state transitions,
 Architect/Codex/GitHub orchestration, metrics service, production upgrades,
 self-hosting, or GitHub automatic deployment. The real Pi/Telegram acceptance
 test occurs manually after merge.

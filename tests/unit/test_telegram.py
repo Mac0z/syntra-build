@@ -17,6 +17,7 @@ from syntra_build.adapters.telegram import (
     TelegramInboundMessage,
     TelegramProtocolError,
     TelegramTransportError,
+    TelegramUpdateDisposition,
 )
 from syntra_build.infrastructure.config import SecretInputs, SecretValue, load_config
 
@@ -87,15 +88,16 @@ def capture_adapter_logs(caplog: pytest.LogCaptureFixture) -> logging.Logger:
 def test_authorised_text_update_is_normalised_in_utc(tmp_path: Path) -> None:
     gateway = client(tmp_path, lambda _request, _timeout: response([update()]))
 
-    assert gateway.poll_updates() == (
-        TelegramInboundMessage(
-            update_id=100,
-            message_id=200,
-            chat_id=300,
-            user_id=42,
-            text="private message body",
-            received_at=datetime(2023, 11, 14, 22, 13, 20, tzinfo=UTC),
-        ),
+    polled = gateway.poll_updates()
+    assert len(polled) == 1
+    assert polled[0].disposition is TelegramUpdateDisposition.ROUTABLE
+    assert polled[0].message == TelegramInboundMessage(
+        update_id=100,
+        message_id=200,
+        chat_id=300,
+        user_id=42,
+        text="private message body",
+        received_at=datetime(2023, 11, 14, 22, 13, 20, tzinfo=UTC),
     )
 
 
@@ -108,7 +110,13 @@ def test_unauthorised_and_unsupported_updates_are_discarded(tmp_path: Path) -> N
         ),
     )
 
-    assert gateway.poll_updates() == ()
+    polled = gateway.poll_updates()
+    assert [item.update_id for item in polled] == [101, 102]
+    assert [item.disposition for item in polled] == [
+        TelegramUpdateDisposition.UNAUTHORISED,
+        TelegramUpdateDisposition.UNSUPPORTED,
+    ]
+    assert all(item.message is None for item in polled)
 
 
 def test_multiple_updates_preserve_provider_order_and_optional_fields(
@@ -122,13 +130,17 @@ def test_multiple_updates_preserve_provider_order_and_optional_fields(
     second_message["reply_to_message"] = {"message_id": 9}
     gateway = client(tmp_path, lambda _request, _timeout: response([first, second]))
 
-    messages = gateway.poll_updates()
+    polled = gateway.poll_updates()
+    first_message = polled[0].message
+    second_message = polled[1].message
 
-    assert [item.update_id for item in messages] == [2, 1]
-    assert messages[0].thread_id is None
-    assert messages[0].reply_to_message_id is None
-    assert messages[1].thread_id == 8
-    assert messages[1].reply_to_message_id == 9
+    assert first_message is not None
+    assert second_message is not None
+    assert [first_message.update_id, second_message.update_id] == [1, 2]
+    assert first_message.thread_id == 8
+    assert first_message.reply_to_message_id == 9
+    assert second_message.thread_id is None
+    assert second_message.reply_to_message_id is None
 
 
 def test_poll_sends_offset_and_configured_timeout(tmp_path: Path) -> None:

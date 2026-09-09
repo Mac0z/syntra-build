@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,3 +28,26 @@ class TelegramSentMessage:
     message_id: int
     chat_id: int
     thread_id: int | None = None
+
+
+class TelegramUpdateDisposition(StrEnum):
+    """Security-boundary decision for a provider update."""
+
+    ROUTABLE = "ROUTABLE"
+    UNAUTHORISED = "UNAUTHORISED"
+    UNSUPPORTED = "UNSUPPORTED"
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramPolledUpdate:
+    """One ordered provider update and its safe routing disposition."""
+
+    update_id: int
+    disposition: TelegramUpdateDisposition
+    message: TelegramInboundMessage | None = None
+
+    def __post_init__(self) -> None:
+        if (self.disposition is TelegramUpdateDisposition.ROUTABLE) != (
+            self.message is not None
+        ):
+            raise ValueError("only routable Telegram updates may contain a message")
