@@ -406,6 +406,17 @@ MIGRATIONS: tuple[Migration, ...] = (
             ) STRICT""",
         ),
     ),
+    Migration(
+        version=9,
+        name="009_provider_cursors",
+        statements=(
+            """CREATE TABLE provider_cursors (
+                provider TEXT PRIMARY KEY,
+                last_processed_update_id INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            ) STRICT""",
+        ),
+    ),
 )
 
 

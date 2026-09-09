@@ -20,7 +20,11 @@ from syntra_build.adapters.github import (
     GitHubRepositoryNameConflictChecker,
     GitHubTransport,
 )
-from syntra_build.adapters.telegram import TelegramClient, TelegramInboundMessage
+from syntra_build.adapters.telegram import (
+    TelegramClient,
+    TelegramPolledUpdate,
+    TelegramUpdateDisposition,
+)
 from syntra_build.adapters.telegram.application import route_authorized_message
 from syntra_build.application.commands.models import Command, InboundMessage
 from syntra_build.application.commands.router import CommandRouter
@@ -45,6 +49,7 @@ from syntra_build.infrastructure.config import (
 from syntra_build.infrastructure.logging import configure_logging
 from syntra_build.infrastructure.persistence import (
     SQLiteProjectRepository,
+    SQLiteProviderCursorRepository,
     SQLiteWorkflowEventRepository,
     bootstrap_database,
 )
@@ -59,7 +64,7 @@ class TelegramSmokeClient(Protocol):
 
     def poll_updates(
         self, *, offset: int | None = None
-    ) -> tuple[TelegramInboundMessage, ...]: ...
+    ) -> tuple[TelegramPolledUpdate, ...]: ...
 
     def send_text(
         self,
@@ -77,6 +82,14 @@ class LocalSmokeResult:
     python_version: str
     database: str
     routing: str
+
+
+class ProviderCursorStore(Protocol):
+    """Minimum durable cursor operations required by a bounded poll."""
+
+    def get(self, provider: str) -> int | None: ...
+
+    def advance(self, provider: str, update_id: int) -> int: ...
 
 
 class _UnavailableProjectQueries:
@@ -206,11 +219,23 @@ def run_local_smoke(
     return LocalSmokeResult(revision, version, "OK", response.text)
 
 
-def run_telegram_once(client: TelegramSmokeClient, router: CommandRouter) -> int:
-    """Perform exactly one M5 poll, then route/send authorized updates in order."""
+def run_telegram_once(
+    client: TelegramSmokeClient,
+    router: CommandRouter,
+    cursors: ProviderCursorStore,
+) -> int:
+    """Poll from the durable offset and acknowledge each safely handled update."""
     _LOGGER.info("Telegram smoke started", extra={"event": "telegram_smoke_started"})
-    messages = client.poll_updates()
-    for message in messages:
+    last_processed = cursors.get("telegram")
+    offset = None if last_processed is None else last_processed + 1
+    updates = client.poll_updates(offset=offset)
+    processed_count = 0
+    for update in updates:
+        if update.disposition is not TelegramUpdateDisposition.ROUTABLE:
+            cursors.advance("telegram", update.update_id)
+            continue
+        message = update.message
+        assert message is not None
         response = route_authorized_message(message, router)
         client.send_text(
             chat_id=message.chat_id,
@@ -218,14 +243,19 @@ def run_telegram_once(client: TelegramSmokeClient, router: CommandRouter) -> int
             thread_id=message.thread_id,
             reply_to_message_id=message.message_id,
         )
+        cursors.advance("telegram", update.update_id)
+        processed_count += 1
     _LOGGER.info(
         "Telegram smoke completed",
         extra={
             "event": "telegram_smoke_completed",
-            "metadata": {"processed_count": len(messages)},
+            "metadata": {
+                "provider_update_count": len(updates),
+                "processed_count": processed_count,
+            },
         },
     )
-    return len(messages)
+    return processed_count
 
 
 def validate_revision(value: str) -> str:
@@ -306,7 +336,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             connection = bootstrap_database(config)
             try:
                 count = run_telegram_once(
-                    TelegramClient(config), build_host_router(config, connection)
+                    TelegramClient(config),
+                    build_host_router(config, connection),
+                    SQLiteProviderCursorRepository(connection),
                 )
             finally:
                 connection.close()

@@ -20,7 +20,9 @@ from syntra_build.adapters.telegram.errors import (
 )
 from syntra_build.adapters.telegram.models import (
     TelegramInboundMessage,
+    TelegramPolledUpdate,
     TelegramSentMessage,
+    TelegramUpdateDisposition,
 )
 from syntra_build.infrastructure.config import ApplicationConfig
 
@@ -69,8 +71,8 @@ class TelegramClient:
 
     def poll_updates(
         self, *, offset: int | None = None
-    ) -> tuple[TelegramInboundMessage, ...]:
-        """Fetch one long-poll response and return authorised text messages."""
+    ) -> tuple[TelegramPolledUpdate, ...]:
+        """Fetch updates, retaining IDs while enforcing authorization locally."""
         parameters: dict[str, object] = {"timeout": self._poll_timeout}
         if offset is not None:
             parameters["offset"] = offset
@@ -82,10 +84,17 @@ class TelegramClient:
         if not isinstance(result, list):
             raise TelegramProtocolError("Telegram getUpdates result must be a list")
 
-        messages: list[TelegramInboundMessage] = []
+        updates: list[TelegramPolledUpdate] = []
         for update in result:
-            message = self._normalise_update(update)
+            raw = _expect_mapping(update, "Telegram update")
+            update_id = _expect_int(raw.get("update_id"), "update_id")
+            message = self._normalise_update(raw)
             if message is None:
+                updates.append(
+                    TelegramPolledUpdate(
+                        update_id, TelegramUpdateDisposition.UNSUPPORTED
+                    )
+                )
                 continue
             if message.user_id not in self._authorised_user_ids:
                 _LOGGER.warning(
@@ -98,8 +107,17 @@ class TelegramClient:
                         },
                     },
                 )
+                updates.append(
+                    TelegramPolledUpdate(
+                        update_id, TelegramUpdateDisposition.UNAUTHORISED
+                    )
+                )
                 continue
-            messages.append(message)
+            updates.append(
+                TelegramPolledUpdate(
+                    update_id, TelegramUpdateDisposition.ROUTABLE, message
+                )
+            )
             _LOGGER.info(
                 "Telegram update received",
                 extra={
@@ -115,10 +133,16 @@ class TelegramClient:
             "Telegram poll completed",
             extra={
                 "event": "telegram_poll_completed",
-                "metadata": {"authorised_update_count": len(messages)},
+                "metadata": {
+                    "provider_update_count": len(updates),
+                    "authorised_update_count": sum(
+                        item.disposition is TelegramUpdateDisposition.ROUTABLE
+                        for item in updates
+                    ),
+                },
             },
         )
-        return tuple(messages)
+        return tuple(sorted(updates, key=lambda item: item.update_id))
 
     def send_text(
         self,

@@ -12,6 +12,9 @@ from syntra_build.infrastructure.persistence.connection import (
     transaction,
     transaction_scope,
 )
+from syntra_build.infrastructure.persistence.cursors import (
+    SQLiteProviderCursorRepository,
+)
 from syntra_build.infrastructure.persistence.errors import (
     ActiveMilestoneConflictError,
     AttemptLimitExhaustedError,
@@ -117,6 +120,7 @@ __all__ = [
     "SQLiteJobRepository",
     "SQLiteHumanGateRepository",
     "SQLiteWorkflowEventRepository",
+    "SQLiteProviderCursorRepository",
     "JobStateTransition",
     "SchedulableJob",
     "StaleJobStateError",
