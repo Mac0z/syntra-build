@@ -198,7 +198,7 @@ class SQLiteProjectDocumentRepository:
         try:
             with transaction_scope(self._connection):
                 prior = self._connection.execute(
-                    """SELECT id,revision FROM project_documents
+                    """SELECT revision FROM project_documents
                        WHERE project_id=? AND document_type=?
                        ORDER BY revision DESC LIMIT 1""",
                     (str(project_id), document_type.value),
@@ -214,15 +214,12 @@ class SQLiteProjectDocumentRepository:
                     document_content_hash(content),
                     created_at,
                     created_by,
-                    supersedes_document_id=(
-                        ProjectDocumentId.from_string(prior["id"]) if prior else None
-                    ),
                 )
                 self._connection.execute(
                     """INSERT INTO project_documents
                        (id,project_id,document_type,revision,status,content,content_hash,
-                        created_at,created_by,supersedes_document_id)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        created_at,created_by)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
                     (
                         str(document.id),
                         str(project_id),
@@ -233,9 +230,6 @@ class SQLiteProjectDocumentRepository:
                         document.content_hash,
                         _timestamp(created_at),
                         created_by,
-                        str(document.supersedes_document_id)
-                        if document.supersedes_document_id
-                        else None,
                     ),
                 )
             return document
@@ -288,6 +282,17 @@ class SQLiteProjectDocumentRepository:
                     raise PersistenceError("project document does not exist")
                 if row["status"] != DocumentStatus.DRAFT.value:
                     raise PersistenceError("only a draft document can be approved")
+                approved = self._connection.execute(
+                    """SELECT id,revision FROM project_documents
+                       WHERE project_id=? AND document_type=? AND status='APPROVED'""",
+                    (str(project_id), row["document_type"]),
+                ).fetchone()
+                if approved is not None and int(approved["revision"]) >= int(
+                    row["revision"]
+                ):
+                    raise PersistenceError(
+                        "a document cannot supersede an equal or later revision"
+                    )
                 self._connection.execute(
                     """UPDATE project_documents SET status='SUPERSEDED'
                        WHERE project_id=? AND document_type=? AND status='APPROVED'""",
@@ -295,11 +300,13 @@ class SQLiteProjectDocumentRepository:
                 )
                 self._connection.execute(
                     """UPDATE project_documents
-                       SET status='APPROVED',approved_at=?,approved_by=?
+                       SET status='APPROVED',approved_at=?,approved_by=?,
+                           supersedes_document_id=?
                        WHERE project_id=? AND id=? AND status='DRAFT'""",
                     (
                         _timestamp(approved_at),
                         approved_by,
+                        approved["id"] if approved is not None else None,
                         str(project_id),
                         str(document_id),
                     ),

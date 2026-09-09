@@ -175,11 +175,12 @@ def test_document_revisions_hash_approval_history_and_immutability(
         spec2 = documents.create_revision(
             PROJECT_A, DocumentType.SPEC, exact + "v2", NOW, "a"
         )
-        assert spec2.revision == 2 and spec2.supersedes_document_id == spec1.id
+        assert spec2.revision == 2 and spec2.supersedes_document_id is None
         approved2 = documents.approve(
             PROJECT_A, spec2.id, NOW + timedelta(seconds=1), "human"
         )
         assert approved2.status is DocumentStatus.APPROVED
+        assert approved2.supersedes_document_id == spec1.id
         assert documents.get(PROJECT_A, spec1.id).status is DocumentStatus.SUPERSEDED
         rejected = documents.create_revision(
             PROJECT_A, DocumentType.AGENTS, "rejected", NOW, "a"
@@ -228,6 +229,97 @@ def test_document_revisions_hash_approval_history_and_immutability(
         documents = SQLiteProjectDocumentRepository(reopened)
         loaded = documents.get(PROJECT_A, spec1.id)
         assert (loaded.content, loaded.content_hash) == (exact, spec1.content_hash)
+
+
+@pytest.mark.parametrize("reject_middle", [False, True])
+def test_approval_lineage_tracks_prior_approval_not_prior_revision(
+    tmp_path: Path, reject_middle: bool
+) -> None:
+    with open_database(tmp_path / f"lineage-{reject_middle}.db") as connection:
+        apply_migrations(connection)
+        add_project(connection, PROJECT_A, "A")
+        ids = iter(ProjectDocumentId.from_string(uid(n)) for n in range(501, 510))
+        documents = SQLiteProjectDocumentRepository(connection, lambda: next(ids))
+        first = documents.create_revision(
+            PROJECT_A, DocumentType.SPEC, "first", NOW, "author"
+        )
+        first = documents.approve(PROJECT_A, first.id, NOW, "approver")
+        assert first.supersedes_document_id is None
+        middle = documents.create_revision(
+            PROJECT_A, DocumentType.SPEC, "middle", NOW, "author"
+        )
+        if reject_middle:
+            middle = documents.reject(PROJECT_A, middle.id)
+        latest = documents.create_revision(
+            PROJECT_A, DocumentType.SPEC, "latest", NOW, "author"
+        )
+        assert middle.supersedes_document_id is None
+        assert latest.supersedes_document_id is None
+
+        latest = documents.approve(
+            PROJECT_A, latest.id, NOW + timedelta(seconds=1), "approver"
+        )
+
+        assert documents.get(PROJECT_A, first.id).status is DocumentStatus.SUPERSEDED
+        expected_middle = (
+            DocumentStatus.REJECTED if reject_middle else DocumentStatus.DRAFT
+        )
+        assert documents.get(PROJECT_A, middle.id).status is expected_middle
+        assert latest.status is DocumentStatus.APPROVED
+        assert latest.supersedes_document_id == first.id
+        with pytest.raises(sqlite3.IntegrityError, match="only on approval"):
+            connection.execute(
+                "UPDATE project_documents SET supersedes_document_id=NULL WHERE id=?",
+                (str(latest.id),),
+            )
+
+
+def test_document_lineage_scope_and_approval_atomicity(tmp_path: Path) -> None:
+    with open_database(tmp_path / "lineage-guards.db") as connection:
+        apply_migrations(connection)
+        add_project(connection, PROJECT_A, "A")
+        add_project(connection, PROJECT_B, "B")
+        ids = iter(ProjectDocumentId.from_string(uid(n)) for n in range(601, 610))
+        documents = SQLiteProjectDocumentRepository(connection, lambda: next(ids))
+        approved = documents.create_revision(
+            PROJECT_A, DocumentType.SPEC, "approved", NOW, "author"
+        )
+        documents.approve(PROJECT_A, approved.id, NOW, "approver")
+        agents = documents.create_revision(
+            PROJECT_A, DocumentType.AGENTS, "agents", NOW, "author"
+        )
+        foreign = documents.create_revision(
+            PROJECT_B, DocumentType.SPEC, "foreign", NOW, "author"
+        )
+        for target in (agents, foreign):
+            with pytest.raises(sqlite3.IntegrityError, match="inconsistent"):
+                connection.execute(
+                    """UPDATE project_documents
+                       SET status='APPROVED',approved_at=?,approved_by=?,
+                           supersedes_document_id=? WHERE id=?""",
+                    (NOW.isoformat(), "approver", str(approved.id), str(target.id)),
+                )
+
+        replacement = documents.create_revision(
+            PROJECT_A, DocumentType.SPEC, "replacement", NOW, "author"
+        )
+        connection.execute(
+            f"""CREATE TRIGGER fail_replacement_approval
+               BEFORE UPDATE ON project_documents
+               WHEN NEW.id='{replacement.id}' AND NEW.status='APPROVED'
+               BEGIN SELECT RAISE(ABORT,'synthetic approval failure'); END"""
+        )
+        with pytest.raises(PersistenceError, match="transaction failed"):
+            documents.approve(
+                PROJECT_A,
+                replacement.id,
+                NOW + timedelta(seconds=1),
+                "approver",
+            )
+        assert documents.get(PROJECT_A, approved.id).status is DocumentStatus.APPROVED
+        rolled_back = documents.get(PROJECT_A, replacement.id)
+        assert rolled_back.status is DocumentStatus.DRAFT
+        assert rolled_back.supersedes_document_id is None
 
 
 def test_decisions_are_validated_ordered_superseded_isolated_and_durable(

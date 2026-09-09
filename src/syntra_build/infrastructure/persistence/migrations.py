@@ -477,6 +477,8 @@ MIGRATIONS: tuple[Migration, ...] = (
                 UNIQUE(project_id,document_type,revision),
                 CHECK((status='APPROVED' AND approved_at IS NOT NULL AND approved_by IS NOT NULL)
                     OR status<>'APPROVED'),
+                CHECK(supersedes_document_id IS NULL
+                    OR status IN ('APPROVED','SUPERSEDED')),
                 CHECK(supersedes_document_id IS NULL OR supersedes_document_id<>id)
             ) STRICT""",
             """CREATE UNIQUE INDEX project_documents_one_approved
@@ -499,6 +501,18 @@ MIGRATIONS: tuple[Migration, ...] = (
                     AND document_type=NEW.document_type
                     AND revision<NEW.revision)
                 BEGIN SELECT RAISE(ABORT,'superseded document is inconsistent'); END""",
+            """CREATE TRIGGER project_documents_supersedes_update_consistency
+                BEFORE UPDATE OF supersedes_document_id ON project_documents
+                WHEN NEW.supersedes_document_id IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM project_documents WHERE id=NEW.supersedes_document_id
+                    AND project_id=NEW.project_id
+                    AND document_type=NEW.document_type
+                    AND revision<NEW.revision)
+                BEGIN SELECT RAISE(ABORT,'superseded document is inconsistent'); END""",
+            """CREATE TRIGGER project_documents_lineage_set_on_approval
+                BEFORE UPDATE OF supersedes_document_id ON project_documents
+                WHEN OLD.status<>'DRAFT' OR NEW.status<>'APPROVED'
+                BEGIN SELECT RAISE(ABORT,'document lineage is set only on approval'); END""",
             """CREATE TABLE project_decisions (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES projects(id),
