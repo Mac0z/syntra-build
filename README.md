@@ -148,6 +148,9 @@ runs of spaces, underscores, or punctuation become one hyphen and edge hyphens
 are removed. Canonical names remain globally unique. `syntra`, `syntra-build`,
 `system`, and `internal` are reserved. GitHub occupancy is checked through a
 read-only interface that fails closed; M14 never provisions a repository.
+The deployed Telegram host router composes that interface with a bounded GitHub
+API `GET /repos/{owner}/{name}` check using the existing `github.owner`, timeout,
+and protected GitHub token configuration.
 
 ## Project documentation
 

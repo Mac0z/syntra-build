@@ -215,7 +215,19 @@ class ProjectCreationService:
                 )
                 self._events.mark_processed(event.id, command.requested_at)
         except PersistenceError as error:
-            # The pre-check is advisory; the unique index remains race authority.
+            # A concurrent consumer may have committed this external event after
+            # our advisory lookup but before our transaction lost its race.
+            duplicate = self._events.find_by_external_deduplication_key(
+                deduplication_key
+            )
+            if duplicate is not None:
+                try:
+                    return CreatedProject(
+                        self._projects.get(duplicate.event.project_id), True
+                    )
+                except PersistenceError:
+                    pass
+            # The local pre-check is advisory; the unique index remains authority.
             if self._projects.find_by_canonical_name(canonical_name) is not None:
                 raise ProjectCreationError(
                     ProjectCreationFailure.LOCAL_CONFLICT

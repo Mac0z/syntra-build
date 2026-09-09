@@ -1877,6 +1877,9 @@ send `/status M14 Acceptance` and `/projects`; both must show the same project
 in `DESIGNING`. Finally inspect the Syntra-owned GitHub organisation and confirm
 that no `m14-acceptance` repository was created. Keep the durable disposable
 record because no supported project-deletion workflow exists yet.
+This deployed command must use the configured read-only GitHub repository-name
+checker; a disabled integration, missing token, or inconclusive GitHub response
+must fail the creation rather than bypassing the check.
 
 Before Syntra Build is considered production-capable:
 
