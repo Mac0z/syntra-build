@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 from syntra_build.adapters.architect import OpenAIArchitectProvider
 from syntra_build.application.architect import ArchitectDesignService
 from syntra_build.application.design import ProjectDesignContextService
-from syntra_build.domain import ProjectId
+from syntra_build.application.specification import build_specification_request
+from syntra_build.domain import ArchitectDesignResponse, ProjectId, SpecificationDraft
 from syntra_build.infrastructure.config import (
     ApplicationConfig,
     SecretInputs,
@@ -19,6 +21,7 @@ from syntra_build.infrastructure.config import (
 from syntra_build.infrastructure.persistence import (
     SQLiteArchitectInteractionRepository,
     SQLiteDesignMessageRepository,
+    SQLiteDesignPackageRepository,
     SQLiteProjectDecisionRepository,
     SQLiteProjectDocumentRepository,
     SQLiteProjectRepository,
@@ -68,6 +71,11 @@ def main() -> int:
     parser.add_argument("project_id")
     parser.add_argument("--correlation-id", required=True)
     parser.add_argument(
+        "--specification-draft",
+        action="store_true",
+        help="spend one provider call drafting SPEC/AGENTS; does not create a package",
+    )
+    parser.add_argument(
         "--config", type=Path, default=Path("/etc/syntra-build/config.json")
     )
     parser.add_argument(
@@ -107,12 +115,44 @@ def main() -> int:
             SQLiteProjectDocumentRepository(connection),
         )
         provider = _build_provider(config)
-        result = ArchitectDesignService(
-            context,
-            SQLiteArchitectInteractionRepository(connection),
-            provider,
-            reasoning_effort=config.architect.reasoning_effort,
-        ).design(ProjectId.from_string(args.project_id), args.correlation_id)
+        project_id = ProjectId.from_string(args.project_id)
+        audit = SQLiteArchitectInteractionRepository(connection)
+        result: ArchitectDesignResponse | SpecificationDraft
+        if args.specification_draft:
+            request = build_specification_request(
+                context.reconstruct(project_id),
+                args.correlation_id,
+                SQLiteDesignPackageRepository(connection).feedback(project_id),
+            )
+            request_id = f"host-draft-{args.correlation_id}"
+            started = datetime.now(UTC)
+            audit.begin_draft(
+                request_id=request_id,
+                request=request,
+                provider=provider.provider_name,
+                model=provider.model,
+                reasoning_effort=config.architect.reasoning_effort,
+                created_at=started,
+            )
+            result = provider.draft_specification(request)
+            usage = provider.telemetry()
+            response_id = usage.get("provider_response_id")
+            audit.succeed_draft(
+                request_id=request_id,
+                response=result,
+                provider_response_id=response_id
+                if isinstance(response_id, str)
+                else None,
+                usage=usage,
+                completed_at=datetime.now(UTC),
+            )
+        else:
+            result = ArchitectDesignService(
+                context,
+                audit,
+                provider,
+                reasoning_effort=config.architect.reasoning_effort,
+            ).design(project_id, args.correlation_id)
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         print(json.dumps(provider.telemetry(), indent=2, sort_keys=True))
     finally:

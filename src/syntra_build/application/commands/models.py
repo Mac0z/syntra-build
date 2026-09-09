@@ -84,6 +84,7 @@ class Command:
     project_reference: str | None = None
     gate_reference: str | None = None
     gate_response: str | None = None
+    gate_feedback: str | None = None
     project_name: str | None = None
     initial_request: str | None = None
     chat_id: str | None = None

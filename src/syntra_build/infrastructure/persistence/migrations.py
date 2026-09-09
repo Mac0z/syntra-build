@@ -561,6 +561,32 @@ MIGRATIONS: tuple[Migration, ...] = (
             """CREATE TRIGGER architect_responses_no_delete BEFORE DELETE ON architect_responses BEGIN SELECT RAISE(ABORT,'architect responses are append-only'); END""",
         ),
     ),
+    Migration(
+        version=12,
+        name="012_design_packages",
+        statements=(
+            "ALTER TABLE projects ADD COLUMN repository_visibility TEXT NOT NULL DEFAULT 'public' CHECK(repository_visibility IN ('public','private'))",
+            "DROP TRIGGER architect_responses_no_update",
+            "DROP TRIGGER architect_responses_no_delete",
+            "ALTER TABLE architect_responses RENAME TO architect_responses_m16",
+            "ALTER TABLE architect_requests RENAME TO architect_requests_m16",
+            """CREATE TABLE architect_requests (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), session_id TEXT REFERENCES architect_sessions(id), request_type TEXT NOT NULL CHECK(request_type IN ('DESIGN','SPECIFICATION_DRAFT')), provider TEXT NOT NULL, model TEXT NOT NULL, reasoning_level TEXT NOT NULL, request_schema_version TEXT NOT NULL, request_payload_json TEXT NOT NULL, correlation_id TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, external_request_id TEXT, status TEXT NOT NULL CHECK(status IN ('STARTED','SUCCEEDED','FAILED')), failure_classification TEXT, UNIQUE(project_id,correlation_id,id)) STRICT""",
+            """INSERT INTO architect_requests SELECT * FROM architect_requests_m16""",
+            """CREATE TABLE architect_responses (id TEXT PRIMARY KEY, architect_request_id TEXT NOT NULL UNIQUE REFERENCES architect_requests(id), response_type TEXT NOT NULL CHECK(response_type IN ('DESIGN','SPECIFICATION_DRAFT')), response_schema_version TEXT NOT NULL, normalised_payload_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status='ACCEPTED'), created_at TEXT NOT NULL, validation_status TEXT NOT NULL CHECK(validation_status='VALID'), provider TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER, total_tokens INTEGER, CHECK(input_tokens IS NULL OR input_tokens>=0), CHECK(cached_input_tokens IS NULL OR cached_input_tokens>=0), CHECK(output_tokens IS NULL OR output_tokens>=0), CHECK(reasoning_tokens IS NULL OR reasoning_tokens>=0), CHECK(total_tokens IS NULL OR total_tokens>=0)) STRICT""",
+            "INSERT INTO architect_responses SELECT * FROM architect_responses_m16",
+            "DROP TABLE architect_responses_m16",
+            "DROP TABLE architect_requests_m16",
+            "CREATE INDEX architect_requests_project_created ON architect_requests(project_id,started_at,id)",
+            "CREATE TRIGGER architect_responses_no_update BEFORE UPDATE ON architect_responses BEGIN SELECT RAISE(ABORT,'architect responses are append-only'); END",
+            "CREATE TRIGGER architect_responses_no_delete BEFORE DELETE ON architect_responses BEGIN SELECT RAISE(ABORT,'architect responses are append-only'); END",
+            """CREATE TABLE design_packages (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), architect_request_id TEXT NOT NULL REFERENCES architect_requests(id), spec_document_id TEXT NOT NULL REFERENCES project_documents(id), agents_document_id TEXT NOT NULL REFERENCES project_documents(id), repository_visibility TEXT NOT NULL CHECK(repository_visibility IN ('public','private')), design_summary TEXT NOT NULL CHECK(length(trim(design_summary))>0), planned_milestones_json TEXT NOT NULL, assumptions_json TEXT NOT NULL, non_blocking_issues_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('PENDING_APPROVAL','APPROVED','REJECTED')), approval_gate_id TEXT NOT NULL UNIQUE REFERENCES human_gates(id), created_at TEXT NOT NULL, approved_at TEXT, approved_by TEXT, rejected_at TEXT, rejection_feedback TEXT, CHECK((status='APPROVED' AND approved_at IS NOT NULL AND approved_by IS NOT NULL AND rejected_at IS NULL) OR (status='REJECTED' AND rejected_at IS NOT NULL AND approved_at IS NULL) OR status='PENDING_APPROVAL')) STRICT""",
+            "CREATE INDEX design_packages_project_status ON design_packages(project_id,status,created_at)",
+            """CREATE TRIGGER design_packages_document_consistency BEFORE INSERT ON design_packages WHEN NOT EXISTS (SELECT 1 FROM project_documents WHERE id=NEW.spec_document_id AND project_id=NEW.project_id AND document_type='SPEC' AND status='DRAFT') OR NOT EXISTS (SELECT 1 FROM project_documents WHERE id=NEW.agents_document_id AND project_id=NEW.project_id AND document_type='AGENTS' AND status='DRAFT') BEGIN SELECT RAISE(ABORT,'design package documents are inconsistent'); END""",
+            """CREATE TRIGGER design_packages_identity_immutable BEFORE UPDATE OF project_id,architect_request_id,spec_document_id,agents_document_id,repository_visibility,design_summary,planned_milestones_json,assumptions_json,non_blocking_issues_json,approval_gate_id,created_at ON design_packages BEGIN SELECT RAISE(ABORT,'design package identity is immutable'); END""",
+            """CREATE TABLE design_change_feedback (id TEXT PRIMARY KEY, package_id TEXT NOT NULL REFERENCES design_packages(id), project_id TEXT NOT NULL REFERENCES projects(id), feedback TEXT NOT NULL CHECK(length(trim(feedback))>0), provided_by TEXT NOT NULL, created_at TEXT NOT NULL) STRICT""",
+            "CREATE INDEX design_feedback_project_created ON design_change_feedback(project_id,created_at,id)",
+        ),
+    ),
 )
 
 

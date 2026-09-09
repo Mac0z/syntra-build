@@ -9,6 +9,7 @@ import pytest
 
 from syntra_build.adapters.architect import (
     DESIGN_RESPONSE_SCHEMA,
+    SPECIFICATION_DRAFT_SCHEMA,
     OpenAIArchitectProvider,
 )
 from syntra_build.application.architect import (
@@ -224,3 +225,12 @@ def test_parsing_proposals_does_not_materialise_project_decisions(
     assert response.proposed_decisions[0].proposal == "Use SQLite"
     assert before is not None and before[0] == 0
     assert after is not None and after[0] == 0
+
+
+def test_specification_schema_is_strict_at_every_object_level() -> None:
+    assert SPECIFICATION_DRAFT_SCHEMA["additionalProperties"] is False
+    properties = cast(dict[str, object], SPECIFICATION_DRAFT_SCHEMA["properties"])
+    milestones = cast(dict[str, object], properties["planned_milestones"])
+    item = cast(dict[str, object], milestones["items"])
+    assert item["additionalProperties"] is False
+    assert "tools" not in SPECIFICATION_DRAFT_SCHEMA

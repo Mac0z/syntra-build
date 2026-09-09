@@ -15,6 +15,11 @@ from syntra_build.domain.errors import DomainValidationError
 from syntra_build.domain.identifiers import ProjectId
 
 
+class RepositoryVisibility(StrEnum):
+    PUBLIC = "public"
+    PRIVATE = "private"
+
+
 class ProjectState(StrEnum):
     NEW = "NEW"
     DESIGNING = "DESIGNING"
@@ -42,6 +47,7 @@ class Project:
     activity: str | None = None
     last_state_change_at: datetime | None = None
     canonical_name: str | None = None
+    repository_visibility: RepositoryVisibility = RepositoryVisibility.PUBLIC
 
     def __post_init__(self) -> None:
         require_identifier(self.id, ProjectId, "id")
@@ -49,6 +55,9 @@ class Project:
         if self.canonical_name is not None:
             require_text(self.canonical_name, "canonical_name")
         require_enum(self.state, ProjectState, "state")
+        require_enum(
+            self.repository_visibility, RepositoryVisibility, "repository_visibility"
+        )
         require_utc(self.created_at, "created_at")
         require_utc(self.updated_at, "updated_at")
         require_timestamp_order(

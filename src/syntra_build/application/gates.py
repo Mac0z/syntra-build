@@ -36,6 +36,10 @@ class GateNotifier(Protocol):
     def send(self, text: str) -> str: ...
 
 
+class DesignDecisionHandler(Protocol):
+    def respond(self, command: Command, gate: HumanGate) -> str: ...
+
+
 @dataclass(frozen=True, slots=True)
 class CreateGateRequest:
     project_id: ProjectId
@@ -261,8 +265,13 @@ class HumanGateService:
 class HumanGateCommandHandler:
     """Provider-neutral bridge from deterministic M6 commands to gate services."""
 
-    def __init__(self, gates: HumanGateService):
+    def __init__(
+        self,
+        gates: HumanGateService,
+        design_decisions: DesignDecisionHandler | None = None,
+    ):
         self._gates = gates
+        self._design_decisions = design_decisions
 
     def waiting(self) -> str:
         return format_waiting(self._gates.outstanding())
@@ -275,13 +284,15 @@ class HumanGateCommandHandler:
         try:
             gate_id = GateId.from_string(command.gate_reference)
             gate = self._gates.get(gate_id)
+            if gate.gate_type is GateType.DESIGN_APPROVAL and self._design_decisions:
+                return self._design_decisions.respond(command, gate)
             resolved = self._gates.respond(
                 gate_id,
                 project_id=gate.project_id,
                 milestone_id=gate.milestone_id,
                 message_id=command.source_message_id,
                 response_code=command.gate_response,
-                response_text=None,
+                response_text=command.gate_feedback,
                 responded_by=command.requested_by,
                 responded_at=command.requested_at,
                 correlation_id=command.correlation_id,

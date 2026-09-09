@@ -82,3 +82,8 @@ class ProjectDocumentId(_UUIDIdentifier):
 @dataclass(frozen=True, slots=True)
 class ProjectDecisionId(_UUIDIdentifier):
     """Stable identity for a structured project design decision."""
+
+
+@dataclass(frozen=True, slots=True)
+class DesignPackageId(_UUIDIdentifier):
+    """Stable identity for an immutable design package."""

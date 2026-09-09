@@ -25,6 +25,9 @@ from syntra_build.infrastructure.persistence.design import (
     SQLiteProjectDocumentRepository,
     document_content_hash,
 )
+from syntra_build.infrastructure.persistence.design_packages import (
+    SQLiteDesignPackageRepository,
+)
 from syntra_build.infrastructure.persistence.errors import (
     ActiveMilestoneConflictError,
     AttemptLimitExhaustedError,
@@ -134,6 +137,7 @@ __all__ = [
     "SQLiteDesignMessageRepository",
     "SQLiteProjectDecisionRepository",
     "SQLiteProjectDocumentRepository",
+    "SQLiteDesignPackageRepository",
     "document_content_hash",
     "JobStateTransition",
     "SchedulableJob",

@@ -15,6 +15,8 @@ from syntra_build.domain import (
     ArchitectDesignResponse,
     ProjectDesignContext,
     ProjectId,
+    SpecificationDraft,
+    SpecificationDraftRequest,
 )
 
 
@@ -41,6 +43,9 @@ class ArchitectProvider(Protocol):
     model: str
 
     def design(self, request: ArchitectDesignRequest) -> ArchitectDesignResponse: ...
+    def draft_specification(
+        self, request: SpecificationDraftRequest
+    ) -> SpecificationDraft: ...
     def telemetry(self) -> dict[str, int | str | None]: ...
 
 
