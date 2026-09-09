@@ -35,7 +35,17 @@ DESIGN_RESPONSE_SCHEMA: dict[str, object] = {
         "message": {"type": "string", "minLength": 1},
         "proposed_decisions": {
             "type": "array",
-            "items": {"type": "object", "additionalProperties": True},
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["decision_type", "title", "proposal", "rationale"],
+                "properties": {
+                    "decision_type": {"type": "string", "minLength": 1},
+                    "title": {"type": "string", "minLength": 1},
+                    "proposal": {"type": "string", "minLength": 1},
+                    "rationale": {"type": "string", "minLength": 1},
+                },
+            },
         },
         "open_questions": {
             "type": "array",
