@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,12 +16,15 @@ from syntra_build.adapters.telegram import (
 from syntra_build.application.commands import InboundMessage
 from syntra_build.infrastructure.config import (
     ApplicationConfig,
+    ConfigurationError,
     SecretInputs,
     SecretValue,
     load_config,
 )
 from syntra_build.infrastructure.persistence import bootstrap_database
 from syntra_build.smoke import (
+    _load_host_config,
+    _parser,
     build_host_router,
     build_smoke_router,
     main,
@@ -29,6 +33,114 @@ from syntra_build.smoke import (
 )
 
 REVISION = "a" * 40
+ARCHITECT_SECRET = "synthetic-architect-secret-never-output"
+TELEGRAM_SECRET = "synthetic-telegram-secret-never-output"
+GITHUB_SECRET = "synthetic-github-secret-never-output"
+
+
+def _write_secret(path: Path, value: str) -> None:
+    path.write_text(value, encoding="utf-8")
+    path.chmod(0o600)
+
+
+def _host_config_files(
+    tmp_path: Path,
+    *,
+    telegram: bool,
+    github: bool,
+    architect: bool,
+) -> tuple[Path, Path, Path, Path]:
+    config_path = tmp_path / "config.json"
+    telegram_path = tmp_path / "telegram-token"
+    github_path = tmp_path / "github-token"
+    architect_path = tmp_path / "openai-api-key"
+    config_path.write_text(
+        json.dumps(
+            {
+                "telegram": {
+                    "enabled": telegram,
+                    "authorised_user_ids": [123] if telegram else [],
+                },
+                "github": {"enabled": github, "owner": "example"},
+                "architect": {
+                    "enabled": architect,
+                    "provider": "openai",
+                    "model": "gpt-test",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    if telegram:
+        _write_secret(telegram_path, TELEGRAM_SECRET)
+    if github:
+        _write_secret(github_path, GITHUB_SECRET)
+    if architect:
+        _write_secret(architect_path, ARCHITECT_SECRET)
+    return config_path, telegram_path, github_path, architect_path
+
+
+@pytest.mark.parametrize(
+    ("telegram", "github", "architect"),
+    [
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+        (True, True, True),
+    ],
+    ids=["telegram", "github", "architect", "all-enabled"],
+)
+def test_host_config_loads_secrets_for_all_enabled_integrations(
+    tmp_path: Path, telegram: bool, github: bool, architect: bool
+) -> None:
+    config = _load_host_config(
+        *_host_config_files(
+            tmp_path, telegram=telegram, github=github, architect=architect
+        )
+    )
+
+    assert (config.secrets.telegram_bot_token is not None) is telegram
+    assert (config.secrets.github_token is not None) is github
+    assert (config.secrets.architect_api_key is not None) is architect
+    for secret in (TELEGRAM_SECRET, GITHUB_SECRET, ARCHITECT_SECRET):
+        assert secret not in repr(config)
+        assert secret not in repr(config.secrets)
+
+
+def test_enabled_architect_requires_secret_file_without_disclosing_value(
+    tmp_path: Path,
+) -> None:
+    paths = _host_config_files(tmp_path, telegram=False, github=False, architect=True)
+    paths[3].unlink()
+
+    with pytest.raises(
+        ConfigurationError, match="Architect API key is required"
+    ) as caught:
+        _load_host_config(*paths)
+    assert ARCHITECT_SECRET not in str(caught.value)
+
+
+def test_architect_secret_file_requires_private_permissions_without_disclosure(
+    tmp_path: Path,
+) -> None:
+    paths = _host_config_files(tmp_path, telegram=False, github=False, architect=True)
+    paths[3].chmod(0o640)
+
+    with pytest.raises(RuntimeError, match="permissions are too broad") as caught:
+        _load_host_config(*paths)
+    assert ARCHITECT_SECRET not in str(caught.value)
+
+
+def test_cli_uses_default_architect_secret_path_and_accepts_override() -> None:
+    default_args = _parser().parse_args(["local"])
+    overridden_args = _parser().parse_args(
+        ["telegram-once", "--architect-api-key-file", "/run/secrets/architect"]
+    )
+
+    assert default_args.architect_api_key_file == Path(
+        "/etc/syntra-build/openai-api-key"
+    )
+    assert overridden_args.architect_api_key_file == Path("/run/secrets/architect")
 
 
 def _config(root: Path) -> ApplicationConfig:
