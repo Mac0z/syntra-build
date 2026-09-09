@@ -1,4 +1,9 @@
-"""Deterministic application command routing."""
+"""Provider-neutral command contracts and parsing.
+
+Routing is intentionally not re-exported from this package.  Lower-level
+application services import the command contracts, while the router composes
+those services; eagerly importing the router here would reverse that dependency.
+"""
 
 from syntra_build.application.commands.models import (
     READ_ONLY_COMMANDS,
@@ -13,7 +18,6 @@ from syntra_build.application.commands.parser import (
     ParseFailure,
     ParseResult,
 )
-from syntra_build.application.commands.router import HELP_TEXT, CommandRouter
 from syntra_build.application.commands.services import (
     CommandAuditRequest,
     CommandAuditSink,
@@ -28,7 +32,6 @@ from syntra_build.application.commands.services import (
 )
 
 __all__ = [
-    "HELP_TEXT",
     "READ_ONLY_COMMANDS",
     "STATE_CHANGING_COMMANDS",
     "Command",
@@ -36,7 +39,6 @@ __all__ = [
     "CommandAuditSink",
     "CommandParser",
     "CommandResponse",
-    "CommandRouter",
     "CommandType",
     "InboundMessage",
     "IntentResolver",

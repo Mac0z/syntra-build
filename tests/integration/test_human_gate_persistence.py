@@ -9,13 +9,13 @@ from syntra_build.application.commands import (
     Command,
     CommandAuditRequest,
     CommandParser,
-    CommandRouter,
     InboundMessage,
     ProjectCommandResult,
     ProjectResolution,
     ProjectSummary,
     ResolutionOutcome,
 )
+from syntra_build.application.commands.router import CommandRouter
 from syntra_build.application.gates import (
     CreateGateRequest,
     HumanGateCommandHandler,
