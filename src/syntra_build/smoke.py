@@ -266,7 +266,10 @@ def validate_revision(value: str) -> str:
 
 
 def _load_host_config(
-    config_path: Path, token_path: Path, github_token_path: Path
+    config_path: Path,
+    token_path: Path,
+    github_token_path: Path,
+    architect_api_key_path: Path,
 ) -> ApplicationConfig:
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(raw, Mapping) or not all(isinstance(key, str) for key in raw):
@@ -275,6 +278,9 @@ def _load_host_config(
         raw,
         environ={},
         secrets=SecretInputs(
+            architect_api_key=read_protected_secret_file(
+                architect_api_key_path, "Architect API key"
+            ),
             telegram_bot_token=read_protected_secret_file(token_path, "Telegram token"),
             github_token=read_protected_secret_file(github_token_path, "GitHub token"),
         ),
@@ -302,6 +308,11 @@ def _parser() -> argparse.ArgumentParser:
         default=Path("/etc/syntra-build/github-token"),
     )
     parser.add_argument(
+        "--architect-api-key-file",
+        type=Path,
+        default=Path("/etc/syntra-build/openai-api-key"),
+    )
+    parser.add_argument(
         "--revision-file", type=Path, default=Path("/opt/syntra-build/REVISION")
     )
     return parser
@@ -313,7 +324,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if sys.version_info[:2] != (3, 14):
             raise RuntimeError("Python 3.14 is required")
-        config = _load_host_config(args.config, args.token_file, args.github_token_file)
+        config = _load_host_config(
+            args.config,
+            args.token_file,
+            args.github_token_file,
+            args.architect_api_key_file,
+        )
         stream = _configure_file_logging(config)
         revision = validate_revision(args.revision_file.read_text(encoding="ascii"))
         if args.command == "local":
