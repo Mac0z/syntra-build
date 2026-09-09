@@ -13,6 +13,7 @@ from syntra_build.domain import (
     ProjectId,
     ProjectState,
     ProjectTransitionRequest,
+    RepositoryVisibility,
 )
 from syntra_build.domain._validation import require_utc
 from syntra_build.domain.project_state_machine import validate_transition
@@ -75,8 +76,8 @@ class SQLiteProjectRepository:
                 return
             self._connection.execute(
                 """INSERT INTO projects
-                   (id,name,state,resume_state,activity,created_at,updated_at,last_state_change_at,canonical_name)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                   (id,name,state,resume_state,activity,created_at,updated_at,last_state_change_at,canonical_name,repository_visibility)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (
                     str(project.id),
                     project.name,
@@ -87,6 +88,7 @@ class SQLiteProjectRepository:
                     _timestamp(project.updated_at),
                     _timestamp(changed_at),
                     project.canonical_name,
+                    project.repository_visibility.value,
                 ),
             )
         except sqlite3.Error as error:
@@ -112,6 +114,9 @@ class SQLiteProjectRepository:
             canonical_name=(
                 row["canonical_name"] if "canonical_name" in row.keys() else None
             ),
+            repository_visibility=RepositoryVisibility(row["repository_visibility"])
+            if "repository_visibility" in row.keys()
+            else RepositoryVisibility.PUBLIC,
         )
 
     def _has_canonical_name_column(self) -> bool:
@@ -269,6 +274,23 @@ class SQLiteProjectRepository:
         )
         if cursor.rowcount != 1:
             raise PersistenceError("project does not exist")
+        return self.get(project_id)
+
+    def set_repository_visibility(
+        self,
+        project_id: ProjectId,
+        visibility: RepositoryVisibility,
+        updated_at: datetime,
+    ) -> Project:
+        """Mutate visibility only while an atomic design approval is in progress."""
+        require_utc(updated_at, "updated_at")
+        cursor = self._connection.execute(
+            """UPDATE projects SET repository_visibility=?,updated_at=?
+               WHERE id=? AND state='DESIGN_APPROVAL'""",
+            (visibility.value, _timestamp(updated_at), str(project_id)),
+        )
+        if cursor.rowcount != 1:
+            raise PersistenceError("project is not awaiting design approval")
         return self.get(project_id)
 
     def transitions(self, project_id: ProjectId) -> tuple[ProjectStateTransition, ...]:

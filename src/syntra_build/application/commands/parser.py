@@ -78,14 +78,19 @@ class CommandParser:
                 )
             )
         if token == "gate":
-            arguments = parts[1].split() if len(parts) == 2 else []
-            if len(arguments) != 2:
+            arguments = parts[1].split(maxsplit=2) if len(parts) == 2 else []
+            if len(arguments) < 2:
+                return ParseResult(failure=ParseFailure.MALFORMED)
+            response = arguments[1].upper()
+            feedback = arguments[2].strip() if len(arguments) == 3 else None
+            if response != "REQUEST_CHANGES" and feedback:
                 return ParseResult(failure=ParseFailure.MALFORMED)
             return ParseResult(
                 command=Command(
                     type=CommandType.RESPOND_GATE,
                     gate_reference=arguments[0],
-                    gate_response=arguments[1].upper(),
+                    gate_response=response,
+                    gate_feedback=feedback,
                     requested_by=message.sender_id,
                     requested_at=message.received_at,
                     source_platform=message.source_platform,

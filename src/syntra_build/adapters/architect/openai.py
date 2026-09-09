@@ -10,7 +10,13 @@ from collections.abc import Callable
 from typing import cast
 
 from syntra_build.application.architect import ArchitectError, ArchitectFailureKind
-from syntra_build.domain import ArchitectDesignRequest, ArchitectDesignResponse
+from syntra_build.domain import (
+    ArchitectDesignRequest,
+    ArchitectDesignResponse,
+    SpecificationDraft,
+    SpecificationDraftRequest,
+)
+from syntra_build.domain.errors import DomainValidationError
 
 DESIGN_RESPONSE_SCHEMA: dict[str, object] = {
     "type": "object",
@@ -50,6 +56,48 @@ DESIGN_RESPONSE_SCHEMA: dict[str, object] = {
         "open_questions": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
+        },
+    },
+}
+SPECIFICATION_DRAFT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "interface_version",
+        "correlation_id",
+        "project_id",
+        "design_summary",
+        "repository_visibility",
+        "spec_markdown",
+        "agents_markdown",
+        "assumptions",
+        "non_blocking_issues",
+        "planned_milestones",
+    ],
+    "properties": {
+        "interface_version": {"type": "string", "const": "1.0"},
+        "correlation_id": {"type": "string", "minLength": 1},
+        "project_id": {"type": "string", "minLength": 1},
+        "design_summary": {"type": "string", "minLength": 1},
+        "repository_visibility": {"type": "string", "enum": ["public", "private"]},
+        "spec_markdown": {"type": "string", "minLength": 1},
+        "agents_markdown": {"type": "string", "minLength": 1},
+        "assumptions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "non_blocking_issues": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "planned_milestones": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["code", "title"],
+                "properties": {
+                    "code": {"type": "string", "minLength": 1},
+                    "title": {"type": "string", "minLength": 1},
+                },
+            },
         },
     },
 }
@@ -173,6 +221,127 @@ class OpenAIArchitectProvider:
             "total_tokens": _integer(usage.get("total_tokens")),
         }
         return response
+
+    def draft_specification(
+        self, request: SpecificationDraftRequest
+    ) -> SpecificationDraft:
+        """Produce bounded source-of-truth drafts without granting provider capabilities."""
+        payload: dict[str, object] = {
+            "model": self.model,
+            "reasoning": {"effort": self._reasoning_effort},
+            "instructions": (
+                "Produce strict SPEC.md and AGENTS.md source-of-truth drafts for a coding agent. "
+                "SPEC defines product intent, scope/non-goals, runtime, requirements, boundaries, "
+                "persistence, security, interfaces, milestones, dependencies and acceptance. AGENTS "
+                "defines durable implementation, architecture, dependency, testing, CI and security "
+                "rules. Do not invent blocking requirements: fail rather than misrepresent them. "
+                "Echo required_repository_visibility exactly. Do not execute operations or use tools."
+            ),
+            "input": json.dumps(
+                request.to_dict(), sort_keys=True, separators=(",", ":")
+            ),
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "specification_draft",
+                    "strict": True,
+                    "schema": SPECIFICATION_DRAFT_SCHEMA,
+                }
+            },
+            "store": False,
+        }
+        raw = self._send(payload)
+        try:
+            response = SpecificationDraft.from_dict(self._output(raw))
+        except (DomainValidationError, TypeError, ValueError) as error:
+            raise ArchitectError(
+                ArchitectFailureKind.MALFORMED_RESPONSE,
+                "Architect provider returned malformed structured output",
+            ) from error
+        if response.repository_visibility is not request.required_repository_visibility:
+            raise ArchitectError(
+                ArchitectFailureKind.MALFORMED_RESPONSE,
+                "Architect changed required repository visibility",
+            )
+        self._capture_usage(raw)
+        return response
+
+    def _send(self, payload: dict[str, object]) -> dict[str, object]:
+        try:
+            return self._transport(payload, self._api_key, self._timeout)
+        except ArchitectError:
+            raise
+        except TimeoutError as error:
+            raise ArchitectError(
+                ArchitectFailureKind.TIMEOUT,
+                "Architect provider timed out; outcome may be ambiguous",
+            ) from error
+        except (OSError, urllib.error.URLError) as error:
+            raise ArchitectError(
+                ArchitectFailureKind.TRANSIENT_PROVIDER,
+                "Architect provider is temporarily unavailable",
+            ) from error
+
+    def _output(self, raw: dict[str, object]) -> object:
+        if raw.get("status") == "incomplete":
+            raise ArchitectError(
+                ArchitectFailureKind.INCOMPLETE_RESPONSE,
+                "Architect provider returned an incomplete response",
+            )
+        output = raw.get("output")
+        if not isinstance(output, list):
+            raise ArchitectError(
+                ArchitectFailureKind.MALFORMED_RESPONSE,
+                "Architect provider returned an unusable response",
+            )
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            for content in cast(list[object], item.get("content", [])):
+                if isinstance(content, dict) and content.get("type") == "refusal":
+                    raise ArchitectError(
+                        ArchitectFailureKind.REFUSAL,
+                        "Architect provider refused the request",
+                    )
+                if (
+                    isinstance(content, dict)
+                    and content.get("type") == "output_text"
+                    and isinstance(content.get("text"), str)
+                ):
+                    try:
+                        return json.loads(cast(str, content["text"]))
+                    except ValueError as error:
+                        raise ArchitectError(
+                            ArchitectFailureKind.MALFORMED_RESPONSE,
+                            "Architect provider returned malformed structured output",
+                        ) from error
+        raise ArchitectError(
+            ArchitectFailureKind.MALFORMED_RESPONSE,
+            "Architect provider returned no structured output",
+        )
+
+    def _capture_usage(self, raw: dict[str, object]) -> None:
+        usage = raw.get("usage", {})
+        usage = usage if isinstance(usage, dict) else {}
+        input_details, output_details = (
+            usage.get("input_tokens_details", {}),
+            usage.get("output_tokens_details", {}),
+        )
+        response_id = raw.get("id")
+        self._usage = {
+            "provider_response_id": response_id
+            if isinstance(response_id, str)
+            else None,
+            "input_tokens": _integer(usage.get("input_tokens")),
+            "cached_input_tokens": _integer(input_details.get("cached_tokens"))
+            if isinstance(input_details, dict)
+            else None,
+            "output_tokens": _integer(usage.get("output_tokens")),
+            "reasoning_tokens": _integer(output_details.get("reasoning_tokens"))
+            if isinstance(output_details, dict)
+            else None,
+            "total_tokens": _integer(usage.get("total_tokens")),
+        }
 
     def telemetry(self) -> dict[str, int | str | None]:
         return dict(self._usage)

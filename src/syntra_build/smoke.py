@@ -35,10 +35,12 @@ from syntra_build.application.commands.services import (
     ProjectSummary,
     ResolutionOutcome,
 )
+from syntra_build.application.gates import HumanGateCommandHandler, HumanGateService
 from syntra_build.application.projects import (
     ProjectCreationService,
     SQLiteProjectQueryService,
 )
+from syntra_build.application.specification import DesignPackageDecisionHandler
 from syntra_build.domain import ProjectId
 from syntra_build.infrastructure.config import (
     ApplicationConfig,
@@ -48,6 +50,8 @@ from syntra_build.infrastructure.config import (
 )
 from syntra_build.infrastructure.logging import configure_logging
 from syntra_build.infrastructure.persistence import (
+    SQLiteDesignPackageRepository,
+    SQLiteHumanGateRepository,
     SQLiteProjectRepository,
     SQLiteProviderCursorRepository,
     SQLiteWorkflowEventRepository,
@@ -150,12 +154,26 @@ def build_host_router(
         events,
         checker,
     )
+    gate_repository = SQLiteHumanGateRepository(connection, lambda: str(uuid4()))
+    authorised = frozenset(str(item) for item in config.telegram.authorised_user_ids)
+    gate_service = HumanGateService(
+        gate_repository,
+        response_id_factory=lambda: str(uuid4()),
+        authorised_responder_ids=authorised,
+    )
+    gate_commands = HumanGateCommandHandler(
+        gate_service,
+        DesignPackageDecisionHandler(
+            SQLiteDesignPackageRepository(connection), authorised
+        ),
+    )
     return CommandRouter(
         project_queries=SQLiteProjectQueryService(projects),
         project_commands=_UnavailableProjectCommands(),
         audit_sink=_NoopAudit(),
         health=_LocalHealth(),
         project_creation=creation,
+        gate_commands=gate_commands,
     )
 
 

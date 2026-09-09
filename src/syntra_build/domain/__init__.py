@@ -48,6 +48,7 @@ from syntra_build.domain.gates import (
     validate_response,
 )
 from syntra_build.domain.identifiers import (
+    DesignPackageId,
     GateId,
     JobId,
     MessageId,
@@ -86,11 +87,32 @@ from syntra_build.domain.project_state_machine import (
     is_transition_allowed,
     validate_transition,
 )
-from syntra_build.domain.projects import Project, ProjectCreationContext, ProjectState
+from syntra_build.domain.projects import (
+    Project,
+    ProjectCreationContext,
+    ProjectState,
+    RepositoryVisibility,
+)
+from syntra_build.domain.specification import (
+    SPECIFICATION_DRAFT_INTERFACE_VERSION,
+    DesignPackage,
+    DesignPackageStatus,
+    PlannedMilestone,
+    SpecificationDraft,
+    SpecificationDraftRequest,
+)
 
 __all__ = [
     "ARCHITECT_INTERFACE_VERSION",
     "ArchitectDesignMode",
+    "SPECIFICATION_DRAFT_INTERFACE_VERSION",
+    "SpecificationDraftRequest",
+    "SpecificationDraft",
+    "PlannedMilestone",
+    "DesignPackage",
+    "DesignPackageStatus",
+    "DesignPackageId",
+    "RepositoryVisibility",
     "ArchitectDesignRequest",
     "ArchitectDesignResponse",
     "ArchitectProposedDecision",
