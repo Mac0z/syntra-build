@@ -417,6 +417,138 @@ MIGRATIONS: tuple[Migration, ...] = (
             ) STRICT""",
         ),
     ),
+    Migration(
+        version=10,
+        name="010_design_persistence",
+        statements=(
+            """CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT REFERENCES milestones(id),
+                gate_id TEXT REFERENCES human_gates(id),
+                direction TEXT NOT NULL CHECK(direction IN ('INBOUND','OUTBOUND')),
+                platform TEXT NOT NULL,
+                external_message_id TEXT,
+                chat_id TEXT NOT NULL,
+                thread_id TEXT,
+                sender_id TEXT,
+                message_type TEXT NOT NULL,
+                text TEXT,
+                attachments_json TEXT,
+                reply_to_message_id TEXT,
+                received_at TEXT,
+                sent_at TEXT,
+                correlation_id TEXT NOT NULL,
+                raw_metadata_json TEXT,
+                CHECK((direction='INBOUND' AND received_at IS NOT NULL AND sent_at IS NULL)
+                   OR (direction='OUTBOUND' AND sent_at IS NOT NULL AND received_at IS NULL))
+            ) STRICT""",
+            """CREATE UNIQUE INDEX messages_external_delivery_unique
+                ON messages(platform,chat_id,external_message_id)
+                WHERE external_message_id IS NOT NULL""",
+            """CREATE INDEX messages_project_chronological ON messages(
+                project_id,coalesce(received_at,sent_at),id)""",
+            """CREATE TRIGGER messages_parent_consistency BEFORE INSERT ON messages
+                WHEN (NEW.milestone_id IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM milestones WHERE id=NEW.milestone_id
+                    AND project_id=NEW.project_id))
+                  OR (NEW.gate_id IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM human_gates WHERE id=NEW.gate_id
+                    AND project_id=NEW.project_id))
+                BEGIN SELECT RAISE(ABORT,'message parent belongs to another project'); END""",
+            """CREATE TRIGGER messages_no_update BEFORE UPDATE ON messages BEGIN
+                SELECT RAISE(ABORT,'messages are append-only'); END""",
+            """CREATE TRIGGER messages_no_delete BEFORE DELETE ON messages BEGIN
+                SELECT RAISE(ABORT,'messages are append-only'); END""",
+            """CREATE TABLE project_documents (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                document_type TEXT NOT NULL CHECK(document_type IN ('SPEC','AGENTS')),
+                revision INTEGER NOT NULL CHECK(revision >= 1),
+                status TEXT NOT NULL CHECK(status IN
+                    ('DRAFT','APPROVED','SUPERSEDED','REJECTED')),
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL CHECK(length(content_hash)=64),
+                created_at TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                approved_at TEXT,
+                approved_by TEXT,
+                supersedes_document_id TEXT REFERENCES project_documents(id),
+                UNIQUE(project_id,document_type,revision),
+                CHECK((status='APPROVED' AND approved_at IS NOT NULL AND approved_by IS NOT NULL)
+                    OR status<>'APPROVED'),
+                CHECK(supersedes_document_id IS NULL
+                    OR status IN ('APPROVED','SUPERSEDED')),
+                CHECK(supersedes_document_id IS NULL OR supersedes_document_id<>id)
+            ) STRICT""",
+            """CREATE UNIQUE INDEX project_documents_one_approved
+                ON project_documents(project_id,document_type)
+                WHERE status='APPROVED'""",
+            """CREATE INDEX project_documents_project_current
+                ON project_documents(project_id,document_type,revision DESC)""",
+            """CREATE TRIGGER project_documents_content_immutable
+                BEFORE UPDATE OF content,content_hash,project_id,document_type,revision
+                ON project_documents BEGIN
+                SELECT RAISE(ABORT,'document revision content and identity are immutable'); END""",
+            """CREATE TRIGGER project_documents_no_delete BEFORE DELETE
+                ON project_documents BEGIN
+                SELECT RAISE(ABORT,'document revisions are preservation-oriented'); END""",
+            """CREATE TRIGGER project_documents_supersedes_consistency
+                BEFORE INSERT ON project_documents
+                WHEN NEW.supersedes_document_id IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM project_documents WHERE id=NEW.supersedes_document_id
+                    AND project_id=NEW.project_id
+                    AND document_type=NEW.document_type
+                    AND revision<NEW.revision)
+                BEGIN SELECT RAISE(ABORT,'superseded document is inconsistent'); END""",
+            """CREATE TRIGGER project_documents_supersedes_update_consistency
+                BEFORE UPDATE OF supersedes_document_id ON project_documents
+                WHEN NEW.supersedes_document_id IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM project_documents WHERE id=NEW.supersedes_document_id
+                    AND project_id=NEW.project_id
+                    AND document_type=NEW.document_type
+                    AND revision<NEW.revision)
+                BEGIN SELECT RAISE(ABORT,'superseded document is inconsistent'); END""",
+            """CREATE TRIGGER project_documents_lineage_set_on_approval
+                BEFORE UPDATE OF supersedes_document_id ON project_documents
+                WHEN OLD.status<>'DRAFT' OR NEW.status<>'APPROVED'
+                BEGIN SELECT RAISE(ABORT,'document lineage is set only on approval'); END""",
+            """CREATE TABLE project_decisions (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT REFERENCES milestones(id),
+                decision_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                source TEXT NOT NULL CHECK(source IN ('HUMAN','ARCHITECT','POLICY','SYSTEM')),
+                created_at TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                superseded_by_decision_id TEXT REFERENCES project_decisions(id),
+                CHECK(superseded_by_decision_id IS NULL OR superseded_by_decision_id<>id)
+            ) STRICT""",
+            """CREATE INDEX project_decisions_project_chronological
+                ON project_decisions(project_id,created_at,id)""",
+            """CREATE INDEX project_decisions_project_active
+                ON project_decisions(project_id,decision_type,created_at,id)
+                WHERE superseded_by_decision_id IS NULL""",
+            """CREATE TRIGGER project_decisions_parent_consistency
+                BEFORE INSERT ON project_decisions
+                WHEN NEW.milestone_id IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM milestones WHERE id=NEW.milestone_id
+                    AND project_id=NEW.project_id)
+                BEGIN SELECT RAISE(ABORT,'decision milestone belongs to another project'); END""",
+            """CREATE TRIGGER project_decisions_supersession_consistency
+                BEFORE UPDATE OF superseded_by_decision_id ON project_decisions
+                WHEN NEW.superseded_by_decision_id IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM project_decisions WHERE id=NEW.superseded_by_decision_id
+                    AND project_id=NEW.project_id)
+                BEGIN SELECT RAISE(ABORT,'superseding decision belongs to another project'); END""",
+            """CREATE TRIGGER project_decisions_no_delete BEFORE DELETE
+                ON project_decisions BEGIN
+                SELECT RAISE(ABORT,'project decisions are preservation-oriented'); END""",
+        ),
+    ),
 )
 
 

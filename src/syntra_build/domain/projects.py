@@ -68,3 +68,31 @@ class Project:
                 "created_at",
                 "last_state_change_at",
             )
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectCreationContext:
+    """Durable owner, initial request, and messaging identity for a project."""
+
+    project_id: ProjectId
+    owner_id: str
+    initial_request: str
+    messaging_platform: str
+    conversation_id: str
+    thread_id: str | None
+    source_update_id: str
+    source_message_id: str
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        require_identifier(self.project_id, ProjectId, "project_id")
+        for value, name in (
+            (self.owner_id, "owner_id"),
+            (self.initial_request, "initial_request"),
+            (self.messaging_platform, "messaging_platform"),
+            (self.conversation_id, "conversation_id"),
+            (self.source_update_id, "source_update_id"),
+            (self.source_message_id, "source_message_id"),
+        ):
+            require_text(value, name)
+        require_utc(self.created_at, "created_at")

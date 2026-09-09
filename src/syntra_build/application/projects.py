@@ -19,6 +19,7 @@ from syntra_build.application.commands.services import (
 )
 from syntra_build.domain import (
     Project,
+    ProjectCreationContext,
     ProjectId,
     ProjectState,
     ProjectTransitionRequest,
@@ -29,10 +30,7 @@ from syntra_build.domain import (
 from syntra_build.infrastructure.persistence.connection import transaction
 from syntra_build.infrastructure.persistence.errors import PersistenceError
 from syntra_build.infrastructure.persistence.events import SQLiteWorkflowEventRepository
-from syntra_build.infrastructure.persistence.projects import (
-    ProjectCreationContext,
-    SQLiteProjectRepository,
-)
+from syntra_build.infrastructure.persistence.projects import SQLiteProjectRepository
 
 MAX_PROJECT_NAME_LENGTH = 100
 MAX_INITIAL_REQUEST_LENGTH = 20_000

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 
+from syntra_build.domain import ProjectCreationContext
 from syntra_build.infrastructure.config import ApplicationConfig
 from syntra_build.infrastructure.persistence.connection import (
     BUSY_TIMEOUT_MILLISECONDS,
@@ -14,6 +15,12 @@ from syntra_build.infrastructure.persistence.connection import (
 )
 from syntra_build.infrastructure.persistence.cursors import (
     SQLiteProviderCursorRepository,
+)
+from syntra_build.infrastructure.persistence.design import (
+    SQLiteDesignMessageRepository,
+    SQLiteProjectDecisionRepository,
+    SQLiteProjectDocumentRepository,
+    document_content_hash,
 )
 from syntra_build.infrastructure.persistence.errors import (
     ActiveMilestoneConflictError,
@@ -60,7 +67,6 @@ from syntra_build.infrastructure.persistence.milestones import (
     SQLiteMilestoneRepository,
 )
 from syntra_build.infrastructure.persistence.projects import (
-    ProjectCreationContext,
     ProjectStateTransition,
     SQLiteProjectRepository,
 )
@@ -121,6 +127,10 @@ __all__ = [
     "SQLiteHumanGateRepository",
     "SQLiteWorkflowEventRepository",
     "SQLiteProviderCursorRepository",
+    "SQLiteDesignMessageRepository",
+    "SQLiteProjectDecisionRepository",
+    "SQLiteProjectDocumentRepository",
+    "document_content_hash",
     "JobStateTransition",
     "SchedulableJob",
     "StaleJobStateError",
