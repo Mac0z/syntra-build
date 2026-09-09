@@ -14,12 +14,23 @@ from syntra_build.domain import (
     DesignPackageId,
     DesignPackageStatus,
     GateId,
+    GateState,
+    HumanGateResponse,
     PlannedMilestone,
     ProjectDocumentId,
     ProjectId,
+    ProjectState,
+    ProjectTransitionRequest,
     RepositoryVisibility,
 )
+from syntra_build.domain.gate_state_machine import GateTransitionRequest
+from syntra_build.infrastructure.persistence.connection import transaction
+from syntra_build.infrastructure.persistence.design import (
+    SQLiteProjectDocumentRepository,
+)
 from syntra_build.infrastructure.persistence.errors import PersistenceError
+from syntra_build.infrastructure.persistence.gates import SQLiteHumanGateRepository
+from syntra_build.infrastructure.persistence.projects import SQLiteProjectRepository
 
 
 def _dt(value: str | None) -> datetime | None:
@@ -113,6 +124,19 @@ class SQLiteDesignPackageRepository:
             )
         )
 
+    def pending_for_project(self, project_id: ProjectId) -> DesignPackage | None:
+        row = self.connection.execute(
+            """SELECT id FROM design_packages
+               WHERE project_id=? AND status='PENDING_APPROVAL'
+               ORDER BY created_at DESC,id DESC LIMIT 1""",
+            (str(project_id),),
+        ).fetchone()
+        return (
+            self.get(DesignPackageId.from_string(row["id"]))
+            if row is not None
+            else None
+        )
+
     def decide(
         self,
         *,
@@ -127,124 +151,102 @@ class SQLiteDesignPackageRepository:
         correlation_id: str,
         failure_hook: Callable[[str], None] | None = None,
     ) -> DesignPackage:
-        """Atomically resolve gate, documents, package, visibility and project state."""
+        """Apply one exact human decision using existing guarded repositories."""
         if outcome not in {"APPROVE", "REQUEST_CHANGES"}:
             raise PersistenceError("unsupported design decision")
         if outcome == "REQUEST_CHANGES" and (feedback is None or not feedback.strip()):
             raise PersistenceError("REQUEST_CHANGES requires feedback")
         hook = failure_hook or (lambda _: None)
         now = occurred_at.isoformat(timespec="microseconds")
-        try:
-            self.connection.execute("BEGIN")
-            package = self.get(package_id)
-            gate = self.connection.execute(
-                "SELECT * FROM human_gates WHERE id=?", (str(gate_id),)
-            ).fetchone()
-            project = self.connection.execute(
-                "SELECT state FROM projects WHERE id=?", (str(project_id),)
-            ).fetchone()
-            if (
-                package.project_id != project_id
-                or package.approval_gate_id != gate_id
-                or package.status is not DesignPackageStatus.PENDING_APPROVAL
-            ):
-                raise PersistenceError(
-                    "gate does not identify the pending design package"
-                )
-            if (
-                gate is None
-                or gate["project_id"] != str(project_id)
-                or gate["gate_type"] != "DESIGN_APPROVAL"
-                or gate["state"] != "NOTIFIED"
-                or gate["artifact_reference"] != f"design-package:{package_id}"
-            ):
-                raise PersistenceError(
-                    "design approval gate is not answerable for package"
-                )
-            if project is None or project["state"] != "DESIGN_APPROVAL":
-                raise PersistenceError("project is not awaiting design approval")
-            documents = {
-                row["id"]: row
-                for row in self.connection.execute(
-                    "SELECT * FROM project_documents WHERE id IN (?,?)",
-                    (str(package.spec_document_id), str(package.agents_document_id)),
-                )
-            }
-            spec, agents = (
-                documents.get(str(package.spec_document_id)),
-                documents.get(str(package.agents_document_id)),
-            )
-            if (
-                spec is None
-                or agents is None
-                or spec["project_id"] != str(project_id)
-                or agents["project_id"] != str(project_id)
-                or spec["document_type"] != "SPEC"
-                or agents["document_type"] != "AGENTS"
-                or spec["status"] != "DRAFT"
-                or agents["status"] != "DRAFT"
-            ):
-                raise PersistenceError("package document revisions are invalid")
-            self.connection.execute(
-                "INSERT INTO human_gate_responses (id,gate_id,message_id,response_code,response_text,selected_option,attachments_json,responded_by,responded_at,validated,validation_notes) VALUES (?,?,?,?,?,?,'[]',?,?,1,'validated by M17 design package policy')",
-                (
-                    str(uuid4()),
-                    str(gate_id),
-                    message_id,
-                    outcome,
-                    feedback,
-                    outcome,
+        gates = SQLiteHumanGateRepository(self.connection, lambda: str(uuid4()))
+        documents = SQLiteProjectDocumentRepository(self.connection)
+        projects = SQLiteProjectRepository(self.connection, lambda: str(uuid4()))
+        package = self.get(package_id)
+        gate = gates.get(gate_id)
+        project = projects.get(project_id)
+        if (
+            package.project_id != project_id
+            or package.approval_gate_id != gate_id
+            or package.status is not DesignPackageStatus.PENDING_APPROVAL
+        ):
+            raise PersistenceError("gate does not identify the pending design package")
+        if (
+            gate.project_id != project_id
+            or gate.gate_type.value != "DESIGN_APPROVAL"
+            or gate.state is not GateState.NOTIFIED
+            or gate.artifact_reference != f"design-package:{package_id}"
+        ):
+            raise PersistenceError("design approval gate is not answerable for package")
+        if project.state is not ProjectState.DESIGN_APPROVAL:
+            raise PersistenceError("project is not awaiting design approval")
+        spec = documents.get(project_id, package.spec_document_id)
+        agents = documents.get(project_id, package.agents_document_id)
+        if (
+            spec.document_type.value != "SPEC"
+            or agents.document_type.value != "AGENTS"
+            or spec.status.value != "DRAFT"
+            or agents.status.value != "DRAFT"
+        ):
+            raise PersistenceError("package document revisions are invalid")
+        response = HumanGateResponse(
+            str(uuid4()),
+            gate_id,
+            message_id,
+            outcome,
+            feedback,
+            None,
+            (),
+            responder,
+            occurred_at,
+            True,
+            "validated by M17 design package policy",
+        )
+        with transaction(self.connection):
+            gate = gates.record_response(
+                self._gate_transition(
+                    gate_id,
+                    project_id,
+                    GateState.NOTIFIED,
+                    GateState.RESPONDED,
+                    "human response received",
+                    "HUMAN",
                     responder,
-                    now,
+                    correlation_id,
+                    occurred_at,
+                    message_id,
                 ),
+                response,
             )
             if outcome == "APPROVE":
-                for label, document in (("spec", spec), ("agents", agents)):
-                    prior = self.connection.execute(
-                        "SELECT id FROM project_documents WHERE project_id=? AND document_type=? AND status='APPROVED'",
-                        (str(project_id), document["document_type"]),
-                    ).fetchone()
-                    self.connection.execute(
-                        "UPDATE project_documents SET status='SUPERSEDED' WHERE project_id=? AND document_type=? AND status='APPROVED'",
-                        (str(project_id), document["document_type"]),
-                    )
-                    self.connection.execute(
-                        "UPDATE project_documents SET status='APPROVED',approved_at=?,approved_by=?,supersedes_document_id=? WHERE id=? AND status='DRAFT'",
-                        (
-                            now,
-                            responder,
-                            prior["id"] if prior else None,
-                            document["id"],
-                        ),
-                    )
-                    hook(label)
+                documents.approve(
+                    project_id, package.spec_document_id, occurred_at, responder
+                )
+                hook("spec")
+                documents.approve(
+                    project_id, package.agents_document_id, occurred_at, responder
+                )
+                hook("agents")
+                projects.set_repository_visibility(
+                    project_id, package.repository_visibility, occurred_at
+                )
                 self.connection.execute(
-                    "UPDATE design_packages SET status='APPROVED',approved_at=?,approved_by=? WHERE id=?",
+                    """UPDATE design_packages SET status='APPROVED',approved_at=?,approved_by=?
+                       WHERE id=? AND status='PENDING_APPROVAL'""",
                     (now, responder, str(package_id)),
                 )
-                hook("package")
-                target = "PROVISIONING"
-                self.connection.execute(
-                    "UPDATE projects SET repository_visibility=?,state=?,updated_at=?,last_state_change_at=? WHERE id=? AND state='DESIGN_APPROVAL'",
-                    (
-                        package.repository_visibility.value,
-                        target,
-                        now,
-                        now,
-                        str(project_id),
-                    ),
-                )
+                target = ProjectState.PROVISIONING
             else:
+                documents.reject(project_id, package.spec_document_id)
+                documents.reject(project_id, package.agents_document_id)
                 self.connection.execute(
-                    "UPDATE project_documents SET status='REJECTED' WHERE id IN (?,?) AND status='DRAFT'",
-                    (str(package.spec_document_id), str(package.agents_document_id)),
-                )
-                self.connection.execute(
-                    "UPDATE design_packages SET status='REJECTED',rejected_at=?,rejection_feedback=? WHERE id=?",
+                    """UPDATE design_packages SET status='REJECTED',rejected_at=?,rejection_feedback=?
+                       WHERE id=? AND status='PENDING_APPROVAL'""",
                     (now, feedback, str(package_id)),
                 )
                 self.connection.execute(
-                    "INSERT INTO design_change_feedback (id,package_id,project_id,feedback,provided_by,created_at) VALUES (?,?,?,?,?,?)",
+                    """INSERT INTO design_change_feedback
+                       (id,package_id,project_id,feedback,provided_by,created_at)
+                       VALUES (?,?,?,?,?,?)""",
                     (
                         str(uuid4()),
                         str(package_id),
@@ -254,59 +256,76 @@ class SQLiteDesignPackageRepository:
                         now,
                     ),
                 )
-                target = "DESIGNING"
-                self.connection.execute(
-                    "UPDATE projects SET state=?,updated_at=?,last_state_change_at=? WHERE id=? AND state='DESIGN_APPROVAL'",
-                    (target, now, now, str(project_id)),
-                )
-            hook("project")
-            self.connection.execute(
-                "UPDATE human_gates SET state='RESOLVED',responded_at=?,resolved_at=? WHERE id=? AND state='NOTIFIED'",
-                (now, now, str(gate_id)),
-            )
-            for previous, new, reason in (
-                ("NOTIFIED", "RESPONDED", "human response recorded"),
-                ("RESPONDED", "VALIDATED", "design decision validated"),
-                ("VALIDATED", "RESOLVED", "design decision applied"),
-            ):
-                self.connection.execute(
-                    """INSERT INTO state_transitions
-                    (id,entity_type,entity_id,project_id,gate_id,previous_state,new_state,reason,
-                     actor_type,actor_id,correlation_id,created_at)
-                    VALUES (?,'HUMAN_GATE',?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        str(uuid4()),
-                        str(gate_id),
-                        str(project_id),
-                        str(gate_id),
-                        previous,
-                        new,
-                        reason,
-                        "HUMAN",
-                        responder,
-                        correlation_id,
-                        now,
-                    ),
-                )
-            hook("gate")
-            self.connection.execute(
-                "INSERT INTO state_transitions (id,entity_type,entity_id,project_id,previous_state,new_state,reason,actor_type,actor_id,correlation_id,created_at) VALUES (?,'PROJECT',?,?,?,?,?,?,?,?,?)",
-                (
-                    str(uuid4()),
-                    str(project_id),
-                    str(project_id),
-                    "DESIGN_APPROVAL",
+                target = ProjectState.DESIGNING
+            hook("package")
+            projects.apply_transition(
+                ProjectTransitionRequest(
+                    project_id,
+                    ProjectState.DESIGN_APPROVAL,
                     target,
                     "human design decision",
                     "HUMAN",
                     responder,
                     correlation_id,
-                    now,
-                ),
+                    occurred_at,
+                    message_id,
+                )
             )
-            self.connection.commit()
-        except BaseException:
-            if self.connection.in_transaction:
-                self.connection.rollback()
-            raise
+            hook("project")
+            gate = gates.apply_transition(
+                self._gate_transition(
+                    gate_id,
+                    project_id,
+                    GateState.RESPONDED,
+                    GateState.VALIDATED,
+                    "response schema validated",
+                    "SYSTEM",
+                    None,
+                    correlation_id,
+                    occurred_at,
+                    message_id,
+                )
+            )
+            gates.apply_transition(
+                self._gate_transition(
+                    gate_id,
+                    project_id,
+                    GateState.VALIDATED,
+                    GateState.RESOLVED,
+                    "validated response resolved gate",
+                    "SYSTEM",
+                    None,
+                    correlation_id,
+                    occurred_at,
+                    message_id,
+                )
+            )
+            hook("gate")
         return self.get(package_id)
+
+    @staticmethod
+    def _gate_transition(
+        gate_id: GateId,
+        project_id: ProjectId,
+        previous: GateState,
+        target: GateState,
+        reason: str,
+        actor_type: str,
+        actor_id: str | None,
+        correlation_id: str,
+        occurred_at: datetime,
+        trigger: str,
+    ) -> GateTransitionRequest:
+        return GateTransitionRequest(
+            gate_id,
+            project_id,
+            previous,
+            target,
+            reason,
+            actor_type,
+            actor_id,
+            correlation_id,
+            occurred_at,
+            None,
+            trigger,
+        )

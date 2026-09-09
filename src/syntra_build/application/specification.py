@@ -158,6 +158,53 @@ def approval_message(
     )
 
 
+def execute_specification_draft(
+    audit: SpecificationAuditStore,
+    provider: SpecificationProvider,
+    request: SpecificationDraftRequest,
+    *,
+    request_id: str,
+    reasoning_effort: str,
+    clock: Callable[[], datetime],
+) -> SpecificationDraft:
+    """Persist intent and the validated result or classified known failure."""
+    audit.begin_draft(
+        request_id=request_id,
+        request=request,
+        provider=provider.provider_name,
+        model=provider.model,
+        reasoning_effort=reasoning_effort,
+        created_at=clock(),
+    )
+    try:
+        draft = provider.draft_specification(request)
+        if (
+            draft.project_id != request.project_id
+            or draft.correlation_id != request.correlation_id
+            or draft.interface_version != request.interface_version
+            or draft.repository_visibility is not request.required_repository_visibility
+        ):
+            raise ArchitectError(
+                ArchitectFailureKind.MALFORMED_RESPONSE,
+                "Architect draft identity or visibility does not match request",
+            )
+        usage = provider.telemetry()
+        provider_id = usage.get("provider_response_id")
+        audit.succeed_draft(
+            request_id=request_id,
+            response=draft,
+            provider_response_id=(
+                provider_id if isinstance(provider_id, str) else None
+            ),
+            usage=usage,
+            completed_at=clock(),
+        )
+        return draft
+    except ArchitectError as error:
+        audit.fail(request_id=request_id, kind=error.kind, completed_at=clock())
+        raise
+
+
 class SpecificationDraftService:
     def __init__(
         self,
@@ -194,43 +241,14 @@ class SpecificationDraftService:
             context, correlation_id, self.packages.feedback(project_id)
         )
         request_id = self.ids()
-        self.audit.begin_draft(
+        draft = execute_specification_draft(
+            self.audit,
+            self.provider,
+            request,
             request_id=request_id,
-            request=request,
-            provider=self.provider.provider_name,
-            model=self.provider.model,
             reasoning_effort=self.reasoning_effort,
-            created_at=self.clock(),
+            clock=self.clock,
         )
-        try:
-            draft = self.provider.draft_specification(request)
-            if (
-                draft.project_id != request.project_id
-                or draft.correlation_id != request.correlation_id
-                or draft.interface_version != request.interface_version
-                or draft.repository_visibility
-                is not request.required_repository_visibility
-            ):
-                raise ArchitectError(
-                    ArchitectFailureKind.MALFORMED_RESPONSE,
-                    "Architect draft identity or visibility does not match request",
-                )
-            usage = self.provider.telemetry()
-            provider_id = usage.get("provider_response_id")
-            self.audit.succeed_draft(
-                request_id=request_id,
-                response=draft,
-                provider_response_id=provider_id
-                if isinstance(provider_id, str)
-                else None,
-                usage=usage,
-                completed_at=self.clock(),
-            )
-        except ArchitectError as error:
-            self.audit.fail(
-                request_id=request_id, kind=error.kind, completed_at=self.clock()
-            )
-            raise
         created = self.clock()
         package_id, gate_id = DesignPackageId.generate(), GateId.generate()
         with transaction(self.packages.connection):

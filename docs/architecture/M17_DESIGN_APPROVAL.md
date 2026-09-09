@@ -51,3 +51,16 @@ python -m syntra_build.architect_smoke <project-uuid> \
 
 This command audits and prints the validated draft but deliberately does not create or approve
 a package. Ordinary smoke tests and CI remain offline.
+
+For the real M17 host acceptance flow, the operator explicitly creates (or recovers) the
+pending package and notifies its Telegram gate after the package transaction commits:
+
+```text
+python -m syntra_build.architect_smoke <project-uuid> \
+  --correlation-id <unique-id> --create-package --telegram-chat-id <chat-id>
+```
+
+If notification fails, rerunning that exact mode finds the existing pending package and retries
+only its `PENDING` gate notification. It does not call the Architect or create document
+revisions again. Subsequent `gate <id> REQUEST_CHANGES <feedback>` and `gate <id> APPROVE`
+messages are handled by the normal `telegram-once` router and durable Telegram cursor.

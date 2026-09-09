@@ -285,6 +285,8 @@ class HumanGateCommandHandler:
             gate_id = GateId.from_string(command.gate_reference)
             gate = self._gates.get(gate_id)
             if gate.gate_type is GateType.DESIGN_APPROVAL and self._design_decisions:
+                if gate.state is not GateState.NOTIFIED:
+                    raise ClosedGateError("gate is not answerable")
                 return self._design_decisions.respond(command, gate)
             resolved = self._gates.respond(
                 gate_id,

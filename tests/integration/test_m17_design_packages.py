@@ -4,13 +4,22 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
 from syntra_build.adapters.architect import SPECIFICATION_DRAFT_SCHEMA
+from syntra_build.application.architect import ArchitectError, ArchitectFailureKind
 from syntra_build.application.commands import CommandParser, InboundMessage
-from syntra_build.application.specification import approval_message
+from syntra_build.application.commands.router import CommandRouter
+from syntra_build.application.design import ProjectDesignContextService
+from syntra_build.application.gates import HumanGateService
+from syntra_build.application.specification import (
+    SpecificationDraftService,
+    approval_message,
+    build_specification_request,
+    execute_specification_draft,
+)
 from syntra_build.domain import (
     DesignPackageId,
     DesignPackageStatus,
@@ -24,16 +33,23 @@ from syntra_build.domain import (
     ProjectState,
     RepositoryVisibility,
     SpecificationDraft,
+    SpecificationDraftRequest,
 )
 from syntra_build.domain.errors import DomainValidationError
+from syntra_build.infrastructure.config import SecretInputs, SecretValue, load_config
 from syntra_build.infrastructure.persistence import (
+    SQLiteArchitectInteractionRepository,
+    SQLiteDesignMessageRepository,
     SQLiteDesignPackageRepository,
+    SQLiteHumanGateRepository,
+    SQLiteProjectDecisionRepository,
     SQLiteProjectDocumentRepository,
     SQLiteProjectRepository,
     apply_migrations,
     document_content_hash,
     open_database,
 )
+from syntra_build.smoke import build_host_router
 
 NOW = datetime(2026, 9, 9, tzinfo=UTC)
 PID = ProjectId(UUID(int=1))
@@ -72,6 +88,33 @@ def test_strict_draft_contract_and_nested_schema() -> None:
     items = milestones["items"]
     assert isinstance(items, dict)
     assert items["additionalProperties"] is False
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "interface_version",
+        "correlation_id",
+        "project_id",
+        "design_summary",
+        "repository_visibility",
+        "spec_markdown",
+        "agents_markdown",
+    ],
+)
+def test_draft_rejects_non_string_scalar_fields(field: str) -> None:
+    value = draft_data()
+    value[field] = 7
+    with pytest.raises(DomainValidationError):
+        SpecificationDraft.from_dict(value)
+
+
+@pytest.mark.parametrize("field", ["assumptions", "non_blocking_issues"])
+def test_draft_rejects_non_string_collection_members(field: str) -> None:
+    value = draft_data()
+    value[field] = [7]
+    with pytest.raises(DomainValidationError):
+        SpecificationDraft.from_dict(value)
 
 
 @pytest.mark.parametrize("field", ["spec_markdown", "agents_markdown"])
@@ -266,3 +309,236 @@ def test_approval_message_contains_human_context(tmp_path: Path) -> None:
         "REQUEST_CHANGES",
     ):
         assert expected in text
+
+
+class FakeDraftProvider:
+    provider_name = "openai"
+    model = "gpt-5.6-sol"
+
+    def __init__(self) -> None:
+        self.requests: list[SpecificationDraftRequest] = []
+
+    def draft_specification(
+        self, request: SpecificationDraftRequest
+    ) -> SpecificationDraft:
+        self.requests.append(request)
+        generation = len(self.requests)
+        return SpecificationDraft(
+            request.interface_version,
+            request.correlation_id,
+            request.project_id,
+            f"Summary {generation}",
+            request.required_repository_visibility,
+            f"# SPEC {generation}",
+            f"# AGENTS {generation}",
+            (),
+            (),
+            (PlannedMilestone("M1", "Build"),),
+        )
+
+    def telemetry(self) -> dict[str, int | str | None]:
+        return {"provider_response_id": f"response-{len(self.requests)}"}
+
+
+class FailingDraftProvider(FakeDraftProvider):
+    def draft_specification(
+        self, request: SpecificationDraftRequest
+    ) -> SpecificationDraft:
+        raise ArchitectError(ArchitectFailureKind.TIMEOUT, "timed out")
+
+
+class CapturingNotifier:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.messages: list[str] = []
+        self.fail = fail
+
+    def send(self, text: str) -> str:
+        self.messages.append(text)
+        if self.fail:
+            raise RuntimeError("notification failed")
+        return "telegram-message"
+
+
+def _draft_service(
+    db: sqlite3.Connection, provider: FakeDraftProvider
+) -> SpecificationDraftService:
+    projects = SQLiteProjectRepository(db, lambda: str(uuid4()))
+    documents = SQLiteProjectDocumentRepository(db)
+    context = ProjectDesignContextService(
+        projects,
+        SQLiteDesignMessageRepository(db),
+        SQLiteProjectDecisionRepository(db),
+        documents,
+    )
+    return SpecificationDraftService(
+        context,
+        SQLiteArchitectInteractionRepository(db),
+        provider,
+        SQLiteDesignPackageRepository(db),
+        documents,
+        SQLiteHumanGateRepository(db, lambda: str(UUID(int=901))),
+        projects,
+        clock=lambda: NOW,
+    )
+
+
+def _notify(
+    db: sqlite3.Connection, package_id: DesignPackageId, notifier: CapturingNotifier
+) -> None:
+    packages = SQLiteDesignPackageRepository(db)
+    package = packages.get(package_id)
+    gates = SQLiteHumanGateRepository(db, lambda: str(uuid4()))
+    HumanGateService(
+        gates,
+        response_id_factory=lambda: str(UUID(int=903)),
+        authorised_responder_ids=frozenset({"123"}),
+    ).notify(package.approval_gate_id, notifier, occurred_at=NOW)
+
+
+def _telegram_router(db: sqlite3.Connection) -> CommandRouter:
+    config = load_config(
+        {"telegram": {"enabled": True, "authorised_user_ids": [123]}},
+        environ={},
+        secrets=SecretInputs(telegram_bot_token=SecretValue("synthetic-token")),
+    )
+    return build_host_router(config, db)
+
+
+def test_real_generation_notification_router_change_and_approval_path(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "end-to-end.db"
+    db = open_database(path)
+    apply_migrations(db)
+    SQLiteProjectRepository(db, lambda: "unused").add(
+        Project(PID, "Demo", ProjectState.DESIGNING, NOW, NOW)
+    )
+    provider = FakeDraftProvider()
+
+    first = _draft_service(db, provider).generate(PID, "draft-1")
+    documents = SQLiteProjectDocumentRepository(db)
+    spec = documents.get(PID, first.spec_document_id)
+    agents = documents.get(PID, first.agents_document_id)
+    assert (spec.revision, agents.revision) == (1, 1)
+    assert (spec.content, agents.content) == ("# SPEC 1", "# AGENTS 1")
+    assert (
+        SQLiteHumanGateRepository(db, lambda: "unused")
+        .get(first.approval_gate_id)
+        .state.value
+        == "PENDING"
+    )
+    assert (
+        SQLiteProjectRepository(db, lambda: "unused").get(PID).state
+        is ProjectState.DESIGN_APPROVAL
+    )
+
+    failed = CapturingNotifier(fail=True)
+    with pytest.raises(RuntimeError, match="notification failed"):
+        _notify(db, first.id, failed)
+    assert len(SQLiteProjectDocumentRepository(db).for_project(PID)) == 2
+    assert SQLiteDesignPackageRepository(db).pending_for_project(PID) == first
+
+    notifier = CapturingNotifier()
+    _notify(db, first.id, notifier)
+    notice = notifier.messages[0]
+    for expected in (
+        "Demo",
+        "PUBLIC",
+        "SPEC.md: r1",
+        "AGENTS.md: r1",
+        "Summary 1",
+        "Planned milestones: 1",
+        str(first.approval_gate_id),
+    ):
+        assert expected in notice
+
+    db.close()
+    db = open_database(path)
+    documents = SQLiteProjectDocumentRepository(db)
+    response = _telegram_router(db).route(
+        InboundMessage(
+            "telegram",
+            "update-1",
+            "message-1",
+            "123",
+            NOW,
+            f"gate {first.approval_gate_id} REQUEST_CHANGES add offline mode",
+        )
+    )
+    assert "REJECTED" in response.text
+    assert SQLiteDesignPackageRepository(db).feedback(PID) == ("add offline mode",)
+    assert all(
+        item.status is DocumentStatus.REJECTED
+        for item in SQLiteProjectDocumentRepository(db).for_project(PID)
+    )
+    assert provider.requests[0].prior_change_feedback == ()
+
+    second = _draft_service(db, provider).generate(PID, "draft-2")
+    assert provider.requests[1].prior_change_feedback == ("add offline mode",)
+    assert documents.get(PID, second.spec_document_id).revision == 2
+    assert documents.get(PID, second.agents_document_id).revision == 2
+    _notify(db, second.id, CapturingNotifier())
+    approved = _telegram_router(db).route(
+        InboundMessage(
+            "telegram",
+            "update-2",
+            "message-2",
+            "123",
+            NOW,
+            f"gate {second.approval_gate_id} APPROVE",
+        )
+    )
+    assert "APPROVED" in approved.text
+    assert (
+        SQLiteProjectRepository(db, lambda: "unused").get(PID).state
+        is ProjectState.PROVISIONING
+    )
+    actors = [
+        row[0]
+        for row in db.execute(
+            """SELECT actor_type FROM state_transitions WHERE gate_id=?
+           ORDER BY rowid""",
+            (str(second.approval_gate_id),),
+        )
+    ]
+    assert actors == ["SYSTEM", "HUMAN", "SYSTEM", "SYSTEM"]
+    duplicate = _telegram_router(db).route(
+        InboundMessage(
+            "telegram",
+            "update-3",
+            "message-2",
+            "123",
+            NOW,
+            f"gate {second.approval_gate_id} APPROVE",
+        )
+    )
+    assert "already closed" in duplicate.text
+
+
+def test_shared_host_draft_execution_audits_known_failure(tmp_path: Path) -> None:
+    db = open_database(tmp_path / "failure.db")
+    apply_migrations(db)
+    projects = SQLiteProjectRepository(db, lambda: "unused")
+    projects.add(Project(PID, "Demo", ProjectState.DESIGNING, NOW, NOW))
+    context = ProjectDesignContextService(
+        projects,
+        SQLiteDesignMessageRepository(db),
+        SQLiteProjectDecisionRepository(db),
+        SQLiteProjectDocumentRepository(db),
+    ).reconstruct(PID)
+    request = build_specification_request(context, "failed-draft")
+    with pytest.raises(ArchitectError) as caught:
+        execute_specification_draft(
+            SQLiteArchitectInteractionRepository(db),
+            FailingDraftProvider(),
+            request,
+            request_id="failed-request",
+            reasoning_effort="high",
+            clock=lambda: NOW,
+        )
+    assert caught.value.kind is ArchitectFailureKind.TIMEOUT
+    row = db.execute(
+        "SELECT status,failure_classification FROM architect_requests WHERE id=?",
+        ("failed-request",),
+    ).fetchone()
+    assert row[:] == ("FAILED", "TIMEOUT")

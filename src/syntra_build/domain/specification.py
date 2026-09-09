@@ -7,6 +7,7 @@ from datetime import datetime
 from enum import StrEnum
 
 from syntra_build.domain._validation import (
+    require_enum,
     require_identifier,
     require_text,
     require_utc,
@@ -147,18 +148,35 @@ class SpecificationDraft:
         }
         if not isinstance(value, dict) or set(value) != fields:
             raise DomainValidationError("malformed specification draft")
+        string_fields = fields - {
+            "assumptions",
+            "non_blocking_issues",
+            "planned_milestones",
+        }
+        if any(not isinstance(value[name], str) for name in string_fields):
+            raise DomainValidationError(
+                "specification draft scalar fields must be strings"
+            )
         for name in ("assumptions", "non_blocking_issues", "planned_milestones"):
             if not isinstance(value[name], list):
                 raise DomainValidationError("malformed specification draft collections")
+        if any(
+            not isinstance(item, str)
+            for name in ("assumptions", "non_blocking_issues")
+            for item in value[name]
+        ):
+            raise DomainValidationError(
+                "specification draft text collections must contain strings"
+            )
         try:
             return cls(
-                str(value["interface_version"]),
-                str(value["correlation_id"]),
-                ProjectId.from_string(str(value["project_id"])),
-                str(value["design_summary"]),
-                RepositoryVisibility(str(value["repository_visibility"])),
-                str(value["spec_markdown"]),
-                str(value["agents_markdown"]),
+                value["interface_version"],
+                value["correlation_id"],
+                ProjectId.from_string(value["project_id"]),
+                value["design_summary"],
+                RepositoryVisibility(value["repository_visibility"]),
+                value["spec_markdown"],
+                value["agents_markdown"],
                 tuple(value["assumptions"]),
                 tuple(value["non_blocking_issues"]),
                 tuple(
@@ -216,6 +234,42 @@ class DesignPackage:
             self.agents_document_id, ProjectDocumentId, "agents_document_id"
         )
         require_identifier(self.approval_gate_id, GateId, "approval_gate_id")
+        require_enum(
+            self.repository_visibility,
+            RepositoryVisibility,
+            "repository_visibility",
+        )
+        require_enum(self.status, DesignPackageStatus, "status")
         require_text(self.architect_request_id, "architect_request_id")
         require_text(self.design_summary, "design_summary")
         require_utc(self.created_at, "created_at")
+        if any(
+            not isinstance(item, PlannedMilestone) for item in self.planned_milestones
+        ):
+            raise DomainValidationError(
+                "planned_milestones must contain typed milestones"
+            )
+        for values, name in (
+            (self.assumptions, "assumptions"),
+            (self.non_blocking_issues, "non_blocking_issues"),
+        ):
+            if any(not isinstance(item, str) or not item.strip() for item in values):
+                raise DomainValidationError(f"{name} must contain non-empty strings")
+        if self.approved_at is not None:
+            require_utc(self.approved_at, "approved_at")
+        if self.rejected_at is not None:
+            require_utc(self.rejected_at, "rejected_at")
+        if self.status is DesignPackageStatus.APPROVED:
+            if self.approved_at is None:
+                raise DomainValidationError("approved package requires approved_at")
+            require_text(self.approved_by, "approved_by")
+        elif self.approved_at is not None or self.approved_by is not None:
+            raise DomainValidationError(
+                "unapproved package cannot have approval metadata"
+            )
+        if (self.status is DesignPackageStatus.REJECTED) != (
+            self.rejected_at is not None
+        ):
+            raise DomainValidationError(
+                "rejected package requires only rejection metadata"
+            )
