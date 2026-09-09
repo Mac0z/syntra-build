@@ -40,6 +40,8 @@ ENVIRONMENT_KEYS = frozenset(
         "SYNTRA_ARCHITECT_ENABLED",
         "SYNTRA_ARCHITECT_PROVIDER",
         "SYNTRA_ARCHITECT_MODEL",
+        "SYNTRA_ARCHITECT_REASONING_EFFORT",
+        "SYNTRA_ARCHITECT_TIMEOUT_SECONDS",
         "SYNTRA_ARCHITECT_API_KEY",
         "SYNTRA_CODEX_CREDENTIAL",
         "SYNTRA_GITHUB_ENABLED",
@@ -261,7 +263,22 @@ def load_config(
             or None,
             api_timeout_seconds=_float(
                 "architect.api_timeout_seconds",
-                architect.get("api_timeout_seconds", 120.0),
+                _pick(
+                    architect,
+                    "timeout_seconds",
+                    env,
+                    "SYNTRA_ARCHITECT_TIMEOUT_SECONDS",
+                    architect.get("api_timeout_seconds", 120.0),
+                ),
+            ),
+            reasoning_effort=str(
+                _pick(
+                    architect,
+                    "reasoning_effort",
+                    env,
+                    "SYNTRA_ARCHITECT_REASONING_EFFORT",
+                    "high",
+                )
             ),
         ),
         codex=CodexConfig(

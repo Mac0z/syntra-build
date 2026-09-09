@@ -1,6 +1,11 @@
 """Provider-independent core domain records for Syntra Build."""
 
 from syntra_build.domain.design import (
+    ARCHITECT_INTERFACE_VERSION,
+    ArchitectDesignMode,
+    ArchitectDesignRequest,
+    ArchitectDesignResponse,
+    ArchitectProposedDecision,
     DecisionSource,
     DesignMessage,
     DocumentStatus,
@@ -84,6 +89,11 @@ from syntra_build.domain.project_state_machine import (
 from syntra_build.domain.projects import Project, ProjectCreationContext, ProjectState
 
 __all__ = [
+    "ARCHITECT_INTERFACE_VERSION",
+    "ArchitectDesignMode",
+    "ArchitectDesignRequest",
+    "ArchitectDesignResponse",
+    "ArchitectProposedDecision",
     "DecisionSource",
     "DesignMessage",
     "DocumentStatus",

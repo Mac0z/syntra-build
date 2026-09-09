@@ -155,3 +155,174 @@ class ProjectDesignContext:
     messages: tuple[DesignMessage, ...]
     decisions: tuple[ProjectDecision, ...]
     documents: tuple[ProjectDocument, ...]
+
+
+ARCHITECT_INTERFACE_VERSION = "1.0"
+
+
+class ArchitectDesignMode(StrEnum):
+    ASK_USER = "ASK_USER"
+    PROPOSE_DESIGN = "PROPOSE_DESIGN"
+    READY_TO_DRAFT = "READY_TO_DRAFT"
+    BLOCKED = "BLOCKED"
+
+
+@dataclass(frozen=True, slots=True)
+class ArchitectDesignRequest:
+    """Provider-neutral, reconstructable input to one design operation."""
+
+    interface_version: str
+    correlation_id: str
+    project_id: ProjectId
+    project_name: str
+    initial_request: str
+    conversation_context: tuple[dict[str, object], ...]
+    known_decisions: tuple[dict[str, object], ...]
+    open_questions: tuple[str, ...]
+    document_context: tuple[dict[str, object], ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.interface_version != ARCHITECT_INTERFACE_VERSION:
+            raise DomainValidationError("unsupported Architect interface version")
+        require_identifier(self.project_id, ProjectId, "project_id")
+        for value, name in (
+            (self.correlation_id, "correlation_id"),
+            (self.project_name, "project_name"),
+            (self.initial_request, "initial_request"),
+        ):
+            require_text(value, name)
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in self.open_questions
+        ):
+            raise DomainValidationError("open_questions must contain non-empty strings")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "interface_version": self.interface_version,
+            "correlation_id": self.correlation_id,
+            "project_id": str(self.project_id),
+            "project_name": self.project_name,
+            "initial_request": self.initial_request,
+            "conversation_context": list(self.conversation_context),
+            "known_decisions": list(self.known_decisions),
+            "open_questions": list(self.open_questions),
+            "document_context": list(self.document_context),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ArchitectProposedDecision:
+    """An untrusted Architect proposal, never an authoritative project decision."""
+
+    decision_type: str
+    title: str
+    proposal: str
+    rationale: str
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.decision_type, "decision_type"),
+            (self.title, "title"),
+            (self.proposal, "proposal"),
+            (self.rationale, "rationale"),
+        ):
+            require_text(value, name)
+
+    @classmethod
+    def from_dict(cls, value: object) -> ArchitectProposedDecision:
+        fields = {"decision_type", "title", "proposal", "rationale"}
+        if not isinstance(value, dict) or set(value) != fields:
+            raise DomainValidationError("malformed Architect proposed decision")
+        if any(not isinstance(value[field], str) for field in fields):
+            raise DomainValidationError(
+                "Architect proposed decision fields must be strings"
+            )
+        return cls(
+            value["decision_type"],
+            value["title"],
+            value["proposal"],
+            value["rationale"],
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "decision_type": self.decision_type,
+            "title": self.title,
+            "proposal": self.proposal,
+            "rationale": self.rationale,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ArchitectDesignResponse:
+    """Validated advisory output; proposals are never accepted decisions."""
+
+    interface_version: str
+    correlation_id: str
+    project_id: ProjectId
+    mode: ArchitectDesignMode
+    message: str
+    proposed_decisions: tuple[ArchitectProposedDecision, ...]
+    open_questions: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.interface_version != ARCHITECT_INTERFACE_VERSION:
+            raise DomainValidationError("unsupported Architect interface version")
+        require_identifier(self.project_id, ProjectId, "project_id")
+        require_enum(self.mode, ArchitectDesignMode, "mode")
+        require_text(self.correlation_id, "correlation_id")
+        require_text(self.message, "message")
+        if any(
+            not isinstance(item, ArchitectProposedDecision)
+            for item in self.proposed_decisions
+        ):
+            raise DomainValidationError(
+                "proposed_decisions must contain ArchitectProposedDecision objects"
+            )
+        if any(
+            not isinstance(value, str) or not value.strip()
+            for value in self.open_questions
+        ):
+            raise DomainValidationError("open_questions must contain non-empty strings")
+
+    @classmethod
+    def from_dict(cls, value: object) -> ArchitectDesignResponse:
+        if not isinstance(value, dict) or set(value) != {
+            "interface_version",
+            "correlation_id",
+            "project_id",
+            "mode",
+            "message",
+            "proposed_decisions",
+            "open_questions",
+        }:
+            raise DomainValidationError("malformed Architect design response")
+        proposals, questions = value["proposed_decisions"], value["open_questions"]
+        if not isinstance(proposals, list) or not isinstance(questions, list):
+            raise DomainValidationError("malformed Architect response collections")
+        try:
+            return cls(
+                str(value["interface_version"]),
+                str(value["correlation_id"]),
+                ProjectId.from_string(str(value["project_id"])),
+                ArchitectDesignMode(str(value["mode"])),
+                str(value["message"]),
+                tuple(ArchitectProposedDecision.from_dict(item) for item in proposals),
+                tuple(questions),
+            )
+        except (TypeError, ValueError) as error:
+            raise DomainValidationError(
+                "malformed Architect design response"
+            ) from error
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "interface_version": self.interface_version,
+            "correlation_id": self.correlation_id,
+            "project_id": str(self.project_id),
+            "mode": self.mode.value,
+            "message": self.message,
+            "proposed_decisions": [item.to_dict() for item in self.proposed_decisions],
+            "open_questions": list(self.open_questions),
+        }
