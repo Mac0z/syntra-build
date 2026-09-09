@@ -25,6 +25,16 @@ from syntra_build.infrastructure.config.models import (
     TelegramConfig,
 )
 
+
+def read_protected_secret_file(path: Path, label: str) -> SecretValue | None:
+    """Read an optional deployed secret after enforcing private file permissions."""
+    if not path.exists():
+        return None
+    if path.stat().st_mode & 0o077:
+        raise RuntimeError(f"{label} file permissions are too broad")
+    return SecretValue(path.read_text(encoding="utf-8").strip())
+
+
 ENVIRONMENT_KEYS = frozenset(
     {
         "SYNTRA_APPLICATION_ROOT",
