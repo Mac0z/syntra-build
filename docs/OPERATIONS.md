@@ -1869,6 +1869,15 @@ Potential future enhancements include:
 
 # 96. Initial Production Readiness Checklist
 
+## M14 Telegram host acceptance
+
+From the authorised Telegram account, send
+`/create M14 Acceptance | Disposable project for M14 host acceptance`. Then
+send `/status M14 Acceptance` and `/projects`; both must show the same project
+in `DESIGNING`. Finally inspect the Syntra-owned GitHub organisation and confirm
+that no `m14-acceptance` repository was created. Keep the durable disposable
+record because no supported project-deletion workflow exists yet.
+
 Before Syntra Build is considered production-capable:
 
 - systemd service installed;

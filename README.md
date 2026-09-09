@@ -112,6 +112,11 @@ events. The dispatcher composes trusted SQLite state-machine effects and event
 completion in one unit of work. These forward-only migrations preserve prior
 state and history; rollback requires restoring a pre-migration backup.
 
+Schema version 8 adds a globally unique canonical name to projects and a
+normalized creation-context table for owner, initial request, conversation,
+and initiating Telegram identities. Canonical names are not reusable after a
+project reaches a terminal state. Rollback requires a version-7 backup.
+
 Project lifecycle changes are accepted only through the explicit domain
 transition policy and the SQLite project repository. The repository uses an
 expected-current-state check and commits the current state and its history row
@@ -133,10 +138,16 @@ stores offsets nor owns command routing or durable duplicate processing.
 ## Commands
 
 The provider-neutral application router supports `ping`, `health`, `projects`,
-`status <project>`, `pause <project>`, `resume <project>`, and
+`create <project name> | <initial request>`, `status <project>`, `pause <project>`, `resume <project>`, and
 `cancel <project>`. An optional leading slash is accepted. Project reads and
 state-change requests use injected application service boundaries; routing does
 not itself apply project lifecycle transitions.
+
+Project creation canonicalises names to lowercase ASCII repository identifiers:
+runs of spaces, underscores, or punctuation become one hyphen and edge hyphens
+are removed. Canonical names remain globally unique. `syntra`, `syntra-build`,
+`system`, and `internal` are reserved. GitHub occupancy is checked through a
+read-only interface that fails closed; M14 never provisions a repository.
 
 ## Project documentation
 

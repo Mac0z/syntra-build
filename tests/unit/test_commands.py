@@ -99,6 +99,7 @@ def test_mutability_classification_is_explicit_and_complete() -> None:
         CommandType.WAITING,
     }
     assert STATE_CHANGING_COMMANDS == {
+        CommandType.CREATE_PROJECT,
         CommandType.PAUSE_PROJECT,
         CommandType.RESUME_PROJECT,
         CommandType.CANCEL_PROJECT,

@@ -8,6 +8,7 @@ from enum import StrEnum
 
 
 class CommandType(StrEnum):
+    CREATE_PROJECT = "CREATE_PROJECT"
     PING = "PING"
     HEALTH = "HEALTH"
     LIST_PROJECTS = "LIST_PROJECTS"
@@ -30,6 +31,7 @@ READ_ONLY_COMMANDS = frozenset(
 )
 STATE_CHANGING_COMMANDS = frozenset(
     {
+        CommandType.CREATE_PROJECT,
         CommandType.PAUSE_PROJECT,
         CommandType.RESUME_PROJECT,
         CommandType.CANCEL_PROJECT,
@@ -82,6 +84,10 @@ class Command:
     project_reference: str | None = None
     gate_reference: str | None = None
     gate_response: str | None = None
+    project_name: str | None = None
+    initial_request: str | None = None
+    chat_id: str | None = None
+    thread_id: str | None = None
 
     @property
     def is_state_changing(self) -> bool:

@@ -41,10 +41,13 @@ class Project:
     resume_state: ProjectState | None = None
     activity: str | None = None
     last_state_change_at: datetime | None = None
+    canonical_name: str | None = None
 
     def __post_init__(self) -> None:
         require_identifier(self.id, ProjectId, "id")
         require_text(self.name, "name")
+        if self.canonical_name is not None:
+            require_text(self.canonical_name, "canonical_name")
         require_enum(self.state, ProjectState, "state")
         require_utc(self.created_at, "created_at")
         require_utc(self.updated_at, "updated_at")

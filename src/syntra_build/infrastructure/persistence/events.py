@@ -193,6 +193,19 @@ class SQLiteWorkflowEventRepository:
         ).fetchone()
         return self.get(WorkflowEventId.from_string(row["id"])) if row else None
 
+    def mark_processed(self, event_id: WorkflowEventId, processed_at: datetime) -> None:
+        """Complete a new event inside its atomic effect transaction."""
+        if not self._connection.in_transaction:
+            raise PersistenceError("event completion requires an active transaction")
+        cursor = self._connection.execute(
+            """UPDATE workflow_events SET processing_status='PROCESSED',
+               processing_attempt_count=1,processed_at=?
+               WHERE id=? AND processing_status='PENDING'""",
+            (_timestamp(processed_at), str(event_id)),
+        )
+        if cursor.rowcount != 1:
+            raise PersistenceError("workflow event could not be completed")
+
     def list_pending(self) -> tuple[PersistedWorkflowEvent, ...]:
         return self._list("processing_status='PENDING'")
 
