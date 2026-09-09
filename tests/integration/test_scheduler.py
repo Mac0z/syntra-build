@@ -504,3 +504,49 @@ def test_blocking_worker_does_not_block_control_plane_database_read(
     harvest(scheduler, executor)
     scheduler.close()
     connection.close()
+
+
+def test_equal_priority_codex_capacity_is_shared_between_projects(
+    tmp_path: Path,
+) -> None:
+    db, projects, jobs, project_a = database(tmp_path / "fair.db")
+    project_b = ProjectId.generate()
+    projects.add(Project(project_b, "project-b", ProjectState.BUILDING, NOW, NOW))
+    for _ in range(4):
+        add_job(jobs, project_a)
+    add_job(jobs, project_b)
+    release = Event()
+    executor = RecordingExecutor(release=release)
+    scheduler = Scheduler(
+        jobs,
+        capacities(codex_concurrency=2),
+        {WorkerClass.CODEX: executor},
+        clock=lambda: NOW,
+    )
+    result = scheduler.run_once()
+    assert result.dispatched == 2
+    release.set()
+    scheduler.close()
+    assert {call.project_id for call in executor.calls} == {project_a, project_b}
+    db.close()
+
+
+def test_priority_precedes_project_round_robin(tmp_path: Path) -> None:
+    db, projects, jobs, project_a = database(tmp_path / "priority-fair.db")
+    project_b = ProjectId.generate()
+    projects.add(Project(project_b, "project-b", ProjectState.BUILDING, NOW, NOW))
+    add_job(jobs, project_a, priority=0)
+    add_job(jobs, project_b, priority=100)
+    release = Event()
+    executor = RecordingExecutor(release=release)
+    scheduler = Scheduler(
+        jobs,
+        capacities(codex_concurrency=1),
+        {WorkerClass.CODEX: executor},
+        clock=lambda: NOW,
+    )
+    scheduler.run_once()
+    release.set()
+    scheduler.close()
+    assert executor.calls[0].project_id == project_b
+    db.close()

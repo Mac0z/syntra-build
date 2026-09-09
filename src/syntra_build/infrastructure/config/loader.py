@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from syntra_build.infrastructure.config.models import (
@@ -90,6 +90,12 @@ def _group(values: Mapping[str, object], name: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ConfigurationError(f"{name} configuration must be a mapping")
     return value
+
+
+def _float_sequence(name: str, value: object) -> tuple[float, ...]:
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        raise ConfigurationError(f"{name} must be a sequence")
+    return tuple(_float(name, item) for item in value)
 
 
 def _pick(
@@ -361,16 +367,26 @@ def load_config(
                     4,
                 ),
             ),
-            initial_backoff_seconds=_float(
-                "retries.initial_backoff_seconds",
-                retries.get("initial_backoff_seconds", 5.0),
+            backoff_schedule_seconds=_float_sequence(
+                "retries.backoff_schedule_seconds",
+                retries.get("backoff_schedule_seconds", (5.0, 30.0, 120.0, 600.0)),
             ),
-            backoff_multiplier=_float(
-                "retries.backoff_multiplier", retries.get("backoff_multiplier", 2.0)
+            jitter_factor=_float(
+                "retries.jitter_factor", retries.get("jitter_factor", 0.2)
             ),
-            maximum_backoff_seconds=_float(
-                "retries.maximum_backoff_seconds",
-                retries.get("maximum_backoff_seconds", 600.0),
+            codex_cycle_limit=_int(
+                "retries.codex_cycle_limit", retries.get("codex_cycle_limit", 5)
+            ),
+            ci_rework_limit=_int(
+                "retries.ci_rework_limit", retries.get("ci_rework_limit", 5)
+            ),
+            architect_rework_limit=_int(
+                "retries.architect_rework_limit",
+                retries.get("architect_rework_limit", 5),
+            ),
+            human_test_rework_limit=_int(
+                "retries.human_test_rework_limit",
+                retries.get("human_test_rework_limit", 5),
             ),
         ),
         logging=LoggingConfig(

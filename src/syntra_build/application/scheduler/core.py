@@ -9,14 +9,24 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from threading import Event, Lock
-from typing import Protocol
+from typing import Protocol, cast
 
+from syntra_build.application.retries import (
+    RetryJobRepository,
+    promote_due_retries,
+    retry_transition,
+)
 from syntra_build.application.scheduler.capacity import CapacityLease, WorkerCapacity
 from syntra_build.application.scheduler.errors import (
     ExecutorUnavailableError,
     SchedulerCapacityExhaustedError,
     SchedulerError,
     WorkerStartError,
+)
+from syntra_build.domain.failures import (
+    FailureClassification,
+    RetryBackoffPolicy,
+    classify_failure,
 )
 from syntra_build.domain.job_state_machine import JobTransitionRequest
 from syntra_build.domain.jobs import Job, JobState, StructuredMetadata, WorkerClass
@@ -69,6 +79,7 @@ class JobExecutionResult:
     external_request_id: str | None = None
     process_id: str | None = None
     logs_reference: str | None = None
+    failure_classification: FailureClassification | None = None
 
     @property
     def target_state(self) -> JobState:
@@ -136,6 +147,9 @@ class Scheduler:
         clock: Callable[[], datetime] | None = None,
         candidate_limit: int | None = None,
         thread_pool: ThreadPoolExecutor | None = None,
+        retry_policy: RetryBackoffPolicy | None = None,
+        retry_promotion_limit: int = 100,
+        exhaustion_handler: Callable[[Job, datetime], None] | None = None,
     ):
         self._jobs = jobs
         self._capacity = capacity
@@ -151,6 +165,10 @@ class Scheduler:
         self._draining = False
         self._lock = Lock()
         self._wake = Event()
+        self._retry_policy = retry_policy or RetryBackoffPolicy()
+        self._retry_promotion_limit = retry_promotion_limit
+        self._fairness_cursor: dict[tuple[WorkerClass, int], str] = {}
+        self._exhaustion_handler = exhaustion_handler
 
     @property
     def is_draining(self) -> bool:
@@ -171,6 +189,12 @@ class Scheduler:
         """Harvest completed work, then claim as many due jobs as capacity permits."""
         with self._lock:
             completed, failures, errors = self._harvest()
+            if hasattr(self._jobs, "due_retries"):
+                promote_due_retries(
+                    cast(RetryJobRepository, self._jobs),
+                    self._now(),
+                    limit=self._retry_promotion_limit,
+                )
             if self._draining:
                 return SchedulerCycleResult(
                     completed=completed,
@@ -185,7 +209,7 @@ class Scheduler:
                 "skipped_executor": 0,
                 "stale_claims": 0,
             }
-            for candidate in candidates:
+            for candidate in self._fair_order(candidates):
                 self._dispatch(candidate, counts, errors)
             return SchedulerCycleResult(
                 considered=len(candidates),
@@ -194,6 +218,45 @@ class Scheduler:
                 errors=tuple(errors),
                 **counts,
             )
+
+    def _fair_order(
+        self, candidates: Sequence[SchedulableJob]
+    ) -> tuple[SchedulableJob, ...]:
+        """Apply project round-robin within worker class and priority tier."""
+        ordered: list[SchedulableJob] = []
+        tiers = sorted(
+            {(item.job.worker_class, item.job.priority) for item in candidates},
+            key=lambda item: (-item[1], item[0].value),
+        )
+        for worker_class, priority in tiers:
+            tier = [
+                x
+                for x in candidates
+                if x.job.worker_class is worker_class and x.job.priority == priority
+            ]
+            by_project: dict[str, list[SchedulableJob]] = {}
+            project_order: list[str] = []
+            for item in tier:
+                key = str(item.job.project_id)
+                if key not in by_project:
+                    by_project[key] = []
+                    project_order.append(key)
+                by_project[key].append(item)
+            cursor = self._fairness_cursor.get((worker_class, priority))
+            if cursor in project_order:
+                pivot = project_order.index(cursor) + 1
+                project_order = project_order[pivot:] + project_order[:pivot]
+            while any(by_project.values()):
+                for project in project_order:
+                    if by_project[project]:
+                        ordered.append(by_project[project].pop(0))
+            if project_order:
+                # Dispatch updates this to the actual last recipient; this fallback
+                # only stabilises ordering when every candidate is skipped.
+                self._fairness_cursor.setdefault(
+                    (worker_class, priority), project_order[-1]
+                )
+        return tuple(ordered)
 
     def _dispatch(
         self,
@@ -262,6 +325,9 @@ class Scheduler:
             future.add_done_callback(lambda _future: self._wake.set())
             may_execute.set()
             counts["dispatched"] += 1
+            self._fairness_cursor[(job.worker_class, job.priority)] = str(
+                job.project_id
+            )
             self._log(job, "dispatched")
         except Exception:
             abort.set()
@@ -289,34 +355,51 @@ class Scheduler:
                 continue
             try:
                 outcome = active.future.result()
-                self._jobs.apply_transition(
-                    self._request(
+                if (
+                    outcome.disposition is JobExecutionDisposition.FAILED
+                    and outcome.failure_classification is not None
+                ):
+                    request, _ = retry_transition(
                         active.job,
-                        JobState.RUNNING,
-                        outcome.target_state,
-                        result=outcome.result,
-                        error_id=outcome.error_id,
-                        next_retry_at=outcome.next_retry_at,
-                        exit_code=outcome.exit_code,
-                        external_request_id=outcome.external_request_id,
-                        process_id=outcome.process_id,
-                        logs_reference=outcome.logs_reference,
+                        outcome.failure_classification,
+                        self._now(),
+                        self._retry_policy,
+                        error_id=outcome.error_id or "classified-execution-failure",
                     )
-                )
-                completed += 1
-                self._log(active.job, outcome.target_state.value.casefold())
-            except Exception:
-                failures += 1
-                errors.append(WorkerStartError("worker execution failed"))
-                try:
+                    persisted = self._jobs.apply_transition(request)
+                    if persisted.retry_exhausted and self._exhaustion_handler:
+                        self._exhaustion_handler(persisted, self._now())
+                else:
                     self._jobs.apply_transition(
                         self._request(
                             active.job,
                             JobState.RUNNING,
-                            JobState.FAILED,
-                            error_id="scheduler-worker-execution-failure",
+                            outcome.target_state,
+                            result=outcome.result,
+                            error_id=outcome.error_id,
+                            next_retry_at=outcome.next_retry_at,
+                            exit_code=outcome.exit_code,
+                            external_request_id=outcome.external_request_id,
+                            process_id=outcome.process_id,
+                            logs_reference=outcome.logs_reference,
+                            failure_classification=outcome.failure_classification,
                         )
                     )
+                completed += 1
+                self._log(active.job, outcome.target_state.value.casefold())
+            except Exception as error:
+                failures += 1
+                errors.append(WorkerStartError("worker execution failed"))
+                try:
+                    classification = classify_failure(error)
+                    request, _ = retry_transition(
+                        active.job,
+                        classification,
+                        self._now(),
+                        self._retry_policy,
+                        error_id="scheduler-worker-execution-failure",
+                    )
+                    self._jobs.apply_transition(request)
                 except PersistenceError:
                     _LOGGER.exception(
                         "Worker failure could not be persisted",

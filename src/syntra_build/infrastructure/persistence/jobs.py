@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from syntra_build.domain.errors import InvalidRetryMetadataError
+from syntra_build.domain.failures import FailureClassification
 from syntra_build.domain.identifiers import JobId, MilestoneId, ProjectId
 from syntra_build.domain.job_state_machine import (
     TERMINAL_JOB_STATES,
@@ -152,6 +153,11 @@ class SQLiteJobRepository:
             json.loads(row["payload_json"]),
             json.loads(row["result_json"]),
             row["last_error_id"],
+            FailureClassification(row["failure_classification"])
+            if row["failure_classification"]
+            else None,
+            bool(row["retry_exhausted"]),
+            row["exhaustion_reason"],
         )
 
     def eligible(
@@ -181,6 +187,20 @@ class SQLiteJobRepository:
             )
             for row in rows
         )
+
+    def due_retries(self, now: datetime, limit: int = 100) -> tuple[Job, ...]:
+        """Return durable retries due for guarded promotion."""
+        require_utc = now.tzinfo is not None and now.utcoffset() == UTC.utcoffset(now)
+        if not require_utc:
+            raise ValueError("retry due time must be UTC")
+        if type(limit) is not int or limit < 1:
+            raise ValueError("retry promotion limit must be positive")
+        rows = self._connection.execute(
+            """SELECT id FROM jobs WHERE state='RETRY_WAIT'
+               AND next_retry_at<=? ORDER BY next_retry_at,id LIMIT ?""",
+            (_ts(now), limit),
+        ).fetchall()
+        return tuple(self.get(JobId.from_string(row["id"])) for row in rows)
 
     def claim_for_dispatch(
         self,
@@ -372,7 +392,7 @@ class SQLiteJobRepository:
         self, row: sqlite3.Row, r: JobTransitionRequest, *, completed: bool
     ) -> None:
         cursor = self._connection.execute(
-            """UPDATE jobs SET state=?,completed_at=?,next_retry_at=?,result_json=?,last_error_id=?,updated_at=? WHERE id=? AND state=?""",
+            """UPDATE jobs SET state=?,completed_at=?,next_retry_at=?,result_json=?,last_error_id=?,updated_at=?,failure_classification=?,retry_exhausted=?,exhaustion_reason=? WHERE id=? AND state=?""",
             (
                 r.target_state.value,
                 _ts(r.occurred_at) if completed else row["completed_at"],
@@ -382,6 +402,11 @@ class SQLiteJobRepository:
                 _json(r.result) if r.result is not None else row["result_json"],
                 r.error_id or row["last_error_id"],
                 _ts(r.occurred_at),
+                r.failure_classification.value
+                if r.failure_classification
+                else row["failure_classification"],
+                int(r.retry_exhausted),
+                r.exhaustion_reason or row["exhaustion_reason"],
                 row["id"],
                 r.expected_state.value,
             ),

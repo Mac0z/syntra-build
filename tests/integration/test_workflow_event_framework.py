@@ -433,7 +433,7 @@ def test_v5_upgrade_preserves_prior_tables_and_adds_only_m11_schema(
             ),
         )
         apply_migrations(db)
-        assert current_schema_version(db) == 6
+        assert current_schema_version(db) == len(MIGRATIONS)
         assert (
             db.execute("SELECT name FROM projects WHERE id=?", (str(P1),)).fetchone()[0]
             == "existing"

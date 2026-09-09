@@ -539,6 +539,28 @@ and the user should receive a concise message explaining:
 
 Other projects continue normally.
 
+## 24.1 M13 policy implementation
+
+Infrastructure attempts use the durable job attempt number and the individual job's
+maximum. The configured default is four attempts. Delays use the configurable
+`5, 30, 120, 600` second schedule with bounded multiplicative jitter (20 percent by
+default); the jitter source is injected for deterministic testing. `next_retry_at` is
+persisted in UTC, and each scheduler cycle promotes due retries before ordinary queue
+selection. No worker capacity is reserved while a job is in `RETRY_WAIT`.
+
+Milestone Codex cycles and CI, Architect, and human-test rework cycles are separate
+explicit counters. Their configured limits mean permitted logical cycles; after that
+many have been recorded, the next requested cycle blocks the milestone rather than
+starting an additional cycle. The initial human-test limit is five, matching the other
+bounded rework defaults until a project-specific policy is introduced.
+
+Within each worker class, higher numeric priority tiers are always considered first.
+Within one priority tier, queued work is round-robin by project, taking one job from
+each project per pass. An in-process cursor starts the next cycle after the project
+that most recently received a dispatch. The cursor is deliberately not durable: a
+service restart resets only scheduling order and cannot duplicate or corrupt a durable
+job claim.
+
 ---
 
 # 25. CI Monitoring

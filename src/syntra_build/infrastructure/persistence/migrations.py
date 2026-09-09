@@ -371,6 +371,21 @@ MIGRATIONS: tuple[Migration, ...] = (
                 BEGIN SELECT RAISE(ABORT,'event gate and milestone are inconsistent'); END""",
         ),
     ),
+    Migration(
+        version=7,
+        name="007_retry_backoff_fairness",
+        statements=(
+            "ALTER TABLE jobs ADD COLUMN failure_classification TEXT CHECK(failure_classification IS NULL OR failure_classification IN ('TRANSIENT','PERMANENT','POLICY','CANCELLED','UNKNOWN'))",
+            "ALTER TABLE jobs ADD COLUMN retry_exhausted INTEGER NOT NULL DEFAULT 0 CHECK(retry_exhausted IN (0,1))",
+            "ALTER TABLE jobs ADD COLUMN exhaustion_reason TEXT",
+            "ALTER TABLE milestones ADD COLUMN codex_cycle_count INTEGER NOT NULL DEFAULT 0 CHECK(codex_cycle_count >= 0)",
+            "ALTER TABLE milestones ADD COLUMN ci_rework_count INTEGER NOT NULL DEFAULT 0 CHECK(ci_rework_count >= 0)",
+            "ALTER TABLE milestones ADD COLUMN architect_rework_count INTEGER NOT NULL DEFAULT 0 CHECK(architect_rework_count >= 0)",
+            "ALTER TABLE milestones ADD COLUMN human_test_rework_count INTEGER NOT NULL DEFAULT 0 CHECK(human_test_rework_count >= 0)",
+            "ALTER TABLE milestones ADD COLUMN exhaustion_reason TEXT",
+            "CREATE INDEX jobs_retry_due ON jobs(state,next_retry_at,id)",
+        ),
+    ),
 )
 
 
