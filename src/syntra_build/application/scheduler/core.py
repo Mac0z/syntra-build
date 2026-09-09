@@ -190,11 +190,13 @@ class Scheduler:
         with self._lock:
             completed, failures, errors = self._harvest()
             if hasattr(self._jobs, "due_retries"):
-                promote_due_retries(
+                promotion = promote_due_retries(
                     cast(RetryJobRepository, self._jobs),
                     self._now(),
                     limit=self._retry_promotion_limit,
                 )
+                for exhausted in promotion.exhausted:
+                    self._handle_exhaustion(exhausted)
             if self._draining:
                 return SchedulerCycleResult(
                     completed=completed,
@@ -355,20 +357,18 @@ class Scheduler:
                 continue
             try:
                 outcome = active.future.result()
-                if (
-                    outcome.disposition is JobExecutionDisposition.FAILED
-                    and outcome.failure_classification is not None
-                ):
-                    request, _ = retry_transition(
+                if outcome.disposition in {
+                    JobExecutionDisposition.FAILED,
+                    JobExecutionDisposition.RETRY_WAIT,
+                }:
+                    # RETRY_WAIT remains only as an M12 compatibility input. Its
+                    # supplied timestamp is deliberately ignored: central policy
+                    # owns both retryability and timing.
+                    self._persist_failure(
                         active.job,
-                        outcome.failure_classification,
-                        self._now(),
-                        self._retry_policy,
-                        error_id=outcome.error_id or "classified-execution-failure",
+                        outcome.failure_classification or FailureClassification.UNKNOWN,
+                        outcome.error_id or "classified-execution-failure",
                     )
-                    persisted = self._jobs.apply_transition(request)
-                    if persisted.retry_exhausted and self._exhaustion_handler:
-                        self._exhaustion_handler(persisted, self._now())
                 else:
                     self._jobs.apply_transition(
                         self._request(
@@ -391,15 +391,11 @@ class Scheduler:
                 failures += 1
                 errors.append(WorkerStartError("worker execution failed"))
                 try:
-                    classification = classify_failure(error)
-                    request, _ = retry_transition(
+                    self._persist_failure(
                         active.job,
-                        classification,
-                        self._now(),
-                        self._retry_policy,
-                        error_id="scheduler-worker-execution-failure",
+                        classify_failure(error),
+                        "scheduler-worker-execution-failure",
                     )
-                    self._jobs.apply_transition(request)
                 except PersistenceError:
                     _LOGGER.exception(
                         "Worker failure could not be persisted",
@@ -409,6 +405,23 @@ class Scheduler:
                 active.lease.release()
                 del self._active[key]
         return completed, failures, errors
+
+    def _persist_failure(
+        self,
+        job: Job,
+        classification: FailureClassification,
+        error_id: str,
+    ) -> Job:
+        request, _ = retry_transition(
+            job, classification, self._now(), self._retry_policy, error_id=error_id
+        )
+        persisted = self._jobs.apply_transition(request)
+        self._handle_exhaustion(persisted)
+        return persisted
+
+    def _handle_exhaustion(self, job: Job) -> None:
+        if job.retry_exhausted and self._exhaustion_handler is not None:
+            self._exhaustion_handler(job, self._now())
 
     def _request(
         self,

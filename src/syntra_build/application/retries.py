@@ -95,25 +95,28 @@ def retry_transition(
 
 def promote_due_retries(
     repository: RetryJobRepository, now: datetime, *, limit: int = 100
-) -> tuple[Job, ...]:
+) -> RetryPromotionResult:
     promoted: list[Job] = []
+    exhausted: list[Job] = []
     for job in repository.due_retries(now, limit):
         if job.attempt_number >= job.max_attempts:
-            repository.apply_transition(
-                JobTransitionRequest(
-                    job.id,
-                    job.project_id,
-                    JobState.RETRY_WAIT,
-                    JobState.FAILED,
-                    "retry budget exhausted before promotion",
-                    "SYSTEM",
-                    "retry-policy",
-                    job.correlation_id,
-                    now,
-                    error_id=job.last_error_id,
-                    failure_classification=job.failure_classification,
-                    retry_exhausted=True,
-                    exhaustion_reason="infrastructure retry limit exhausted",
+            exhausted.append(
+                repository.apply_transition(
+                    JobTransitionRequest(
+                        job.id,
+                        job.project_id,
+                        JobState.RETRY_WAIT,
+                        JobState.FAILED,
+                        "retry budget exhausted before promotion",
+                        "SYSTEM",
+                        "retry-policy",
+                        job.correlation_id,
+                        now,
+                        error_id=job.last_error_id,
+                        failure_classification=job.failure_classification,
+                        retry_exhausted=True,
+                        exhaustion_reason="infrastructure retry limit exhausted",
+                    )
                 )
             )
             continue
@@ -133,7 +136,15 @@ def promote_due_retries(
                 )
             )
         )
-    return tuple(promoted)
+    return RetryPromotionResult(tuple(promoted), tuple(exhausted))
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPromotionResult:
+    """Outcomes discovered while promoting persisted retry waits."""
+
+    promoted: tuple[Job, ...]
+    exhausted: tuple[Job, ...]
 
 
 def escalate_exhausted_job(

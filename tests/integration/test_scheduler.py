@@ -26,6 +26,11 @@ from syntra_build.domain import (
     ProjectTransitionRequest,
     WorkerClass,
 )
+from syntra_build.domain.failures import (
+    FailureClassification,
+    RetryBackoffPolicy,
+    TransientFailure,
+)
 from syntra_build.infrastructure.config import SchedulerConfig
 from syntra_build.infrastructure.persistence import (
     SQLiteJobRepository,
@@ -71,9 +76,12 @@ class RecordingExecutor:
 
 
 class RaisingExecutor:
+    def __init__(self, error: Exception | None = None):
+        self.error = error or RuntimeError("synthetic executor failure")
+
     def execute(self, job: Job) -> JobExecutionResult:
         del job
-        raise RuntimeError("synthetic executor failure")
+        raise self.error
 
 
 def database(
@@ -99,6 +107,7 @@ def add_job(
     created_at: datetime = NOW,
     scheduled_at: datetime | None = None,
     job_id: JobId | None = None,
+    max_attempts: int = 2,
 ) -> JobId:
     job_id = job_id or JobId.generate()
     jobs.add(
@@ -114,7 +123,7 @@ def add_job(
             scheduled_at=scheduled_at,
             worker_class=worker_class,
             correlation_id=f"correlation-{job_id}",
-            max_attempts=2,
+            max_attempts=max_attempts,
         )
     )
     return job_id
@@ -237,7 +246,6 @@ def test_codex_limit_and_independent_architect_capacity(tmp_path: Path) -> None:
         (JobExecutionDisposition.SUCCEEDED, JobState.SUCCEEDED),
         (JobExecutionDisposition.FAILED, JobState.FAILED),
         (JobExecutionDisposition.CANCELLED, JobState.CANCELLED),
-        (JobExecutionDisposition.RETRY_WAIT, JobState.RETRY_WAIT),
     ],
 )
 def test_non_local_and_terminal_outcomes_release_capacity(
@@ -247,13 +255,7 @@ def test_non_local_and_terminal_outcomes_release_capacity(
 ) -> None:
     connection, _, jobs, project_id = database(tmp_path / f"release-{expected}.db")
     job_id = add_job(jobs, project_id)
-    details: dict[str, object] = {}
-    if disposition is JobExecutionDisposition.RETRY_WAIT:
-        details = {
-            "next_retry_at": NOW + timedelta(minutes=1),
-            "error_id": "synthetic-retry",
-        }
-    executor = RecordingExecutor(JobExecutionResult(disposition, **details))  # type: ignore[arg-type]
+    executor = RecordingExecutor(JobExecutionResult(disposition))
     capacity = capacities(codex_concurrency=1)
     scheduler = Scheduler(
         jobs, capacity, {WorkerClass.CODEX: executor}, clock=lambda: NOW
@@ -284,6 +286,65 @@ def test_worker_exception_is_durable_and_does_not_leak_slot(tmp_path: Path) -> N
     assert jobs.get(job_id, project_id).state is JobState.FAILED
     assert len(jobs.attempts(job_id, project_id)) == 1
     assert capacity.available(WorkerClass.CODEX) == 1
+    scheduler.close()
+    connection.close()
+
+
+def test_executor_retry_wait_cannot_bypass_central_timing(tmp_path: Path) -> None:
+    connection, _, jobs, project_id = database(tmp_path / "no-bypass.db")
+    job_id = add_job(jobs, project_id)
+    executor = RecordingExecutor(
+        JobExecutionResult(
+            JobExecutionDisposition.RETRY_WAIT,
+            error_id="executor-requested-retry",
+            next_retry_at=NOW + timedelta(days=99),
+            failure_classification=FailureClassification.TRANSIENT,
+        )
+    )
+    scheduler = Scheduler(
+        jobs,
+        capacities(codex_concurrency=1),
+        {WorkerClass.CODEX: executor},
+        clock=lambda: NOW,
+        retry_policy=RetryBackoffPolicy((30.0,), 0),
+    )
+    scheduler.run_once()
+    harvest(scheduler, executor)
+    persisted = jobs.get(job_id, project_id)
+    assert persisted.state is JobState.RETRY_WAIT
+    assert persisted.next_retry_at == NOW + timedelta(seconds=30)
+    scheduler.close()
+    connection.close()
+
+
+@pytest.mark.parametrize(
+    ("max_attempts", "expected"), [(2, JobState.RETRY_WAIT), (1, JobState.FAILED)]
+)
+def test_typed_transient_exception_uses_exhaustion_path(
+    tmp_path: Path, max_attempts: int, expected: JobState
+) -> None:
+    connection, _, jobs, project_id = database(
+        tmp_path / f"raised-transient-{max_attempts}.db"
+    )
+    job_id = add_job(jobs, project_id, max_attempts=max_attempts)
+    exhausted: list[Job] = []
+    scheduler = Scheduler(
+        jobs,
+        capacities(codex_concurrency=1),
+        {WorkerClass.CODEX: RaisingExecutor(TransientFailure("temporary"))},
+        clock=lambda: NOW,
+        retry_policy=RetryBackoffPolicy((5.0,), 0),
+        exhaustion_handler=lambda job, _at: exhausted.append(job),
+    )
+    scheduler.run_once()
+    scheduler.wait_for_wake(2)
+    scheduler.run_once()
+    persisted = jobs.get(job_id, project_id)
+    assert persisted.state is expected
+    assert persisted.attempt_number == 1
+    assert len(jobs.attempts(job_id, project_id)) == 1
+    assert persisted.retry_exhausted is (max_attempts == 1)
+    assert len(exhausted) == (1 if max_attempts == 1 else 0)
     scheduler.close()
     connection.close()
 
@@ -549,4 +610,65 @@ def test_priority_precedes_project_round_robin(tmp_path: Path) -> None:
     release.set()
     scheduler.close()
     assert executor.calls[0].project_id == project_b
+    db.close()
+
+
+def test_round_robin_fairness_persists_across_scheduler_cycles(tmp_path: Path) -> None:
+    db, projects, jobs, project_a = database(tmp_path / "fair-cycles.db")
+    project_b = ProjectId.generate()
+    projects.add(Project(project_b, "project-b", ProjectState.BUILDING, NOW, NOW))
+    for _ in range(3):
+        add_job(jobs, project_a)
+    for _ in range(2):
+        add_job(jobs, project_b)
+    executor = RecordingExecutor()
+    scheduler = Scheduler(
+        jobs,
+        capacities(codex_concurrency=1),
+        {WorkerClass.CODEX: executor},
+        clock=lambda: NOW,
+    )
+
+    scheduler.run_once()
+    for _ in range(5):
+        scheduler.wait_for_wake(2)
+        scheduler.run_once()
+
+    sequence = [job.project_id for job in executor.calls]
+    assert len(sequence) == 5
+    assert sequence[0] != sequence[1]
+    assert sequence[:4] in (
+        [project_a, project_b, project_a, project_b],
+        [project_b, project_a, project_b, project_a],
+    )
+    scheduler.close()
+    db.close()
+
+
+def test_rework_job_returns_behind_waiting_project(tmp_path: Path) -> None:
+    db, projects, jobs, project_a = database(tmp_path / "fair-rework.db")
+    project_b = ProjectId.generate()
+    projects.add(Project(project_b, "project-b", ProjectState.BUILDING, NOW, NOW))
+    add_job(jobs, project_a, created_at=NOW - timedelta(seconds=2))
+    add_job(jobs, project_b, created_at=NOW - timedelta(seconds=1))
+    executor = RecordingExecutor()
+    scheduler = Scheduler(
+        jobs,
+        capacities(codex_concurrency=1),
+        {WorkerClass.CODEX: executor},
+        clock=lambda: NOW,
+    )
+
+    scheduler.run_once()
+    scheduler.wait_for_wake(2)
+    assert executor.calls[0].project_id == project_a
+    # Simulate the completed workflow producing another equal-priority Codex cycle.
+    # Its older timestamp makes it sort first before project fairness is applied.
+    add_job(jobs, project_a, created_at=NOW - timedelta(seconds=3))
+    scheduler.run_once()
+    scheduler.wait_for_wake(2)
+
+    assert executor.calls[1].project_id == project_b
+    scheduler.run_once()
+    scheduler.close()
     db.close()

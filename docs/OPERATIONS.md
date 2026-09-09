@@ -547,6 +547,10 @@ maximum. The configured default is four attempts. Delays use the configurable
 default); the jitter source is injected for deterministic testing. `next_retry_at` is
 persisted in UTC, and each scheduler cycle promotes due retries before ordinary queue
 selection. No worker capacity is reserved while a job is in `RETRY_WAIT`.
+Executors report structured failure classifications. The legacy executor
+`RETRY_WAIT` disposition is treated only as a compatibility failure signal: any
+executor-supplied retry timestamp is ignored and Syntra's central policy calculates
+the authoritative delay.
 
 Milestone Codex cycles and CI, Architect, and human-test rework cycles are separate
 explicit counters. Their configured limits mean permitted logical cycles; after that
