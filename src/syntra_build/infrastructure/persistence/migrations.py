@@ -386,6 +386,26 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX jobs_retry_due ON jobs(state,next_retry_at,id)",
         ),
     ),
+    Migration(
+        version=8,
+        name="008_project_creation",
+        statements=(
+            "ALTER TABLE projects ADD COLUMN canonical_name TEXT",
+            "CREATE UNIQUE INDEX projects_canonical_name_unique ON projects(canonical_name) WHERE canonical_name IS NOT NULL",
+            """CREATE TABLE project_creation_context (
+                project_id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                initial_request TEXT NOT NULL,
+                messaging_platform TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                thread_id TEXT,
+                source_update_id TEXT NOT NULL,
+                source_message_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id)
+            ) STRICT""",
+        ),
+    ),
 )
 
 

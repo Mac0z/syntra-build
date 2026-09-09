@@ -6,9 +6,18 @@ from pathlib import Path
 
 import pytest
 
+from syntra_build.adapters.github import GitHubHTTPResponse
 from syntra_build.adapters.telegram import TelegramInboundMessage
-from syntra_build.infrastructure.config import ApplicationConfig, load_config
+from syntra_build.application.commands import InboundMessage
+from syntra_build.infrastructure.config import (
+    ApplicationConfig,
+    SecretInputs,
+    SecretValue,
+    load_config,
+)
+from syntra_build.infrastructure.persistence import bootstrap_database
 from syntra_build.smoke import (
+    build_host_router,
     build_smoke_router,
     main,
     run_local_smoke,
@@ -136,6 +145,53 @@ def test_smoke_health_is_truthful_and_project_services_are_unavailable() -> None
     assert client.sent[0]["text"] == (
         "development runtime available (local initialization passed)"
     )
+
+
+def test_real_host_router_composes_m14_github_check_and_persistence(
+    tmp_path: Path,
+) -> None:
+    base = _config(tmp_path)
+    config = load_config(
+        {
+            **base.safe_dict(),
+            "github": {"enabled": True, "owner": "Mac0z"},
+        },
+        environ={},
+        secrets=SecretInputs(github_token=SecretValue("synthetic-github-token")),
+    )
+    connection = bootstrap_database(config)
+    router = build_host_router(
+        config,
+        connection,
+        github_transport=lambda _request, _timeout: GitHubHTTPResponse(404, b"{}"),
+    )
+    response = router.route(
+        InboundMessage(
+            "telegram",
+            "101",
+            "201",
+            "301",
+            datetime.now(UTC),
+            "/create Host Project | Verify real composition",
+            "401",
+        )
+    )
+    assert "State: DESIGNING" in response.text
+    assert (
+        router.route(
+            InboundMessage(
+                "telegram",
+                "102",
+                "202",
+                "301",
+                datetime.now(UTC),
+                "/status Host Project",
+                "401",
+            )
+        ).text
+        == "Project: Host Project\nState: DESIGNING"
+    )
+    connection.close()
 
 
 def test_cli_failure_is_nonzero_and_secret_safe(

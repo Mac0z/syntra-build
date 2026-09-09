@@ -34,6 +34,13 @@ Telegram user ID. The file uses the existing typed M1 field names. The default
 M1 filesystem and database paths already resolve to the approved `/opt`,
 `/etc`, `/var/lib`, and `/var/log` layout, so they need not be duplicated.
 
+For M14, also enable the existing GitHub configuration and set its owner to the
+canonical Syntra-owned account:
+
+```json
+"github": {"enabled": true, "owner": "Mac0z", "api_timeout_seconds": 30}
+```
+
 Install the token without putting it in an argument or shell history. First
 create the destination with its final ownership and permissions, then write the
 silently entered token through standard input:
@@ -73,6 +80,12 @@ printed.
 The token file is loaded into the existing `SecretInputs`/`SecretValue` model.
 The smoke command rejects group/world-readable token files. Never inspect or
 copy this file into logs, Git, or the SQLite database.
+
+Install the minimum-permission GitHub token through the same protected-file
+pattern at `/etc/syntra-build/github-token` (owner `syntra-build`, mode `0600`).
+The token must permit the read-only repository lookup required for the
+configured owner; M14 does not use it to create or mutate repositories. The
+smoke runner rejects a group/world-readable GitHub token file.
 
 ## Select and install an exact revision
 
@@ -119,8 +132,8 @@ secret-safe terminal message.
 
 ## One bounded Telegram cycle
 
-Send `/ping` (or `/health` or an unsupported command) from the configured
-authorised account, then run:
+Send `/ping`, `/health`, or an M14 `/create <name> | <request>` command from the
+configured authorised account, then run:
 
 ```bash
 sudo -u syntra-build /opt/syntra-build/venv/bin/python \
@@ -129,10 +142,10 @@ sudo -u syntra-build /opt/syntra-build/venv/bin/python \
 
 This makes exactly one M5 `getUpdates` poll, preserves provider order, passes
 only M5-authorised normalized text messages through the M6 seam, replies using
-M5 `send_text`, and exits. `/health` truthfully reports only that local M6A
-initialization is available. Project reads/mutations have no M7 implementation.
-There is no saved offset or seen-update cache, so a later manual run may see an
-update again until durable consumption is implemented. The first bounded poll
+M5 `send_text`, and exits. `/health` truthfully reports only that local
+initialization is available. M14 creation and query commands use durable SQLite
+repositories and the real read-only GitHub name checker; duplicate creation
+updates use their M11 external identity. The first bounded poll
 may legitimately report `0 authorised updates` if Telegram has not yet surfaced
 the newly sent update; rerunning the bounded command is acceptable for this
 manual acceptance test.

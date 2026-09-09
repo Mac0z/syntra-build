@@ -14,7 +14,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, TextIO
+from uuid import uuid4
 
+from syntra_build.adapters.github import (
+    GitHubRepositoryNameConflictChecker,
+    GitHubTransport,
+)
 from syntra_build.adapters.telegram import TelegramClient, TelegramInboundMessage
 from syntra_build.adapters.telegram.application import route_authorized_message
 from syntra_build.application.commands import CommandRouter
@@ -26,6 +31,10 @@ from syntra_build.application.commands.services import (
     ProjectSummary,
     ResolutionOutcome,
 )
+from syntra_build.application.projects import (
+    ProjectCreationService,
+    SQLiteProjectQueryService,
+)
 from syntra_build.domain import ProjectId
 from syntra_build.infrastructure.config import (
     ApplicationConfig,
@@ -34,7 +43,11 @@ from syntra_build.infrastructure.config import (
     load_config,
 )
 from syntra_build.infrastructure.logging import configure_logging
-from syntra_build.infrastructure.persistence import bootstrap_database
+from syntra_build.infrastructure.persistence import (
+    SQLiteProjectRepository,
+    SQLiteWorkflowEventRepository,
+    bootstrap_database,
+)
 
 _LOGGER = logging.getLogger("syntra_build.smoke")
 _REVISION = re.compile(r"[0-9a-f]{40}")
@@ -101,6 +114,35 @@ def build_smoke_router() -> CommandRouter:
         project_commands=_UnavailableProjectCommands(),
         audit_sink=_NoopAudit(),
         health=_LocalHealth(),
+    )
+
+
+def build_host_router(
+    config: ApplicationConfig,
+    connection: sqlite3.Connection,
+    *,
+    github_transport: GitHubTransport | None = None,
+) -> CommandRouter:
+    """Compose the durable M14 services used by real Telegram host routing."""
+    projects = SQLiteProjectRepository(connection, lambda: str(uuid4()))
+    events = SQLiteWorkflowEventRepository(connection)
+    checker = (
+        GitHubRepositoryNameConflictChecker(config, transport=github_transport)
+        if github_transport is not None
+        else GitHubRepositoryNameConflictChecker(config)
+    )
+    creation = ProjectCreationService(
+        connection,
+        projects,
+        events,
+        checker,
+    )
+    return CommandRouter(
+        project_queries=SQLiteProjectQueryService(projects),
+        project_commands=_UnavailableProjectCommands(),
+        audit_sink=_NoopAudit(),
+        health=_LocalHealth(),
+        project_creation=creation,
     )
 
 
@@ -193,16 +235,28 @@ def validate_revision(value: str) -> str:
     return revision
 
 
-def _load_host_config(config_path: Path, token_path: Path) -> ApplicationConfig:
+def _read_secret_file(path: Path, label: str) -> SecretValue | None:
+    if not path.exists():
+        return None
+    if path.stat().st_mode & 0o077:
+        raise RuntimeError(f"{label} file permissions are too broad")
+    return SecretValue(path.read_text(encoding="utf-8").strip())
+
+
+def _load_host_config(
+    config_path: Path, token_path: Path, github_token_path: Path
+) -> ApplicationConfig:
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(raw, Mapping) or not all(isinstance(key, str) for key in raw):
         raise RuntimeError("configuration file must contain a JSON object")
-    token: SecretValue | None = None
-    if token_path.exists():
-        if token_path.stat().st_mode & 0o077:
-            raise RuntimeError("Telegram token file permissions are too broad")
-        token = SecretValue(token_path.read_text(encoding="utf-8").strip())
-    return load_config(raw, environ={}, secrets=SecretInputs(telegram_bot_token=token))
+    return load_config(
+        raw,
+        environ={},
+        secrets=SecretInputs(
+            telegram_bot_token=_read_secret_file(token_path, "Telegram token"),
+            github_token=_read_secret_file(github_token_path, "GitHub token"),
+        ),
+    )
 
 
 def _configure_file_logging(config: ApplicationConfig) -> TextIO:
@@ -221,6 +275,11 @@ def _parser() -> argparse.ArgumentParser:
         "--token-file", type=Path, default=Path("/etc/syntra-build/telegram-token")
     )
     parser.add_argument(
+        "--github-token-file",
+        type=Path,
+        default=Path("/etc/syntra-build/github-token"),
+    )
+    parser.add_argument(
         "--revision-file", type=Path, default=Path("/opt/syntra-build/REVISION")
     )
     return parser
@@ -232,7 +291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if sys.version_info[:2] != (3, 14):
             raise RuntimeError("Python 3.14 is required")
-        config = _load_host_config(args.config, args.token_file)
+        config = _load_host_config(args.config, args.token_file, args.github_token_file)
         stream = _configure_file_logging(config)
         revision = validate_revision(args.revision_file.read_text(encoding="ascii"))
         if args.command == "local":
@@ -244,7 +303,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Routing: {result.routing}")
         else:
             validate_filesystem(config)
-            count = run_telegram_once(TelegramClient(config), build_smoke_router())
+            connection = bootstrap_database(config)
+            try:
+                count = run_telegram_once(
+                    TelegramClient(config), build_host_router(config, connection)
+                )
+            finally:
+                connection.close()
             print(f"Syntra Build Telegram smoke: PASS ({count} authorised updates)")
         return 0
     except Exception:

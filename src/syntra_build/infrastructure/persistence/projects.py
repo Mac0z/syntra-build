@@ -36,6 +36,19 @@ class ProjectStateTransition:
     trigger_event_id: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectCreationContext:
+    project_id: ProjectId
+    owner_id: str
+    initial_request: str
+    messaging_platform: str
+    conversation_id: str
+    thread_id: str | None
+    source_update_id: str
+    source_message_id: str
+    created_at: datetime
+
+
 def _timestamp(value: datetime) -> str:
     return value.isoformat(timespec="microseconds")
 
@@ -55,10 +68,27 @@ class SQLiteProjectRepository:
     def add(self, project: Project) -> None:
         changed_at = project.last_state_change_at or project.created_at
         try:
+            if project.canonical_name is None and not self._has_canonical_name_column():
+                self._connection.execute(
+                    """INSERT INTO projects
+                       (id,name,state,resume_state,activity,created_at,updated_at,last_state_change_at)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (
+                        str(project.id),
+                        project.name,
+                        project.state.value,
+                        project.resume_state.value if project.resume_state else None,
+                        project.activity,
+                        _timestamp(project.created_at),
+                        _timestamp(project.updated_at),
+                        _timestamp(changed_at),
+                    ),
+                )
+                return
             self._connection.execute(
                 """INSERT INTO projects
-                   (id,name,state,resume_state,activity,created_at,updated_at,last_state_change_at)
-                   VALUES (?,?,?,?,?,?,?,?)""",
+                   (id,name,state,resume_state,activity,created_at,updated_at,last_state_change_at,canonical_name)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
                 (
                     str(project.id),
                     project.name,
@@ -68,6 +98,7 @@ class SQLiteProjectRepository:
                     _timestamp(project.created_at),
                     _timestamp(project.updated_at),
                     _timestamp(changed_at),
+                    project.canonical_name,
                 ),
             )
         except sqlite3.Error as error:
@@ -90,6 +121,70 @@ class SQLiteProjectRepository:
             else None,
             activity=row["activity"],
             last_state_change_at=_datetime(row["last_state_change_at"]),
+            canonical_name=(
+                row["canonical_name"] if "canonical_name" in row.keys() else None
+            ),
+        )
+
+    def _has_canonical_name_column(self) -> bool:
+        return any(
+            row[1] == "canonical_name"
+            for row in self._connection.execute("PRAGMA table_info(projects)")
+        )
+
+    def find_by_canonical_name(self, canonical_name: str) -> Project | None:
+        row = self._connection.execute(
+            "SELECT id FROM projects WHERE canonical_name=?", (canonical_name,)
+        ).fetchone()
+        return self.get(ProjectId.from_string(row["id"])) if row else None
+
+    def list_all(self) -> tuple[Project, ...]:
+        rows = self._connection.execute(
+            "SELECT id FROM projects ORDER BY created_at,id"
+        ).fetchall()
+        return tuple(self.get(ProjectId.from_string(row["id"])) for row in rows)
+
+    def add_creation_context(self, context: ProjectCreationContext) -> None:
+        try:
+            self._connection.execute(
+                """INSERT INTO project_creation_context
+                   (project_id,owner_id,initial_request,messaging_platform,conversation_id,
+                    thread_id,source_update_id,source_message_id,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(context.project_id),
+                    context.owner_id,
+                    context.initial_request,
+                    context.messaging_platform,
+                    context.conversation_id,
+                    context.thread_id,
+                    context.source_update_id,
+                    context.source_message_id,
+                    _timestamp(context.created_at),
+                ),
+            )
+        except sqlite3.Error as error:
+            raise PersistenceError(
+                "project creation context could not be stored"
+            ) from error
+
+    def get_creation_context(self, project_id: ProjectId) -> ProjectCreationContext:
+        row = self._connection.execute(
+            "SELECT * FROM project_creation_context WHERE project_id=?",
+            (str(project_id),),
+        ).fetchone()
+        if row is None:
+            raise PersistenceError("project creation context does not exist")
+        return ProjectCreationContext(
+            project_id,
+            row["owner_id"],
+            row["initial_request"],
+            row["messaging_platform"],
+            row["conversation_id"],
+            row["thread_id"],
+            row["source_update_id"],
+            row["source_message_id"],
+            _datetime(row["created_at"]),
         )
 
     def apply_transition(self, request: ProjectTransitionRequest) -> Project:

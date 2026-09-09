@@ -57,6 +57,7 @@ from syntra_build.infrastructure.persistence.milestones import (
     SQLiteMilestoneRepository,
 )
 from syntra_build.infrastructure.persistence.projects import (
+    ProjectCreationContext,
     ProjectStateTransition,
     SQLiteProjectRepository,
 )
@@ -127,6 +128,7 @@ __all__ = [
     "InvalidAttemptError",
     "ImmutableTerminalAttemptError",
     "ProjectStateTransition",
+    "ProjectCreationContext",
     "SQLiteProjectRepository",
     "apply_migrations",
     "bootstrap_database",

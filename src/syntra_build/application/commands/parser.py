@@ -54,6 +54,29 @@ class CommandParser:
         else:
             token = head.casefold()
         definition = _COMMANDS.get(token)
+        if token == "create":
+            argument = parts[1] if len(parts) == 2 else ""
+            name, separator, initial_request = argument.partition("|")
+            if not separator or not name.strip() or not initial_request.strip():
+                return ParseResult(failure=ParseFailure.MALFORMED)
+            return ParseResult(
+                command=Command(
+                    type=CommandType.CREATE_PROJECT,
+                    project_name=name.strip()
+                    .removeprefix('"')
+                    .removesuffix('"')
+                    .strip(),
+                    initial_request=initial_request.strip(),
+                    requested_by=message.sender_id,
+                    requested_at=message.received_at,
+                    source_platform=message.source_platform,
+                    source_update_id=message.source_update_id,
+                    source_message_id=message.source_message_id,
+                    correlation_id=self._correlation_id_factory(),
+                    chat_id=message.chat_id,
+                    thread_id=message.thread_id,
+                )
+            )
         if token == "gate":
             arguments = parts[1].split() if len(parts) == 2 else []
             if len(arguments) != 2:
