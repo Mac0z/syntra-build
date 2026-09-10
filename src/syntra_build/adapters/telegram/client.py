@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """Small synchronous Telegram Bot API gateway with an injectable HTTP seam."""
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from typing import Final
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 from syntra_build.adapters.telegram.errors import (
     TelegramAPIError,
@@ -19,6 +21,7 @@ from syntra_build.adapters.telegram.errors import (
     TelegramTransportError,
 )
 from syntra_build.adapters.telegram.models import (
+    TelegramCallbackQuery,
     TelegramInboundMessage,
     TelegramPolledUpdate,
     TelegramSentMessage,
@@ -88,21 +91,22 @@ class TelegramClient:
         for update in result:
             raw = _expect_mapping(update, "Telegram update")
             update_id = _expect_int(raw.get("update_id"), "update_id")
-            message = self._normalise_update(raw)
-            if message is None:
+            message, callback = self._normalise_update(raw)
+            payload = message or callback
+            if payload is None:
                 updates.append(
                     TelegramPolledUpdate(
                         update_id, TelegramUpdateDisposition.UNSUPPORTED
                     )
                 )
                 continue
-            if message.user_id not in self._authorised_user_ids:
+            if payload.user_id not in self._authorised_user_ids:
                 _LOGGER.warning(
                     "Telegram update ignored",
                     extra={
                         "event": "telegram_update_ignored",
                         "metadata": {
-                            "update_id": message.update_id,
+                            "update_id": payload.update_id,
                             "reason": "unauthorised_user",
                         },
                     },
@@ -115,17 +119,21 @@ class TelegramClient:
                 continue
             updates.append(
                 TelegramPolledUpdate(
-                    update_id, TelegramUpdateDisposition.ROUTABLE, message
+                    update_id, TelegramUpdateDisposition.ROUTABLE, message, callback
                 )
             )
+            source_message_id = message.message_id if message is not None else None
+            if callback is not None:
+                source_message_id = callback.source_message_id
+            assert source_message_id is not None
             _LOGGER.info(
                 "Telegram update received",
                 extra={
                     "event": "telegram_update_received",
                     "metadata": {
-                        "update_id": message.update_id,
-                        "message_id": message.message_id,
-                        "user_id": message.user_id,
+                        "update_id": payload.update_id,
+                        "message_id": source_message_id,
+                        "user_id": payload.user_id,
                     },
                 },
             )
@@ -151,6 +159,7 @@ class TelegramClient:
         text: str,
         thread_id: int | None = None,
         reply_to_message_id: int | None = None,
+        reply_markup: Mapping[str, object] | None = None,
     ) -> TelegramSentMessage:
         """Send one plain-text message and return its stable provider reference."""
         parameters: dict[str, object] = {"chat_id": chat_id, "text": text}
@@ -158,6 +167,8 @@ class TelegramClient:
             parameters["message_thread_id"] = thread_id
         if reply_to_message_id is not None:
             parameters["reply_to_message_id"] = reply_to_message_id
+        if reply_markup is not None:
+            parameters["reply_markup"] = json.dumps(reply_markup, separators=(",", ":"))
         result = self._request("sendMessage", parameters, _TRANSPORT_OVERHEAD_SECONDS)
         message = _expect_mapping(result, "Telegram sendMessage result")
         message_id = _expect_int(message.get("message_id"), "message_id")
@@ -176,6 +187,66 @@ class TelegramClient:
         )
         return sent
 
+    def answer_callback(self, callback_query_id: str, text: str | None = None) -> None:
+        parameters: dict[str, object] = {"callback_query_id": callback_query_id}
+        if text:
+            parameters["text"] = text
+        self._request("answerCallbackQuery", parameters, _TRANSPORT_OVERHEAD_SECONDS)
+
+    def send_document(
+        self,
+        *,
+        chat_id: int,
+        content: bytes,
+        filename: str,
+        mime_type: str,
+        caption: str | None = None,
+        thread_id: int | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> TelegramSentMessage:
+        """Upload in-memory content with Telegram's multipart protocol."""
+        boundary = f"syntra-{uuid4().hex}"
+        fields: dict[str, object] = {"chat_id": chat_id}
+        if caption is not None:
+            fields["caption"] = caption
+        if thread_id is not None:
+            fields["message_thread_id"] = thread_id
+        if reply_to_message_id is not None:
+            fields["reply_to_message_id"] = reply_to_message_id
+        chunks: list[bytes] = []
+        for key, value in fields.items():
+            chunks.append(
+                f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
+            )
+        safe_name = filename.replace('"', "_").replace("\r", "_").replace("\n", "_")
+        chunks.append(
+            (
+                f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{safe_name}"\r\nContent-Type: {mime_type}\r\n\r\n'
+            ).encode()
+        )
+        chunks.extend((content, b"\r\n", f"--{boundary}--\r\n".encode()))
+        result = self._request_bytes(
+            "sendDocument",
+            b"".join(chunks),
+            f"multipart/form-data; boundary={boundary}",
+        )
+        message = _expect_mapping(result, "Telegram sendDocument result")
+        chat = _expect_mapping(message.get("chat"), "chat")
+        return TelegramSentMessage(
+            _expect_int(message.get("message_id"), "message_id"),
+            _expect_int(chat.get("id"), "chat.id"),
+            _optional_int(message.get("message_thread_id"), "thread ID"),
+        )
+
+    def _request_bytes(self, method: str, data: bytes, content_type: str) -> object:
+        request = Request(
+            f"{_API_ROOT}/bot{self._token}/{method}",
+            data=data,
+            headers={"Content-Type": content_type},
+            method="POST",
+        )
+        return self._decode_response(method, request, _TRANSPORT_OVERHEAD_SECONDS)
+
     def _request(
         self, method: str, parameters: Mapping[str, object], timeout: float
     ) -> object:
@@ -186,6 +257,9 @@ class TelegramClient:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             method="POST",
         )
+        return self._decode_response(method, request, timeout)
+
+    def _decode_response(self, method: str, request: Request, timeout: float) -> object:
         try:
             response = self._transport(request, timeout)
         except Exception as error:
@@ -224,17 +298,50 @@ class TelegramClient:
         return envelope["result"]
 
     @staticmethod
-    def _normalise_update(raw_update: object) -> TelegramInboundMessage | None:
+    def _normalise_update(
+        raw_update: object,
+    ) -> tuple[TelegramInboundMessage | None, TelegramCallbackQuery | None]:
         update = _expect_mapping(raw_update, "Telegram update")
         update_id = _expect_int(update.get("update_id"), "update_id")
         raw_message = update.get("message")
         if not isinstance(raw_message, Mapping):
-            _log_unsupported(update_id)
-            return None
+            raw_callback = update.get("callback_query")
+            if not isinstance(raw_callback, Mapping):
+                _log_unsupported(update_id)
+                return None, None
+            sender = _expect_mapping(raw_callback.get("from"), "callback_query.from")
+            source = _expect_mapping(
+                raw_callback.get("message"), "callback_query.message"
+            )
+            chat = _expect_mapping(source.get("chat"), "callback_query.message.chat")
+            data = raw_callback.get("data")
+            callback_id = raw_callback.get("id")
+            if (
+                not isinstance(data, str)
+                or not data
+                or len(data.encode()) > 64
+                or not isinstance(callback_id, str)
+                or not callback_id
+            ):
+                _log_unsupported(update_id)
+                return None, None
+            timestamp = _expect_int(source.get("date"), "callback_query.message.date")
+            return None, TelegramCallbackQuery(
+                update_id,
+                callback_id,
+                _expect_int(sender.get("id"), "callback_query.from.id"),
+                _expect_int(chat.get("id"), "callback_query.message.chat.id"),
+                _expect_int(
+                    source.get("message_id"), "callback_query.message.message_id"
+                ),
+                data,
+                datetime.fromtimestamp(timestamp, UTC),
+                _optional_int(source.get("message_thread_id"), "thread ID"),
+            )
         text = raw_message.get("text")
         if not isinstance(text, str) or not text:
             _log_unsupported(update_id)
-            return None
+            return None, None
         sender = _expect_mapping(raw_message.get("from"), "message.from")
         chat = _expect_mapping(raw_message.get("chat"), "message.chat")
         timestamp = _expect_int(raw_message.get("date"), "message.date")
@@ -254,7 +361,7 @@ class TelegramClient:
             received_at=datetime.fromtimestamp(timestamp, UTC),
             thread_id=_optional_int(raw_message.get("message_thread_id"), "thread ID"),
             reply_to_message_id=reply_id,
-        )
+        ), None
 
 
 def _log_unsupported(update_id: int) -> None:

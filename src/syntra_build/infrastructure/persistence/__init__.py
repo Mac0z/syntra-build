@@ -76,6 +76,11 @@ from syntra_build.infrastructure.persistence.projects import (
     ProjectStateTransition,
     SQLiteProjectRepository,
 )
+from syntra_build.infrastructure.persistence.telegram_interactions import (
+    SQLiteTelegramGateInteractionRepository,
+    TelegramGateInteraction,
+    TelegramInteractionState,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -132,6 +137,9 @@ __all__ = [
     "SQLiteJobRepository",
     "SQLiteHumanGateRepository",
     "SQLiteWorkflowEventRepository",
+    "SQLiteTelegramGateInteractionRepository",
+    "TelegramGateInteraction",
+    "TelegramInteractionState",
     "SQLiteProviderCursorRepository",
     "SQLiteArchitectInteractionRepository",
     "SQLiteDesignMessageRepository",

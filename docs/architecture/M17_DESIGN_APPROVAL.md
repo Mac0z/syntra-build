@@ -64,3 +64,33 @@ If notification fails, rerunning that exact mode finds the existing pending pack
 only its `PENDING` gate notification. It does not call the Architect or create document
 revisions again. Subsequent `gate <id> REQUEST_CHANGES <feedback>` and `gate <id> APPROVE`
 messages are handled by the normal `telegram-once` router and durable Telegram cursor.
+
+## M17.1 Telegram review experience
+
+The design notification provides `View SPEC`, `View AGENTS`, `Approve`, and `Request
+changes` inline buttons. Callback data is limited to `design:<action>:<gate-uuid>` and is
+only a locator. The authorised identity, answerable gate, artifact reference, exact package,
+project state, and document IDs are revalidated from SQLite. The durable update cursor still
+advances only after safe handling.
+
+Document buttons upload exact persisted UTF-8 Markdown as the authoritative source and an
+in-memory `fpdf2` rendering as a review copy. PDFs never enter `project_documents`.
+Request Changes durably records the chat, user, gate, package, and ForceReply prompt message
+ID. Only a reply matching that tuple reaches the existing atomic M17 decision handler after
+a restart; unrelated text remains ordinary command input.
+
+The explicit `gate <gate-id> APPROVE` and `gate <gate-id> REQUEST_CHANGES <feedback>` forms
+remain fallback/admin commands. Full SPEC/AGENTS drafting uses a 600-second Architect
+timeout; explicitly configured shorter interactions retain their configured timeout.
+
+Host acceptance uses the existing commands (run `telegram-once` after each human action):
+
+```text
+python -m syntra_build.architect_smoke <project-uuid> --correlation-id <id> \
+  --create-package --telegram-chat-id <chat-id>
+python -m syntra_build.smoke telegram-once
+```
+
+View both formats, request and reply with changes, regenerate with a new correlation ID,
+then approve. Verify `DESIGNING` after feedback, `PROVISIONING` after approval, exactly one
+approved SPEC/AGENTS pair, working fallback commands on a fresh package, and no GitHub repo.

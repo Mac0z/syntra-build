@@ -22,6 +22,20 @@ class TelegramInboundMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class TelegramCallbackQuery:
+    """An authorised callback, kept distinct from inbound text."""
+
+    update_id: int
+    callback_query_id: str
+    user_id: int
+    chat_id: int
+    source_message_id: int
+    callback_data: str
+    received_at: datetime
+    thread_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class TelegramSentMessage:
     """Stable reference to a text message accepted by Telegram."""
 
@@ -45,9 +59,9 @@ class TelegramPolledUpdate:
     update_id: int
     disposition: TelegramUpdateDisposition
     message: TelegramInboundMessage | None = None
+    callback: TelegramCallbackQuery | None = None
 
     def __post_init__(self) -> None:
-        if (self.disposition is TelegramUpdateDisposition.ROUTABLE) != (
-            self.message is not None
-        ):
-            raise ValueError("only routable Telegram updates may contain a message")
+        payloads = int(self.message is not None) + int(self.callback is not None)
+        if (self.disposition is TelegramUpdateDisposition.ROUTABLE) != (payloads == 1):
+            raise ValueError("routable Telegram updates require exactly one payload")
