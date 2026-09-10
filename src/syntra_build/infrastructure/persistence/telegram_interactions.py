@@ -63,12 +63,19 @@ class SQLiteTelegramGateNotificationRepository:
         return self.get(gate_id)
 
     def get(self, gate_id: GateId) -> TelegramGateNotification:
+        notification = self.find(gate_id)
+        if notification is None:
+            raise PersistenceError("Telegram gate notification does not exist")
+        return notification
+
+    def find(self, gate_id: GateId) -> TelegramGateNotification | None:
+        """Return an existing immutable notification binding when present."""
         row = self.connection.execute(
             "SELECT * FROM telegram_gate_notifications WHERE gate_id=?",
             (str(gate_id),),
         ).fetchone()
         if row is None:
-            raise PersistenceError("Telegram gate notification does not exist")
+            return None
         return TelegramGateNotification(
             gate_id,
             row["chat_id"],

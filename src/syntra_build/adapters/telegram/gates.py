@@ -28,6 +28,20 @@ class TelegramGateNotifier:
         markup = None
         if match and "design-package:" in text:
             gate = match.group(1)
+            if self.notifications is not None:
+                existing = self.notifications.find(GateId.from_string(gate))
+                if existing is not None:
+                    expected_thread = (
+                        str(self.thread_id) if self.thread_id is not None else None
+                    )
+                    if (
+                        existing.chat_id != str(self.chat_id)
+                        or existing.thread_id != expected_thread
+                    ):
+                        raise ValueError(
+                            "existing Telegram gate notification destination conflicts"
+                        )
+                    return existing.message_id
             markup = {
                 "inline_keyboard": [
                     [

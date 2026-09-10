@@ -13,6 +13,7 @@ from syntra_build.adapters.architect import SPECIFICATION_DRAFT_SCHEMA
 from syntra_build.adapters.telegram import (
     TelegramCallbackQuery,
     TelegramClient,
+    TelegramGateNotifier,
     TelegramInboundMessage,
     TelegramSentMessage,
 )
@@ -563,6 +564,66 @@ class FakeDesignTelegram:
 
 def bind_notification(db: sqlite3.Connection, gate_id: GateId) -> None:
     SQLiteTelegramGateNotificationRepository(db).add(gate_id, "300", "7", "201", NOW)
+
+
+def test_pending_gate_reuses_persisted_notification_after_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "notification-recovery.db"
+    db, _, _, gate_id = setup_pending(path)
+    db.execute(
+        "UPDATE human_gates SET state='PENDING',notified_at=NULL WHERE id=?",
+        (str(gate_id),),
+    )
+    bind_notification(db, gate_id)
+    db.close()
+
+    db = open_database(path)
+    fake = FakeDesignTelegram()
+    notifications = SQLiteTelegramGateNotificationRepository(db)
+    service = HumanGateService(
+        SQLiteHumanGateRepository(db, lambda: str(uuid4())),
+        response_id_factory=lambda: str(uuid4()),
+        authorised_responder_ids=frozenset({"123"}),
+    )
+    notifier = TelegramGateNotifier(
+        cast(TelegramClient, fake),
+        chat_id=300,
+        thread_id=7,
+        notifications=notifications,
+        clock=lambda: NOW,
+    )
+
+    gate = service.notify(gate_id, notifier, occurred_at=NOW)
+
+    assert fake.texts == []
+    assert gate.state is GateState.NOTIFIED
+    assert notifications.get(gate_id).message_id == "201"
+    assert (
+        db.execute(
+            "SELECT count(*) FROM telegram_gate_notifications WHERE gate_id=?",
+            (str(gate_id),),
+        ).fetchone()[0]
+        == 1
+    )
+    notifications.validate_callback(gate_id, "300", "7", "201")
+
+
+def test_notification_reconciliation_rejects_destination_conflict(
+    tmp_path: Path,
+) -> None:
+    db, _, _, gate_id = setup_pending(tmp_path / "notification-conflict.db")
+    bind_notification(db, gate_id)
+    fake = FakeDesignTelegram()
+    notifier = TelegramGateNotifier(
+        cast(TelegramClient, fake),
+        chat_id=999,
+        thread_id=7,
+        notifications=SQLiteTelegramGateNotificationRepository(db),
+    )
+    with pytest.raises(ValueError, match="destination conflicts"):
+        notifier.send(f"Gate: {gate_id}\nArtifact: design-package:any")
+    assert fake.texts == []
 
 
 def design_callback(gate_id: GateId, action: str) -> TelegramCallbackQuery:
