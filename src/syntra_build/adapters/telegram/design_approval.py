@@ -54,7 +54,7 @@ def markdown_pdf(
     project_name: str, document_type: str, revision: int, content: str
 ) -> bytes:
     """Create a bounded, non-authoritative readable rendering in memory."""
-    from fpdf import FPDF  # type: ignore[import-untyped]
+    from fpdf import FPDF
 
     pdf = FPDF()
     pdf.set_compression(False)
