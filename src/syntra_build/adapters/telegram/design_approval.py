@@ -30,6 +30,7 @@ from syntra_build.infrastructure.persistence import (
     SQLiteProjectDocumentRepository,
     SQLiteProjectRepository,
     SQLiteTelegramGateInteractionRepository,
+    SQLiteTelegramGateNotificationRepository,
 )
 from syntra_build.infrastructure.persistence.connection import transaction
 from syntra_build.infrastructure.persistence.errors import PersistenceError
@@ -111,7 +112,7 @@ class TelegramDesignApprovalHandler:
         action, raw_gate_id = match.groups()
         try:
             gate_id = GateId.from_string(raw_gate_id)
-            gate, package = self._resolve(gate_id, callback.chat_id)
+            gate, package = self._resolve_callback(gate_id, callback)
             if action in {"spec", "agents"}:
                 self._deliver_document(callback, package.id, action)
             elif action == "approve":
@@ -174,7 +175,7 @@ class TelegramDesignApprovalHandler:
                 reply_to_message_id=message.message_id,
             )
             return True
-        gate, _ = self._resolve(item.gate_id, message.chat_id)
+        gate, _ = self._resolve_gate(item.gate_id)
         command = Command(
             CommandType.RESPOND_GATE,
             str(message.user_id),
@@ -202,9 +203,18 @@ class TelegramDesignApprovalHandler:
         )
         return True
 
-    def _resolve(
-        self, gate_id: GateId, chat_id: int
+    def _resolve_callback(
+        self, gate_id: GateId, callback: TelegramCallbackQuery
     ) -> tuple[HumanGate, DesignPackage]:
+        SQLiteTelegramGateNotificationRepository(self.connection).validate_callback(
+            gate_id,
+            str(callback.chat_id),
+            str(callback.thread_id) if callback.thread_id is not None else None,
+            str(callback.source_message_id),
+        )
+        return self._resolve_gate(gate_id)
+
+    def _resolve_gate(self, gate_id: GateId) -> tuple[HumanGate, DesignPackage]:
         gate = SQLiteHumanGateRepository(self.connection, lambda: "unused").get(gate_id)
         if (
             gate.gate_type is not GateType.DESIGN_APPROVAL
@@ -220,9 +230,6 @@ class TelegramDesignApprovalHandler:
                 gate.artifact_reference.removeprefix(_ARTIFACT_PREFIX)
             )
         )
-        # Chat identity is correlated by the provider update and configured destination;
-        # package/project/document identities always come from the gate row.
-        del chat_id
         if package.approval_gate_id != gate.id or package.project_id != gate.project_id:
             raise PersistenceError("design package does not match gate")
         return gate, package

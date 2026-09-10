@@ -4,11 +4,19 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
 
 from syntra_build.adapters.architect import SPECIFICATION_DRAFT_SCHEMA
+from syntra_build.adapters.telegram import (
+    TelegramCallbackQuery,
+    TelegramClient,
+    TelegramInboundMessage,
+    TelegramSentMessage,
+)
+from syntra_build.adapters.telegram.design_approval import TelegramDesignApprovalHandler
 from syntra_build.application.architect import ArchitectError, ArchitectFailureKind
 from syntra_build.application.commands import CommandParser, InboundMessage
 from syntra_build.application.commands.router import CommandRouter
@@ -26,6 +34,7 @@ from syntra_build.domain import (
     DocumentStatus,
     DocumentType,
     GateId,
+    GateState,
     PlannedMilestone,
     Project,
     ProjectDocumentId,
@@ -45,6 +54,9 @@ from syntra_build.infrastructure.persistence import (
     SQLiteProjectDecisionRepository,
     SQLiteProjectDocumentRepository,
     SQLiteProjectRepository,
+    SQLiteTelegramGateInteractionRepository,
+    SQLiteTelegramGateNotificationRepository,
+    TelegramInteractionState,
     apply_migrations,
     document_content_hash,
     open_database,
@@ -513,6 +525,205 @@ def test_real_generation_notification_router_change_and_approval_path(
         )
     )
     assert "already closed" in duplicate.text
+
+
+class FakeDesignTelegram:
+    def __init__(self, *, fail_prompt: bool = False) -> None:
+        self.texts: list[str] = []
+        self.documents: list[tuple[str, bytes]] = []
+        self.acks: list[str] = []
+        self.fail_prompt = fail_prompt
+
+    def answer_callback(self, callback_query_id: str, text: str | None = None) -> None:
+        self.acks.append(callback_query_id)
+
+    def send_text(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        thread_id: int | None = None,
+        reply_to_message_id: int | None = None,
+        reply_markup: object | None = None,
+    ) -> TelegramSentMessage:
+        del reply_to_message_id, reply_markup
+        if self.fail_prompt and text.startswith("What would"):
+            raise RuntimeError("prompt failed")
+        self.texts.append(text)
+        return TelegramSentMessage(700, chat_id, thread_id)
+
+    def send_document(
+        self, *, filename: str, content: bytes, **kwargs: object
+    ) -> TelegramSentMessage:
+        self.documents.append((filename, content))
+        chat_id = kwargs["chat_id"]
+        assert isinstance(chat_id, int)
+        return TelegramSentMessage(701, chat_id)
+
+
+def bind_notification(db: sqlite3.Connection, gate_id: GateId) -> None:
+    SQLiteTelegramGateNotificationRepository(db).add(gate_id, "300", "7", "201", NOW)
+
+
+def design_callback(gate_id: GateId, action: str) -> TelegramCallbackQuery:
+    return TelegramCallbackQuery(
+        100, f"callback-{action}", 123, 300, 201, f"design:{action}:{gate_id}", NOW, 7
+    )
+
+
+def test_callback_approval_requires_exact_notification_identity(tmp_path: Path) -> None:
+    db, packages, package_id, gate_id = setup_pending(tmp_path / "callback.db")
+    bind_notification(db, gate_id)
+    fake = FakeDesignTelegram()
+    handler = TelegramDesignApprovalHandler(
+        db, cast(TelegramClient, fake), frozenset({"123"})
+    )
+    valid = design_callback(gate_id, "approve")
+    for chat_id, message_id, thread_id in (
+        (999, 201, 7),
+        (300, 999, 7),
+        (300, 201, 999),
+    ):
+        wrong = TelegramCallbackQuery(
+            valid.update_id,
+            valid.callback_query_id,
+            valid.user_id,
+            chat_id,
+            message_id,
+            valid.callback_data,
+            valid.received_at,
+            thread_id,
+        )
+        handler.handle_callback(wrong)
+        assert packages.get(package_id).status is DesignPackageStatus.PENDING_APPROVAL
+
+    handler.handle_callback(design_callback(gate_id, "approve"))
+    assert packages.get(package_id).status is DesignPackageStatus.APPROVED
+    assert (
+        SQLiteProjectRepository(db, lambda: "unused").get(PID).state
+        is ProjectState.PROVISIONING
+    )
+    assert (
+        SQLiteHumanGateRepository(db, lambda: "unused").get(gate_id).state
+        is GateState.RESOLVED
+    )
+    actors = [
+        row[0]
+        for row in db.execute(
+            "SELECT actor_type FROM state_transitions WHERE gate_id=? ORDER BY rowid",
+            (str(gate_id),),
+        )
+    ]
+    assert actors == ["HUMAN", "SYSTEM", "SYSTEM"]
+    handler.handle_callback(design_callback(gate_id, "approve"))
+    assert len(db.execute("SELECT * FROM human_gate_responses").fetchall()) == 1
+
+
+@pytest.mark.parametrize(
+    ("action", "filename", "authoritative"),
+    (("spec", "SPEC-r1.md", b"# SPEC"), ("agents", "AGENTS-r1.md", b"# AGENTS")),
+)
+def test_view_callback_uses_package_document_not_latest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    filename: str,
+    authoritative: bytes,
+) -> None:
+    db, _, _, gate_id = setup_pending(tmp_path / f"view-{action}.db")
+    documents = SQLiteProjectDocumentRepository(db)
+    newer_spec = documents.create_revision(
+        PID, DocumentType.SPEC, "# unrelated", NOW, "ARCHITECT"
+    )
+    newer_agents = documents.create_revision(
+        PID, DocumentType.AGENTS, "# unrelated", NOW, "ARCHITECT"
+    )
+    documents.reject(PID, newer_spec.id)
+    documents.reject(PID, newer_agents.id)
+    bind_notification(db, gate_id)
+    fake = FakeDesignTelegram()
+    monkeypatch.setattr(
+        "syntra_build.adapters.telegram.design_approval.markdown_pdf",
+        lambda *_args: b"%PDF-1.4 review",
+    )
+    TelegramDesignApprovalHandler(
+        db, cast(TelegramClient, fake), frozenset({"123"})
+    ).handle_callback(design_callback(gate_id, action))
+    assert fake.documents == [
+        (filename, authoritative),
+        (filename.removesuffix(".md") + ".pdf", b"%PDF-1.4 review"),
+    ]
+    assert (
+        document_content_hash(authoritative.decode())
+        == db.execute(
+            "SELECT content_hash FROM project_documents WHERE content=?",
+            (authoritative.decode(),),
+        ).fetchone()[0]
+    )
+    assert db.execute("SELECT count(*) FROM project_documents").fetchone()[0] == 4
+
+
+def test_natural_feedback_joins_atomic_m17_transaction_after_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "feedback-callback.db"
+    db, packages, package_id, gate_id = setup_pending(path)
+    bind_notification(db, gate_id)
+    fake = FakeDesignTelegram()
+    TelegramDesignApprovalHandler(
+        db, cast(TelegramClient, fake), frozenset({"123"})
+    ).handle_callback(design_callback(gate_id, "changes"))
+    interaction = SQLiteTelegramGateInteractionRepository(db).active(gate_id, "123")
+    assert interaction is not None
+    assert interaction.state is TelegramInteractionState.WAITING_FEEDBACK
+    assert interaction.prompt_message_id == "700"
+    interaction_id = interaction.id
+    db.close()
+
+    db = open_database(path)
+    unrelated = TelegramInboundMessage(101, 301, 300, 123, "ignore", NOW, 7, None)
+    handler = TelegramDesignApprovalHandler(
+        db, cast(TelegramClient, fake), frozenset({"123"})
+    )
+    assert handler.handle_feedback_reply(unrelated) is False
+    wrong_reply = TelegramInboundMessage(102, 302, 300, 123, "ignore", NOW, 7, 999)
+    assert handler.handle_feedback_reply(wrong_reply) is False
+    reply = TelegramInboundMessage(103, 303, 300, 123, "Add offline mode", NOW, 7, 700)
+    assert handler.handle_feedback_reply(reply) is True
+    packages = SQLiteDesignPackageRepository(db)
+    assert packages.get(package_id).status is DesignPackageStatus.REJECTED
+    assert packages.feedback(PID) == ("Add offline mode",)
+    assert (
+        SQLiteProjectRepository(db, lambda: "unused").get(PID).state
+        is ProjectState.DESIGNING
+    )
+    row = db.execute(
+        "SELECT state FROM telegram_gate_interactions WHERE id=?", (interaction_id,)
+    ).fetchone()
+    assert row[0] == "RESOLVED"
+
+
+def test_prompt_failure_leaves_one_recoverable_interaction(tmp_path: Path) -> None:
+    db, _, package_id, gate_id = setup_pending(tmp_path / "prompt-failure.db")
+    bind_notification(db, gate_id)
+    fake = FakeDesignTelegram(fail_prompt=True)
+    handler = TelegramDesignApprovalHandler(
+        db, cast(TelegramClient, fake), frozenset({"123"})
+    )
+    with pytest.raises(RuntimeError, match="prompt failed"):
+        handler.handle_callback(design_callback(gate_id, "changes"))
+    interaction = SQLiteTelegramGateInteractionRepository(db).active(gate_id, "123")
+    assert (
+        interaction is not None
+        and interaction.state is TelegramInteractionState.PROMPTING
+    )
+    assert (
+        db.execute(
+            "SELECT count(*) FROM telegram_gate_interactions WHERE package_id=?",
+            (str(package_id),),
+        ).fetchone()[0]
+        == 1
+    )
 
 
 def test_shared_host_draft_execution_audits_known_failure(tmp_path: Path) -> None:

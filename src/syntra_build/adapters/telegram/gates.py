@@ -1,9 +1,15 @@
 """Telegram transport bridge for application-level human-gate notification."""
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from syntra_build.adapters.telegram.client import TelegramClient
+from syntra_build.domain import GateId
+from syntra_build.infrastructure.persistence import (
+    SQLiteTelegramGateNotificationRepository,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,6 +20,8 @@ class TelegramGateNotifier:
     chat_id: int
     thread_id: int | None = None
     reply_to_message_id: int | None = None
+    notifications: SQLiteTelegramGateNotificationRepository | None = None
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
     def send(self, text: str) -> str:
         match = re.search(r"Gate: ([0-9a-f-]{36})", text)
@@ -45,4 +53,12 @@ class TelegramGateNotifier:
             reply_to_message_id=self.reply_to_message_id,
             reply_markup=markup,
         )
+        if match and self.notifications is not None:
+            self.notifications.add(
+                GateId.from_string(match.group(1)),
+                str(sent.chat_id),
+                str(sent.thread_id) if sent.thread_id is not None else None,
+                str(sent.message_id),
+                self.clock(),
+            )
         return str(sent.message_id)

@@ -61,6 +61,7 @@ class TelegramClient:
         config: ApplicationConfig,
         *,
         transport: HTTPTransport = _stdlib_transport,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         token = config.secrets.telegram_bot_token
         if not config.telegram.enabled:
@@ -71,6 +72,7 @@ class TelegramClient:
         self._authorised_user_ids = frozenset(config.telegram.authorised_user_ids)
         self._poll_timeout = config.telegram.polling_timeout_seconds
         self._transport = transport
+        self._clock = clock
 
     def poll_updates(
         self, *, offset: int | None = None
@@ -297,8 +299,8 @@ class TelegramClient:
             raise TelegramProtocolError("Telegram response is missing result")
         return envelope["result"]
 
-    @staticmethod
     def _normalise_update(
+        self,
         raw_update: object,
     ) -> tuple[TelegramInboundMessage | None, TelegramCallbackQuery | None]:
         update = _expect_mapping(raw_update, "Telegram update")
@@ -325,7 +327,6 @@ class TelegramClient:
             ):
                 _log_unsupported(update_id)
                 return None, None
-            timestamp = _expect_int(source.get("date"), "callback_query.message.date")
             return None, TelegramCallbackQuery(
                 update_id,
                 callback_id,
@@ -335,7 +336,7 @@ class TelegramClient:
                     source.get("message_id"), "callback_query.message.message_id"
                 ),
                 data,
-                datetime.fromtimestamp(timestamp, UTC),
+                self._clock(),
                 _optional_int(source.get("message_thread_id"), "thread ID"),
             )
         text = raw_message.get("text")

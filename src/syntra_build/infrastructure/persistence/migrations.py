@@ -591,6 +591,20 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=13,
         name="013_telegram_gate_interactions",
         statements=(
+            """CREATE TABLE telegram_gate_notifications (
+                gate_id TEXT PRIMARY KEY REFERENCES human_gates(id),
+                chat_id TEXT NOT NULL,
+                thread_id TEXT,
+                message_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(chat_id,message_id)
+            ) STRICT""",
+            """CREATE TRIGGER telegram_gate_notifications_no_update
+                BEFORE UPDATE ON telegram_gate_notifications BEGIN
+                SELECT RAISE(ABORT,'Telegram gate notifications are immutable'); END""",
+            """CREATE TRIGGER telegram_gate_notifications_no_delete
+                BEFORE DELETE ON telegram_gate_notifications BEGIN
+                SELECT RAISE(ABORT,'Telegram gate notifications are preservation-oriented'); END""",
             """CREATE TABLE telegram_gate_interactions (
                 id TEXT PRIMARY KEY,
                 gate_id TEXT NOT NULL REFERENCES human_gates(id),

@@ -21,6 +21,79 @@ class TelegramInteractionState(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class TelegramGateNotification:
+    gate_id: GateId
+    chat_id: str
+    thread_id: str | None
+    message_id: str
+    created_at: datetime
+
+
+class SQLiteTelegramGateNotificationRepository:
+    """Bind a gate to the exact Telegram message presenting its controls."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+
+    def add(
+        self,
+        gate_id: GateId,
+        chat_id: str,
+        thread_id: str | None,
+        message_id: str,
+        created_at: datetime,
+    ) -> TelegramGateNotification:
+        try:
+            self.connection.execute(
+                """INSERT INTO telegram_gate_notifications
+                   (gate_id,chat_id,thread_id,message_id,created_at)
+                   VALUES (?,?,?,?,?)""",
+                (
+                    str(gate_id),
+                    chat_id,
+                    thread_id,
+                    message_id,
+                    created_at.isoformat(timespec="microseconds"),
+                ),
+            )
+        except sqlite3.Error as error:
+            raise PersistenceError(
+                "Telegram gate notification could not be stored"
+            ) from error
+        return self.get(gate_id)
+
+    def get(self, gate_id: GateId) -> TelegramGateNotification:
+        row = self.connection.execute(
+            "SELECT * FROM telegram_gate_notifications WHERE gate_id=?",
+            (str(gate_id),),
+        ).fetchone()
+        if row is None:
+            raise PersistenceError("Telegram gate notification does not exist")
+        return TelegramGateNotification(
+            gate_id,
+            row["chat_id"],
+            row["thread_id"],
+            row["message_id"],
+            datetime.fromisoformat(row["created_at"]).astimezone(UTC),
+        )
+
+    def validate_callback(
+        self,
+        gate_id: GateId,
+        chat_id: str,
+        thread_id: str | None,
+        message_id: str,
+    ) -> None:
+        notification = self.get(gate_id)
+        if (
+            notification.chat_id != chat_id
+            or notification.thread_id != thread_id
+            or notification.message_id != message_id
+        ):
+            raise PersistenceError("callback does not match the gate notification")
+
+
+@dataclass(frozen=True, slots=True)
 class TelegramGateInteraction:
     id: str
     gate_id: GateId

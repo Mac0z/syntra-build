@@ -78,7 +78,9 @@ from syntra_build.infrastructure.persistence.projects import (
 )
 from syntra_build.infrastructure.persistence.telegram_interactions import (
     SQLiteTelegramGateInteractionRepository,
+    SQLiteTelegramGateNotificationRepository,
     TelegramGateInteraction,
+    TelegramGateNotification,
     TelegramInteractionState,
 )
 
@@ -138,6 +140,8 @@ __all__ = [
     "SQLiteHumanGateRepository",
     "SQLiteWorkflowEventRepository",
     "SQLiteTelegramGateInteractionRepository",
+    "SQLiteTelegramGateNotificationRepository",
+    "TelegramGateNotification",
     "TelegramGateInteraction",
     "TelegramInteractionState",
     "SQLiteProviderCursorRepository",

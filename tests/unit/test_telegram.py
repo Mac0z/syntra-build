@@ -26,7 +26,10 @@ TOKEN = "synthetic-telegram-token-never-log"
 
 
 def client(
-    tmp_path: Path, transport: Callable[[Request, float], HTTPResponse]
+    tmp_path: Path,
+    transport: Callable[[Request, float], HTTPResponse],
+    *,
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> TelegramClient:
     config = load_config(
         {
@@ -45,7 +48,7 @@ def client(
         environ={},
         secrets=SecretInputs(telegram_bot_token=SecretValue(TOKEN)),
     )
-    return TelegramClient(config, transport=transport)
+    return TelegramClient(config, transport=transport, clock=clock)
 
 
 def response(result: object, *, ok: bool = True) -> HTTPResponse:
@@ -122,7 +125,12 @@ def test_authorised_text_update_is_normalised_in_utc(tmp_path: Path) -> None:
 
 
 def test_authorised_callback_is_a_distinct_immutable_record(tmp_path: Path) -> None:
-    gateway = client(tmp_path, lambda _request, _timeout: response([callback_update()]))
+    received_at = datetime(2026, 9, 10, 12, tzinfo=UTC)
+    gateway = client(
+        tmp_path,
+        lambda _request, _timeout: response([callback_update()]),
+        clock=lambda: received_at,
+    )
     item = gateway.poll_updates()[0]
     assert item.message is None
     assert item.callback == TelegramCallbackQuery(
@@ -132,7 +140,7 @@ def test_authorised_callback_is_a_distinct_immutable_record(tmp_path: Path) -> N
         300,
         201,
         "design:spec:00000000-0000-0000-0000-000000000001",
-        datetime(2023, 11, 14, 22, 13, 20, tzinfo=UTC),
+        received_at,
         7,
     )
 
