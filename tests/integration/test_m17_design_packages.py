@@ -11,11 +11,15 @@ import pytest
 
 from syntra_build.adapters.architect import SPECIFICATION_DRAFT_SCHEMA
 from syntra_build.adapters.telegram import (
+    TelegramAPIError,
     TelegramCallbackQuery,
     TelegramClient,
     TelegramGateNotifier,
     TelegramInboundMessage,
+    TelegramPolledUpdate,
     TelegramSentMessage,
+    TelegramTransportError,
+    TelegramUpdateDisposition,
 )
 from syntra_build.adapters.telegram.design_approval import TelegramDesignApprovalHandler
 from syntra_build.application.architect import ArchitectError, ArchitectFailureKind
@@ -62,7 +66,7 @@ from syntra_build.infrastructure.persistence import (
     document_content_hash,
     open_database,
 )
-from syntra_build.smoke import build_host_router
+from syntra_build.smoke import build_host_router, run_telegram_once
 
 NOW = datetime(2026, 9, 9, tzinfo=UTC)
 PID = ProjectId(UUID(int=1))
@@ -529,14 +533,27 @@ def test_real_generation_notification_router_change_and_approval_path(
 
 
 class FakeDesignTelegram:
-    def __init__(self, *, fail_prompt: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_prompt: bool = False,
+        acknowledgement_errors: list[Exception | None] | None = None,
+        document_failures: int = 0,
+    ) -> None:
         self.texts: list[str] = []
         self.documents: list[tuple[str, bytes]] = []
         self.acks: list[str] = []
         self.fail_prompt = fail_prompt
+        self.acknowledgement_errors = acknowledgement_errors or []
+        self.document_failures = document_failures
+        self.polled_callback: TelegramCallbackQuery | None = None
 
     def answer_callback(self, callback_query_id: str, text: str | None = None) -> None:
         self.acks.append(callback_query_id)
+        if self.acknowledgement_errors:
+            error = self.acknowledgement_errors.pop(0)
+            if error is not None:
+                raise error
 
     def send_text(
         self,
@@ -556,10 +573,53 @@ class FakeDesignTelegram:
     def send_document(
         self, *, filename: str, content: bytes, **kwargs: object
     ) -> TelegramSentMessage:
+        if self.document_failures:
+            self.document_failures -= 1
+            raise TelegramTransportError("document delivery failed")
         self.documents.append((filename, content))
         chat_id = kwargs["chat_id"]
         assert isinstance(chat_id, int)
         return TelegramSentMessage(701, chat_id)
+
+    def poll_updates(
+        self, *, offset: int | None = None
+    ) -> tuple[TelegramPolledUpdate, ...]:
+        if self.polled_callback is None or (
+            offset is not None and offset > self.polled_callback.update_id
+        ):
+            return ()
+        return (
+            TelegramPolledUpdate(
+                self.polled_callback.update_id,
+                TelegramUpdateDisposition.ROUTABLE,
+                callback=self.polled_callback,
+            ),
+        )
+
+
+class FakeCursor:
+    def __init__(self) -> None:
+        self.value: int | None = None
+
+    def get(self, provider: str) -> int | None:
+        assert provider == "telegram"
+        return self.value
+
+    def advance(self, provider: str, update_id: int) -> int:
+        assert provider == "telegram"
+        self.value = update_id
+        return update_id
+
+
+def terminal_acknowledgement() -> TelegramAPIError:
+    return TelegramAPIError(
+        error_code=400,
+        http_status=400,
+        description=(
+            "Bad Request: query is too old and response timeout expired or "
+            "query ID is invalid"
+        ),
+    )
 
 
 def bind_notification(db: sqlite3.Connection, gate_id: GateId) -> None:
@@ -630,6 +690,111 @@ def design_callback(gate_id: GateId, action: str) -> TelegramCallbackQuery:
     return TelegramCallbackQuery(
         100, f"callback-{action}", 123, 300, 201, f"design:{action}:{gate_id}", NOW, 7
     )
+
+
+def test_expired_acknowledgement_continues_atomic_approval(tmp_path: Path) -> None:
+    db, packages, package_id, gate_id = setup_pending(tmp_path / "expired-approve.db")
+    bind_notification(db, gate_id)
+    fake = FakeDesignTelegram(acknowledgement_errors=[terminal_acknowledgement()])
+    TelegramDesignApprovalHandler(
+        db, cast(TelegramClient, fake), frozenset({"123"})
+    ).handle_callback(design_callback(gate_id, "approve"))
+    assert packages.get(package_id).status is DesignPackageStatus.APPROVED
+    assert len(db.execute("SELECT * FROM human_gate_responses").fetchall()) == 1
+
+
+def test_expired_acknowledgement_continues_durable_changes_prompt(
+    tmp_path: Path,
+) -> None:
+    db, _, _, gate_id = setup_pending(tmp_path / "expired-changes.db")
+    bind_notification(db, gate_id)
+    fake = FakeDesignTelegram(acknowledgement_errors=[terminal_acknowledgement()])
+    TelegramDesignApprovalHandler(
+        db, cast(TelegramClient, fake), frozenset({"123"})
+    ).handle_callback(design_callback(gate_id, "changes"))
+    interaction = SQLiteTelegramGateInteractionRepository(db).active(gate_id, "123")
+    assert interaction is not None
+    assert interaction.state is TelegramInteractionState.WAITING_FEEDBACK
+    assert interaction.prompt_message_id == "700"
+
+
+@pytest.mark.parametrize(
+    "acknowledgement_error",
+    (
+        TelegramAPIError(
+            error_code=400,
+            http_status=400,
+            description="Bad Request: unexpected callback error",
+        ),
+        TelegramTransportError("network unavailable"),
+    ),
+)
+def test_nonterminal_acknowledgement_failure_stops_action(
+    tmp_path: Path, acknowledgement_error: Exception
+) -> None:
+    db, packages, package_id, gate_id = setup_pending(tmp_path / "fatal-ack.db")
+    bind_notification(db, gate_id)
+    fake = FakeDesignTelegram(acknowledgement_errors=[acknowledgement_error])
+    with pytest.raises(type(acknowledgement_error)):
+        TelegramDesignApprovalHandler(
+            db, cast(TelegramClient, fake), frozenset({"123"})
+        ).handle_callback(design_callback(gate_id, "approve"))
+    assert packages.get(package_id).status is DesignPackageStatus.PENDING_APPROVAL
+
+
+def test_replayed_document_callback_recovers_after_expired_ack_and_advances_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db, _, _, gate_id = setup_pending(tmp_path / "callback-replay.db")
+    bind_notification(db, gate_id)
+    fake = FakeDesignTelegram(
+        acknowledgement_errors=[None, terminal_acknowledgement()], document_failures=1
+    )
+    fake.polled_callback = design_callback(gate_id, "spec")
+    cursor = FakeCursor()
+    handler = TelegramDesignApprovalHandler(
+        db, cast(TelegramClient, fake), frozenset({"123"})
+    )
+    monkeypatch.setattr(
+        "syntra_build.adapters.telegram.design_approval.markdown_pdf",
+        lambda *_args: b"%PDF-1.4 review",
+    )
+    with pytest.raises(TelegramTransportError, match="document delivery failed"):
+        run_telegram_once(
+            cast(TelegramClient, fake),
+            build_host_router(
+                load_config(
+                    {"telegram": {"enabled": True, "authorised_user_ids": [123]}},
+                    environ={},
+                    secrets=SecretInputs(
+                        telegram_bot_token=SecretValue("synthetic-token")
+                    ),
+                ),
+                db,
+            ),
+            cursor,
+            handler,
+        )
+    assert cursor.value is None
+
+    run_telegram_once(
+        cast(TelegramClient, fake),
+        build_host_router(
+            load_config(
+                {"telegram": {"enabled": True, "authorised_user_ids": [123]}},
+                environ={},
+                secrets=SecretInputs(telegram_bot_token=SecretValue("synthetic-token")),
+            ),
+            db,
+        ),
+        cursor,
+        handler,
+    )
+    assert cursor.value == 100
+    assert fake.documents == [
+        ("SPEC-r1.md", b"# SPEC"),
+        ("SPEC-r1.pdf", b"%PDF-1.4 review"),
+    ]
 
 
 def test_callback_approval_requires_exact_notification_identity(tmp_path: Path) -> None:

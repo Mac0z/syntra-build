@@ -273,13 +273,13 @@ class TelegramClient:
                 },
             )
             raise TelegramTransportError("Telegram transport request failed") from error
-        if not 200 <= response.status < 300:
-            raise TelegramTransportError(
-                f"Telegram HTTP request failed with status {response.status}"
-            )
         try:
             payload = json.loads(response.body)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            if not 200 <= response.status < 300:
+                raise TelegramProtocolError(
+                    f"Telegram HTTP {response.status} response was not valid JSON"
+                ) from error
             raise TelegramProtocolError(
                 "Telegram response was not valid JSON"
             ) from error
@@ -294,7 +294,15 @@ class TelegramClient:
                 if isinstance(description_value, str)
                 else None
             )
-            raise TelegramAPIError(error_code=error_code, description=description)
+            raise TelegramAPIError(
+                error_code=error_code,
+                description=description,
+                http_status=response.status,
+            )
+        if not 200 <= response.status < 300:
+            raise TelegramProtocolError(
+                f"Telegram HTTP {response.status} returned a successful API envelope"
+            )
         if "result" not in envelope:
             raise TelegramProtocolError("Telegram response is missing result")
         return envelope["result"]

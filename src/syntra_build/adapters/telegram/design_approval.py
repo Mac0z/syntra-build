@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 from dataclasses import dataclass
 from typing import Final
 
 from syntra_build.adapters.telegram.client import TelegramClient
+from syntra_build.adapters.telegram.errors import TelegramAPIError, TelegramError
 from syntra_build.adapters.telegram.models import (
     TelegramCallbackQuery,
     TelegramInboundMessage,
@@ -39,6 +41,7 @@ _CALLBACK: Final = re.compile(
     r"design:(spec|agents|approve|changes):([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\Z"
 )
 _ARTIFACT_PREFIX: Final = "design-package:"
+_LOGGER = logging.getLogger("syntra_build.adapters.telegram.design_approval")
 
 
 def design_callback_data(action: str, gate_id: GateId) -> str:
@@ -104,11 +107,9 @@ class TelegramDesignApprovalHandler:
             raise PermissionError("responder is not authorised")
         match = _CALLBACK.fullmatch(callback.callback_data)
         if match is None:
-            self.client.answer_callback(
-                callback.callback_query_id, "Unsupported action."
-            )
+            self._acknowledge(callback.callback_query_id, "Unsupported action.")
             return
-        self.client.answer_callback(callback.callback_query_id)
+        self._acknowledge(callback.callback_query_id)
         action, raw_gate_id = match.groups()
         try:
             gate_id = GateId.from_string(raw_gate_id)
@@ -152,6 +153,44 @@ class TelegramDesignApprovalHandler:
                 text="This design approval has already been resolved.",
                 thread_id=callback.thread_id,
                 reply_to_message_id=callback.source_message_id,
+            )
+
+    def _acknowledge(self, callback_query_id: str, text: str | None = None) -> None:
+        try:
+            self.client.answer_callback(callback_query_id, text)
+        except TelegramAPIError as error:
+            if not error.is_terminal_callback_acknowledgement:
+                _LOGGER.error(
+                    "Telegram callback acknowledgement failed",
+                    extra={
+                        "event": "telegram_callback_acknowledgement_failed",
+                        "metadata": {
+                            "error_code": error.error_code,
+                            "http_status": error.http_status,
+                        },
+                    },
+                )
+                raise
+            _LOGGER.warning(
+                "Telegram callback acknowledgement is no longer possible",
+                extra={
+                    "event": "telegram_callback_acknowledgement_terminal",
+                    "metadata": {
+                        "error_code": error.error_code,
+                        "http_status": error.http_status,
+                    },
+                },
+            )
+        except TelegramError:
+            _LOGGER.error(
+                "Telegram callback acknowledgement failed",
+                extra={"event": "telegram_callback_acknowledgement_failed"},
+            )
+            raise
+        else:
+            _LOGGER.info(
+                "Telegram callback acknowledged",
+                extra={"event": "telegram_callback_acknowledged"},
             )
 
     def handle_feedback_reply(self, message: TelegramInboundMessage) -> bool:

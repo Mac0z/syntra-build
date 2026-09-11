@@ -83,6 +83,13 @@ The explicit `gate <gate-id> APPROVE` and `gate <gate-id> REQUEST_CHANGES <feedb
 remain fallback/admin commands. Full SPEC/AGENTS drafting uses a 600-second Architect
 timeout; explicitly configured shorter interactions retain their configured timeout.
 
+Callback acknowledgement is a Telegram-only presentation step. A valid Telegram API error
+that specifically reports an expired or otherwise terminally unanswerable callback is logged
+and does not prevent authoritative callback handling. Network failures, malformed responses,
+authentication failures, and unknown API errors still fail the poll without advancing its
+durable cursor. Thus a later replay can retry the authoritative action, while the cursor moves
+only after that action is safely handled.
+
 Host acceptance uses the existing commands (run `telegram-once` after each human action):
 
 ```text

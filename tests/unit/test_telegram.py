@@ -257,6 +257,44 @@ def test_api_failure_is_typed_and_safe(tmp_path: Path) -> None:
     assert TOKEN not in str(captured.value)
 
 
+def test_http_400_api_envelope_preserves_safe_telegram_details(tmp_path: Path) -> None:
+    provider_response = HTTPResponse(
+        400,
+        (
+            '{"ok":false,"error_code":400,"description":"Bad Request: '
+            "query is too old and response timeout expired or query ID is invalid "
+            + TOKEN
+            + '"}'
+        ).encode(),
+    )
+    gateway = client(tmp_path, lambda _request, _timeout: provider_response)
+
+    with pytest.raises(TelegramAPIError) as captured:
+        gateway.answer_callback("expired-query")
+
+    error = captured.value
+    assert error.error_code == 400
+    assert error.http_status == 400
+    assert error.is_terminal_callback_acknowledgement
+    assert "query is too old" in (error.description or "")
+    assert TOKEN not in str(error)
+
+
+def test_unknown_http_400_api_error_is_not_terminal_callback_failure(
+    tmp_path: Path,
+) -> None:
+    gateway = client(
+        tmp_path,
+        lambda _request, _timeout: HTTPResponse(
+            400,
+            b'{"ok":false,"error_code":400,"description":"Bad Request: unknown"}',
+        ),
+    )
+    with pytest.raises(TelegramAPIError) as captured:
+        gateway.answer_callback("query")
+    assert not captured.value.is_terminal_callback_acknowledgement
+
+
 def test_network_failure_is_wrapped_chained_and_not_logged(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
