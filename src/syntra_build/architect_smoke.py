@@ -38,6 +38,7 @@ from syntra_build.infrastructure.persistence import (
     SQLiteProjectDecisionRepository,
     SQLiteProjectDocumentRepository,
     SQLiteProjectRepository,
+    SQLiteTelegramGateNotificationRepository,
     bootstrap_database,
 )
 
@@ -172,7 +173,13 @@ def main() -> int:
                     ),
                 ).notify(
                     gate.id,
-                    TelegramGateNotifier(TelegramClient(config), args.telegram_chat_id),
+                    TelegramGateNotifier(
+                        TelegramClient(config),
+                        args.telegram_chat_id,
+                        notifications=SQLiteTelegramGateNotificationRepository(
+                            connection
+                        ),
+                    ),
                     occurred_at=datetime.now(UTC),
                 )
             print(f"Design package: {package.id}")

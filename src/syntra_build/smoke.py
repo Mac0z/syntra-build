@@ -26,6 +26,7 @@ from syntra_build.adapters.telegram import (
     TelegramUpdateDisposition,
 )
 from syntra_build.adapters.telegram.application import route_authorized_message
+from syntra_build.adapters.telegram.design_approval import TelegramDesignApprovalHandler
 from syntra_build.application.commands.models import Command, InboundMessage
 from syntra_build.application.commands.router import CommandRouter
 from syntra_build.application.commands.services import (
@@ -241,6 +242,7 @@ def run_telegram_once(
     client: TelegramSmokeClient,
     router: CommandRouter,
     cursors: ProviderCursorStore,
+    design_approvals: TelegramDesignApprovalHandler | None = None,
 ) -> int:
     """Poll from the durable offset and acknowledge each safely handled update."""
     _LOGGER.info("Telegram smoke started", extra={"event": "telegram_smoke_started"})
@@ -252,15 +254,25 @@ def run_telegram_once(
         if update.disposition is not TelegramUpdateDisposition.ROUTABLE:
             cursors.advance("telegram", update.update_id)
             continue
-        message = update.message
-        assert message is not None
-        response = route_authorized_message(message, router)
-        client.send_text(
-            chat_id=message.chat_id,
-            text=response.text,
-            thread_id=message.thread_id,
-            reply_to_message_id=message.message_id,
-        )
+        if update.callback is not None:
+            if design_approvals is None:
+                raise RuntimeError("Telegram callback routing is unavailable")
+            design_approvals.handle_callback(update.callback)
+        else:
+            message = update.message
+            assert message is not None
+            consumed = (
+                design_approvals is not None
+                and design_approvals.handle_feedback_reply(message)
+            )
+            if not consumed:
+                response = route_authorized_message(message, router)
+                client.send_text(
+                    chat_id=message.chat_id,
+                    text=response.text,
+                    thread_id=message.thread_id,
+                    reply_to_message_id=message.message_id,
+                )
         cursors.advance("telegram", update.update_id)
         processed_count += 1
     _LOGGER.info(
@@ -361,10 +373,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             validate_filesystem(config)
             connection = bootstrap_database(config)
             try:
+                telegram = TelegramClient(config)
                 count = run_telegram_once(
-                    TelegramClient(config),
+                    telegram,
                     build_host_router(config, connection),
                     SQLiteProviderCursorRepository(connection),
+                    TelegramDesignApprovalHandler(
+                        connection,
+                        telegram,
+                        frozenset(
+                            str(item) for item in config.telegram.authorised_user_ids
+                        ),
+                    ),
                 )
             finally:
                 connection.close()

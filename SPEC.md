@@ -1052,6 +1052,18 @@ A milestone may be split into smaller milestones if implementation proves broade
 
 **Exit gate:** All listed acceptance criteria pass in CI and the PR is approved against this specification.
 
+### M17.1 — Telegram design approval UX
+
+**Objective:** Present exact M17 packages through secure inline buttons, authoritative
+Markdown downloads, non-authoritative PDF review copies, and durable natural feedback.
+
+**Dependencies:** M17
+
+**Acceptance criteria:** Callback data is an untrusted gate locator and SQLite resolves the
+exact package and documents. Approval reuses the atomic M17 handler; Request Changes is
+correlated across restart. Explicit gate commands remain available. No repository is
+provisioned by this follow-up.
+
 ### M18 — GitHub repository provisioning
 
 **Objective:** Provision the approved project repository deterministically in GitHub.

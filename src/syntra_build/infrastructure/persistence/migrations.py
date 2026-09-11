@@ -587,6 +587,53 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX design_feedback_project_created ON design_change_feedback(project_id,created_at,id)",
         ),
     ),
+    Migration(
+        version=13,
+        name="013_telegram_gate_interactions",
+        statements=(
+            """CREATE TABLE telegram_gate_notifications (
+                gate_id TEXT PRIMARY KEY REFERENCES human_gates(id),
+                chat_id TEXT NOT NULL,
+                thread_id TEXT,
+                message_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(chat_id,message_id)
+            ) STRICT""",
+            """CREATE TRIGGER telegram_gate_notifications_no_update
+                BEFORE UPDATE ON telegram_gate_notifications BEGIN
+                SELECT RAISE(ABORT,'Telegram gate notifications are immutable'); END""",
+            """CREATE TRIGGER telegram_gate_notifications_no_delete
+                BEFORE DELETE ON telegram_gate_notifications BEGIN
+                SELECT RAISE(ABORT,'Telegram gate notifications are preservation-oriented'); END""",
+            """CREATE TABLE telegram_gate_interactions (
+                id TEXT PRIMARY KEY,
+                gate_id TEXT NOT NULL REFERENCES human_gates(id),
+                package_id TEXT NOT NULL REFERENCES design_packages(id),
+                chat_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                thread_id TEXT,
+                prompt_message_id TEXT,
+                state TEXT NOT NULL CHECK(state IN ('PROMPTING','WAITING_FEEDBACK','RESOLVED','CANCELLED')),
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                cancelled_at TEXT,
+                CHECK((state='WAITING_FEEDBACK' AND prompt_message_id IS NOT NULL)
+                   OR state<>'WAITING_FEEDBACK'),
+                CHECK((state='RESOLVED' AND resolved_at IS NOT NULL) OR state<>'RESOLVED'),
+                CHECK((state='CANCELLED' AND cancelled_at IS NOT NULL) OR state<>'CANCELLED')
+            ) STRICT""",
+            """CREATE UNIQUE INDEX telegram_gate_interactions_active
+                ON telegram_gate_interactions(gate_id,user_id)
+                WHERE state IN ('PROMPTING','WAITING_FEEDBACK')""",
+            """CREATE UNIQUE INDEX telegram_gate_interactions_prompt
+                ON telegram_gate_interactions(chat_id,user_id,prompt_message_id)
+                WHERE prompt_message_id IS NOT NULL""",
+            """CREATE TRIGGER telegram_gate_interactions_identity_immutable
+                BEFORE UPDATE OF gate_id,package_id,chat_id,user_id,thread_id,created_at
+                ON telegram_gate_interactions BEGIN
+                SELECT RAISE(ABORT,'Telegram gate interaction identity is immutable'); END""",
+        ),
+    ),
 )
 
 

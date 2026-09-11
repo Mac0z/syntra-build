@@ -24,7 +24,7 @@ from syntra_build.domain import (
     RepositoryVisibility,
 )
 from syntra_build.domain.gate_state_machine import GateTransitionRequest
-from syntra_build.infrastructure.persistence.connection import transaction
+from syntra_build.infrastructure.persistence.connection import transaction_scope
 from syntra_build.infrastructure.persistence.design import (
     SQLiteProjectDocumentRepository,
 )
@@ -201,7 +201,7 @@ class SQLiteDesignPackageRepository:
             True,
             "validated by M17 design package policy",
         )
-        with transaction(self.connection):
+        with transaction_scope(self.connection):
             gate = gates.record_response(
                 self._gate_transition(
                     gate_id,
