@@ -75,6 +75,10 @@ advances only after safe handling.
 
 Document buttons upload exact persisted UTF-8 Markdown as the authoritative source and an
 in-memory `fpdf2` rendering as a review copy. PDFs never enter `project_documents`.
+The renderer resets each cell to the left margin and permits character-level wrapping for
+long URLs, hashes, paths, commands, and other unbroken tokens. Both Markdown and PDF bytes
+are prepared before either upload begins, so local rendering failure cannot cause a partial
+Telegram delivery.
 Request Changes durably records the chat, user, gate, package, and ForceReply prompt message
 ID. Only a reply matching that tuple reaches the existing atomic M17 decision handler after
 a restart; unrelated text remains ordinary command input.

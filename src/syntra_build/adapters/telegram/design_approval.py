@@ -7,7 +7,7 @@ import logging
 import re
 import sqlite3
 from dataclasses import dataclass
-from typing import Final
+from typing import Any, Final
 
 from syntra_build.adapters.telegram.client import TelegramClient
 from syntra_build.adapters.telegram.errors import TelegramAPIError, TelegramError
@@ -33,6 +33,7 @@ from syntra_build.infrastructure.persistence import (
     SQLiteProjectRepository,
     SQLiteTelegramGateInteractionRepository,
     SQLiteTelegramGateNotificationRepository,
+    document_content_hash,
 )
 from syntra_build.infrastructure.persistence.connection import transaction
 from syntra_build.infrastructure.persistence.errors import PersistenceError
@@ -65,8 +66,10 @@ def markdown_pdf(
     pdf.add_page()
     pdf.set_auto_page_break(True, 15)
     pdf.set_font("Helvetica", "B", 16)
-    pdf.multi_cell(
-        0, 8, _latin(f"{project_name} - {document_type} revision {revision}")
+    _pdf_line(
+        pdf,
+        8,
+        _latin(f"{project_name} - {document_type} revision {revision}"),
     )
     pdf.ln(2)
     in_code = False
@@ -77,22 +80,37 @@ def markdown_pdf(
             continue
         if in_code:
             pdf.set_font("Courier", size=9)
-            pdf.multi_cell(0, 5, _latin(line) or " ")
+            _pdf_line(pdf, 5, _latin(line) or " ")
         elif match := re.match(r"^(#{1,6})\s+(.*)$", line):
             pdf.set_font("Helvetica", "B", max(10, 17 - len(match.group(1))))
-            pdf.multi_cell(0, 7, _latin(match.group(2)))
+            _pdf_line(pdf, 7, _latin(match.group(2)))
         elif re.match(r"^\s*([-*+] |\d+[.)] )", line):
             pdf.set_font("Helvetica", size=10)
-            pdf.multi_cell(0, 6, _latin(line))
+            _pdf_line(pdf, 6, _latin(line))
         else:
             pdf.set_font("Helvetica", size=10)
-            pdf.multi_cell(0, 6, _latin(line) or " ")
+            _pdf_line(pdf, 6, _latin(line) or " ")
     output = pdf.output()
     return bytes(output)
 
 
 def _latin(value: str) -> str:
     return value.encode("latin-1", "replace").decode("latin-1")
+
+
+def _pdf_line(pdf: Any, height: int, text: str) -> None:
+    """Render from the left margin and permit breaks inside long tokens."""
+    # fpdf2 leaves the cursor at the right edge after a multi-cell by default. Starting
+    # the next width=0 cell there gives it no usable width and raises FPDFException.
+    pdf.set_x(pdf.l_margin)
+    pdf.multi_cell(
+        0,
+        height,
+        text,
+        new_x="LMARGIN",
+        new_y="NEXT",
+        wrapmode="CHAR",
+    )
 
 
 @dataclass(slots=True)
@@ -286,6 +304,9 @@ class TelegramDesignApprovalHandler:
         expected = DocumentType.SPEC if action == "spec" else DocumentType.AGENTS
         if document.document_type is not expected:
             raise PersistenceError("package document type is invalid")
+        markdown = document.content.encode("utf-8")
+        if document_content_hash(document.content) != document.content_hash:
+            raise PersistenceError("package document content hash is invalid")
         project = SQLiteProjectRepository(self.connection, lambda: "unused").get(
             package.project_id
         )
@@ -295,9 +316,12 @@ class TelegramDesignApprovalHandler:
             f"SHA-256: {document.content_hash}\n"
             "The Markdown file is authoritative; the PDF is a review rendering."
         )
+        pdf = markdown_pdf(
+            project.name, expected.value, document.revision, document.content
+        )
         self.client.send_document(
             chat_id=callback.chat_id,
-            content=document.content.encode("utf-8"),
+            content=markdown,
             filename=f"{stem}.md",
             mime_type="text/markdown",
             caption=caption,
@@ -306,9 +330,7 @@ class TelegramDesignApprovalHandler:
         )
         self.client.send_document(
             chat_id=callback.chat_id,
-            content=markdown_pdf(
-                project.name, expected.value, document.revision, document.content
-            ),
+            content=pdf,
             filename=f"{stem}.pdf",
             mime_type="application/pdf",
             caption=caption,

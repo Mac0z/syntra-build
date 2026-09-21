@@ -797,6 +797,56 @@ def test_replayed_document_callback_recovers_after_expired_ack_and_advances_curs
     ]
 
 
+def test_pdf_preparation_failure_sends_nothing_and_keeps_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db, _, _, gate_id = setup_pending(tmp_path / "pdf-preparation.db")
+    bind_notification(db, gate_id)
+    fake = FakeDesignTelegram()
+    fake.polled_callback = design_callback(gate_id, "agents")
+    cursor = FakeCursor()
+    handler = TelegramDesignApprovalHandler(
+        db, cast(TelegramClient, fake), frozenset({"123"})
+    )
+    config = load_config(
+        {"telegram": {"enabled": True, "authorised_user_ids": [123]}},
+        environ={},
+        secrets=SecretInputs(telegram_bot_token=SecretValue("synthetic-token")),
+    )
+
+    def fail_pdf(*_args: object) -> bytes:
+        raise RuntimeError("deterministic PDF failure")
+
+    monkeypatch.setattr(
+        "syntra_build.adapters.telegram.design_approval.markdown_pdf", fail_pdf
+    )
+    with pytest.raises(RuntimeError, match="deterministic PDF failure"):
+        run_telegram_once(
+            cast(TelegramClient, fake),
+            build_host_router(config, db),
+            cursor,
+            handler,
+        )
+    assert fake.documents == []
+    assert cursor.value is None
+
+    monkeypatch.setattr(
+        "syntra_build.adapters.telegram.design_approval.markdown_pdf",
+        lambda *_args: b"%PDF-1.4 review",
+    )
+    run_telegram_once(
+        cast(TelegramClient, fake),
+        build_host_router(config, db),
+        cursor,
+        handler,
+    )
+    assert cursor.value == 100
+    assert fake.documents == [
+        ("AGENTS-r1.md", b"# AGENTS"),
+        ("AGENTS-r1.pdf", b"%PDF-1.4 review"),
+    ]
+
+
 def test_callback_approval_requires_exact_notification_identity(tmp_path: Path) -> None:
     db, packages, package_id, gate_id = setup_pending(tmp_path / "callback.db")
     bind_notification(db, gate_id)
