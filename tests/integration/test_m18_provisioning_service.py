@@ -701,3 +701,9 @@ def test_restart_reuses_identified_repository_and_durable_baseline(
     assert verified.commit_sha == persisted.commit_sha
     assert verified.spec_document_id == persisted.spec_document_id
     assert verified.agents_document_id == persisted.agents_document_id
+    transition_count = database.execute(
+        """SELECT count(*) FROM state_transitions
+        WHERE project_id=? AND previous_state='PROVISIONING' AND new_state='READY'""",
+        (str(PID),),
+    ).fetchone()[0]
+    assert transition_count == 1

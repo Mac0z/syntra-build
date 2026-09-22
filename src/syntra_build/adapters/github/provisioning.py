@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 from collections.abc import Mapping
 from urllib.parse import quote
@@ -23,6 +24,7 @@ from syntra_build.domain import RepositoryVisibility
 from syntra_build.infrastructure.config import ApplicationConfig
 
 _API_ROOT = "https://api.github.com"
+_BASE64_ASCII_WHITESPACE = frozenset(" \t\r\n\f\v")
 
 
 class GitHubProvisioningAdapter:
@@ -178,8 +180,15 @@ class GitHubProvisioningAdapter:
                 "repository content response was malformed",
             )
         try:
-            return base64.b64decode(payload["content"], validate=True)
-        except ValueError as error:
+            content = payload["content"]
+            assert isinstance(content, str)
+            normalized = "".join(
+                character
+                for character in content
+                if character not in _BASE64_ASCII_WHITESPACE
+            ).encode("ascii")
+            return base64.b64decode(normalized, validate=True)
+        except (UnicodeEncodeError, binascii.Error, ValueError) as error:
             raise ProvisioningError(
                 ProvisioningFailure.TRANSIENT, "repository content was malformed"
             ) from error

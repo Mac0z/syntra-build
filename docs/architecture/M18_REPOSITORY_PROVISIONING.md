@@ -29,6 +29,10 @@ hashes. The service independently reads both files at the remote commit and rech
 repository identity, visibility, default branch, and `main` SHA before atomically
 recording verification and transitioning `PROVISIONING` to `READY`.
 
+GitHub Contents API Base64 is normalised by removing only ASCII whitespace before
+strict decoding. This accepts GitHub's line-wrapped content while malformed characters,
+padding, encodings, and payload shapes continue to fail closed.
+
 Only `SPEC.md` and `AGENTS.md` are created by the M18 Git helper. General clones,
 worktrees, implementation branches, change-set management, and milestone Git
 operations belong to M19 and are deliberately excluded.
