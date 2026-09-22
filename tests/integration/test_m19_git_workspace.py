@@ -70,6 +70,8 @@ def test_bare_repository_worktree_commit_push_and_dirty_preservation(
     base = git.fetch(repository, str(remote), "main")
     git.ensure_bare(repository, str(remote))
     assert git.origin(repository) == str(remote)
+    with pytest.raises(WorkspaceError, match="remote identity"):
+        git.ensure_bare(repository, str(tmp_path / "different.git"))
 
     branch = "syntra/m01-foundation"
     git.create_branch(repository, branch, base)
@@ -169,3 +171,110 @@ def test_migration_015_round_trip_and_immutable_identity(tmp_path: Path) -> None
         assert row["pushed_at"] is None
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             db.execute("UPDATE git_workspaces SET base_sha=?", ("c" * 40,))
+
+
+def test_same_branch_name_is_allowed_in_separate_repositories(tmp_path: Path) -> None:
+    with database(tmp_path) as db:
+        second_project = ProjectId(UUID(int=102))
+        second_milestone = MilestoneId(UUID(int=103))
+        db.execute(
+            """INSERT INTO projects
+            (id,name,state,created_at,updated_at,last_state_change_at)
+            VALUES (?,?,'READY',?,?,?)""",
+            (
+                str(second_project),
+                "Other",
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        db.execute(
+            """INSERT INTO milestones
+            (id,project_id,sequence_number,code,title,state,created_at,updated_at)
+            VALUES (?,?,1,'M1','Foundation','READY',?,?)""",
+            (
+                str(second_milestone),
+                str(second_project),
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        db.execute(
+            """INSERT INTO github_repositories
+            (id,project_id,provider,owner,repository_name,full_name,
+             external_repository_id,visibility,default_branch,status,created_at,
+             updated_at,verified_at) VALUES
+            ('gh2',?,'github','owner','other','owner/other',2,'public','main',
+             'VERIFIED',?,?,?)""",
+            (
+                str(second_project),
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        records = SQLiteWorkspaceRepository(db)
+        repositories = (
+            ManagedRepository(
+                "managed-a",
+                PID,
+                "gh",
+                tmp_path / "a.git",
+                "https://a",
+                "main",
+                None,
+                None,
+            ),
+            ManagedRepository(
+                "managed-b",
+                second_project,
+                "gh2",
+                tmp_path / "b.git",
+                "https://b",
+                "main",
+                None,
+                None,
+            ),
+        )
+        for repository in repositories:
+            records.create_managed(repository, NOW)
+        records.create_workspace(
+            Workspace(
+                "workspace-a",
+                PID,
+                MID,
+                "managed-a",
+                "syntra/m01-foundation",
+                tmp_path / "workspace-a",
+                "main",
+                SHA,
+                SHA,
+                WorkspaceState.READY,
+                NOW,
+            )
+        )
+        records.create_workspace(
+            Workspace(
+                "workspace-b",
+                second_project,
+                second_milestone,
+                "managed-b",
+                "syntra/m01-foundation",
+                tmp_path / "workspace-b",
+                "main",
+                SHA,
+                SHA,
+                WorkspaceState.READY,
+                NOW,
+            )
+        )
+        db.commit()
+
+        assert (
+            db.execute(
+                """SELECT count(*) FROM git_workspaces
+                WHERE branch_name='syntra/m01-foundation'"""
+            ).fetchone()[0]
+            == 2
+        )

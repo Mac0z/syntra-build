@@ -712,7 +712,7 @@ MIGRATIONS: tuple[Migration, ...] = (
                 project_id TEXT NOT NULL REFERENCES projects(id),
                 milestone_id TEXT NOT NULL UNIQUE REFERENCES milestones(id),
                 git_repository_id TEXT NOT NULL REFERENCES git_repositories(id),
-                branch_name TEXT NOT NULL UNIQUE,
+                branch_name TEXT NOT NULL,
                 worktree_path TEXT NOT NULL UNIQUE,
                 base_branch TEXT NOT NULL,
                 base_sha TEXT NOT NULL CHECK(length(base_sha)=40),
@@ -722,6 +722,7 @@ MIGRATIONS: tuple[Migration, ...] = (
                 last_validated_at TEXT,
                 removed_at TEXT,
                 UNIQUE(project_id,milestone_id),
+                UNIQUE(git_repository_id,branch_name),
                 FOREIGN KEY(project_id,milestone_id) REFERENCES milestones(project_id,id)
             ) STRICT""",
             """CREATE TABLE commits (

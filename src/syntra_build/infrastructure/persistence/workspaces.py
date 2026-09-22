@@ -105,7 +105,9 @@ class SQLiteWorkspaceRepository:
         removed: bool = False,
     ) -> None:
         changed = self.connection.execute(
-            """UPDATE git_workspaces SET state=?,current_head_sha=?,last_validated_at=?,
+            """UPDATE git_workspaces
+            SET state=?,current_head_sha=COALESCE(?,current_head_sha),
+            last_validated_at=?,
             removed_at=CASE WHEN ? THEN ? ELSE removed_at END WHERE id=?""",
             (
                 state.value,

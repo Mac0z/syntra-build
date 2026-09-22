@@ -23,6 +23,14 @@ class WorkspaceError(RuntimeError):
     """A workspace identity or trusted Git invariant failed."""
 
 
+class PushNotAppliedError(WorkspaceError):
+    """An uncertain push was reconciled to an absent or unchanged remote ref."""
+
+
+class AmbiguousPushError(WorkspaceError):
+    """A push failed after it may have changed the remote."""
+
+
 @dataclass(frozen=True, slots=True)
 class ManagedRepository:
     id: str

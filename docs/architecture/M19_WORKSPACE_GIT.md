@@ -17,12 +17,22 @@ registered worktrees, reconstructs a missing worktree only from its persisted
 repository/branch/base identity, and refuses to adopt an unowned directory.
 Wrong remotes or branches fail closed. Dirty files are reported and preserved;
 removal refuses dirty worktrees and is idempotent for an already absent path.
+`REMOVED` is terminal for the persisted workspace: ordinary preparation never
+reactivates it. If a recorded branch disappears after trusted progress, recovery
+recreates it only at the exact persisted head when that commit is provable from
+local object state or the expected remote branch; it never falls back to base.
 
 Syntra alone stages an explicit path set, commits with `Syntra Build
 <syntra@localhost>`, pushes the persisted branch to the same remote branch, and
 verifies the remote SHA. Commit evidence is durable. The `commits` table omits
 `change_set_id` deliberately: M21 will add validated change-set evidence before
 policy-gated commit orchestration exists.
+
+A failed push is classified as ambiguous because the remote may have accepted
+it before the transport failed. Syntra queries the exact remote branch once: an
+expected SHA completes the operation, an absent/unchanged ref is returned to the
+bounded retry seam, and any other SHA fails closed. The uncertain push itself is
+never blindly repeated.
 
 M18 and M19 share one ephemeral askpass facility. Credentials remain outside
 URLs, arguments, Git configuration, logs, and SQLite; askpass material is

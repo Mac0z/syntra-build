@@ -12,7 +12,9 @@ from uuid import uuid4
 
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
 from syntra_build.domain.workspaces import (
+    AmbiguousPushError,
     ManagedRepository,
+    PushNotAppliedError,
     TrustedCommit,
     TrustedPushResult,
     Workspace,
@@ -127,11 +129,17 @@ class WorkspaceService:
         milestone = SQLiteMilestoneRepository(
             self.connection, lambda: str(uuid4())
         ).get(milestone_id, project_id)
+        prior_workspace = self.records.workspace_for_milestone(milestone_id)
+        if (
+            prior_workspace is not None
+            and prior_workspace.state is WorkspaceState.REMOVED
+        ):
+            raise WorkspaceError("removed workspace cannot be implicitly recreated")
         managed = self.synchronise_repository(project_id, now)
         assert managed.last_known_main_sha is not None
         branch = milestone_branch_name(milestone.sequence_number, milestone.title)
         expected_path = self._workspace_path(project_id, milestone_id)
-        workspace = self.records.workspace_for_milestone(milestone_id)
+        workspace = prior_workspace
         if workspace is None:
             if expected_path.exists():
                 raise WorkspaceError(
@@ -163,9 +171,26 @@ class WorkspaceService:
 
         local_sha = self.git.branch_sha(managed.path, workspace.branch_name)
         if local_sha is None:
-            self.git.create_branch(
-                managed.path, workspace.branch_name, workspace.base_sha
+            expected_sha = workspace.current_head_sha or workspace.base_sha
+            remote_sha = self.git.remote_branch_sha(
+                managed.path, managed.remote_url, workspace.branch_name
             )
+            if remote_sha is not None and remote_sha != expected_sha:
+                self._mark(workspace, WorkspaceState.ERROR, None, now)
+                raise WorkspaceError("remote milestone branch has unexpected HEAD")
+            if not self.git.has_commit(managed.path, expected_sha):
+                if remote_sha != expected_sha:
+                    self._mark(workspace, WorkspaceState.ERROR, None, now)
+                    raise WorkspaceError("persisted workspace HEAD cannot be recovered")
+                fetched = self.git.fetch_branch(
+                    managed.path, managed.remote_url, workspace.branch_name
+                )
+                if fetched != expected_sha or not self.git.has_commit(
+                    managed.path, expected_sha
+                ):
+                    self._mark(workspace, WorkspaceState.ERROR, None, now)
+                    raise WorkspaceError("persisted workspace HEAD cannot be recovered")
+            self.git.create_branch(managed.path, workspace.branch_name, expected_sha)
         elif workspace.current_head_sha and local_sha != workspace.current_head_sha:
             self._mark(workspace, WorkspaceState.ERROR, local_sha, now)
             raise WorkspaceError(
@@ -272,14 +297,33 @@ class WorkspaceService:
         assert managed is not None
         if inspection.head_sha != expected_commit_sha:
             raise WorkspaceError("local commit SHA differs from expected push SHA")
-        remote_sha = self.git.remote_branch_sha(
+        pre_push_sha = self.git.remote_branch_sha(
             managed.path, managed.remote_url, workspace.branch_name
         )
-        if remote_sha != expected_commit_sha:
-            self.git.push(managed.path, managed.remote_url, workspace.branch_name)
-            remote_sha = self.git.remote_branch_sha(
-                managed.path, managed.remote_url, workspace.branch_name
-            )
+        remote_sha: str | None
+        if pre_push_sha != expected_commit_sha:
+            try:
+                self.git.push(managed.path, managed.remote_url, workspace.branch_name)
+            except AmbiguousPushError:
+                reconciled_sha = self.git.remote_branch_sha(
+                    managed.path, managed.remote_url, workspace.branch_name
+                )
+                if reconciled_sha == expected_commit_sha:
+                    remote_sha = reconciled_sha
+                elif reconciled_sha == pre_push_sha:
+                    raise PushNotAppliedError(
+                        "push did not update the expected remote branch"
+                    ) from None
+                else:
+                    raise WorkspaceError(
+                        "ambiguous push produced an unexpected remote branch SHA"
+                    ) from None
+            else:
+                remote_sha = self.git.remote_branch_sha(
+                    managed.path, managed.remote_url, workspace.branch_name
+                )
+        else:
+            remote_sha = pre_push_sha
         if remote_sha != expected_commit_sha:
             raise WorkspaceError("remote branch verification was inconclusive")
         with transaction(self.connection):

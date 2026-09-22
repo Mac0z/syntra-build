@@ -8,7 +8,7 @@ from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
 from pathlib import Path
 
-from syntra_build.domain.workspaces import WorkspaceError
+from syntra_build.domain.workspaces import AmbiguousPushError, WorkspaceError
 from syntra_build.infrastructure.config import SecretValue
 from syntra_build.infrastructure.git_auth import git_authentication_environment
 
@@ -89,6 +89,20 @@ class TrustedGit:
             timeout=30,
         )
         return result.stdout.strip() if result.returncode == 0 else None
+
+    def has_commit(self, repository: Path, sha: str) -> bool:
+        result = subprocess.run(
+            ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+            cwd=repository,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+
+    def fetch_branch(self, repository: Path, remote_url: str, branch: str) -> str:
+        return self.fetch(repository, remote_url, branch)
 
     def create_branch(self, repository: Path, branch: str, base_sha: str) -> None:
         existing = self.branch_sha(repository, branch)
@@ -171,11 +185,27 @@ class TrustedGit:
 
     def push(self, repository: Path, remote_url: str, branch: str) -> None:
         with self._auth(remote_url) as environment:
-            self._run(
-                repository,
-                ["push", "origin", f"refs/heads/{branch}:refs/heads/{branch}"],
-                environment,
-            )
+            try:
+                subprocess.run(
+                    [
+                        "git",
+                        "push",
+                        "origin",
+                        f"refs/heads/{branch}:refs/heads/{branch}",
+                    ],
+                    cwd=repository,
+                    env=dict(environment),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+            except OSError, subprocess.SubprocessError:
+                # Git cannot prove whether the server accepted a request before a
+                # transport failure. Deliberately discard stderr and its cause.
+                raise AmbiguousPushError(
+                    "Git push outcome requires reconciliation"
+                ) from None
 
     def remove_worktree(self, repository: Path, path: Path) -> None:
         self._run(repository, ["worktree", "remove", str(path)])
