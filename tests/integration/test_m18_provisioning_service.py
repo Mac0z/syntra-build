@@ -513,6 +513,40 @@ def test_existing_expected_remote_main_is_not_rewritten(
     assert git.push_calls == 0
 
 
+def test_retry_reuses_attributed_empty_repository_and_pushes_baseline(
+    database: sqlite3.Connection,
+) -> None:
+    service, github, git = _identified_with_baseline(database)
+    assert github.main is None
+
+    result = service.provision(PID, NOW, "empty-repository-recovery")
+
+    repository = SQLiteProvisioningRepository(database).for_project(PID)
+    baseline = SQLiteProvisioningRepository(database).baseline(PID)
+    assert result.project_state is ProjectState.READY
+    assert github.create_calls == 0
+    assert git.commit_calls == 1
+    assert git.push_calls == 1
+    assert git.files == {"SPEC.md": SPEC.encode(), "AGENTS.md": AGENTS.encode()}
+    assert github.main == SHA
+    assert github.contents == git.files
+    assert repository is not None
+    assert repository.external_repository_id == 123
+    assert repository.visibility is RepositoryVisibility.PUBLIC
+    assert baseline is not None
+    assert baseline.commit_sha == SHA
+    assert baseline.spec_document_id.value == UUID(SPEC_ID)
+    assert baseline.spec_content_hash == _hash(SPEC)
+    assert baseline.agents_document_id.value == UUID(AGENTS_ID)
+    assert baseline.agents_content_hash == _hash(AGENTS)
+    transition_count = database.execute(
+        """SELECT count(*) FROM state_transitions
+        WHERE project_id=? AND previous_state='PROVISIONING' AND new_state='READY'""",
+        (str(PID),),
+    ).fetchone()[0]
+    assert transition_count == 1
+
+
 def test_ambiguous_push_reconciles_expected_remote_sha(
     database: sqlite3.Connection,
 ) -> None:

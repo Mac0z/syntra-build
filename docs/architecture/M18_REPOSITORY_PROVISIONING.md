@@ -12,6 +12,11 @@ identity anchor. Ambiguous mutations are inspected before any bounded retry; ide
 visibility, or remote-branch disagreement fails closed. Credentials remain inside
 trusted adapters and are never placed in a remote URL or SQLite.
 
+GitHub reports a newly created empty repository's `main` ref with HTTP 409 and the
+specific `Git Repository is empty.` response. The adapter normalises only that exact
+condition to an absent remote SHA so the approved baseline can be pushed; other 409
+responses remain failures.
+
 The initial baseline has a dedicated relational record binding the repository and
 commit SHA to the exact approved SPEC and AGENTS document IDs, revisions, and SHA-256
 hashes. The service independently reads both files at the remote commit and rechecks

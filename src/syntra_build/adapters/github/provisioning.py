@@ -140,6 +140,12 @@ class GitHubProvisioningAdapter:
         if status == 404:
             return None
         if (
+            status == 409
+            and isinstance(payload, Mapping)
+            and payload.get("message") == "Git Repository is empty."
+        ):
+            return None
+        if (
             status != 200
             or not isinstance(payload, Mapping)
             or not isinstance(payload.get("object"), Mapping)
