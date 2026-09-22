@@ -5,21 +5,37 @@ from __future__ import annotations
 
 import os
 import subprocess
-from collections.abc import Mapping
+import tempfile
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 
 from syntra_build.application.provisioning import ProvisioningError, ProvisioningFailure
 from syntra_build.domain import ProjectId
+from syntra_build.infrastructure.config import SecretValue
+
+_ASKPASS_PROGRAM = """#!/bin/sh
+case "$1" in
+  *Username*) printf '%s\\n' "$SYNTRA_GIT_USERNAME" ;;
+  *Password*) printf '%s\\n' "$SYNTRA_GIT_PASSWORD" ;;
+  *) exit 1 ;;
+esac
+"""
 
 
 class SubprocessInitialBaselineGit:
     """Create one controlled repository; this is intentionally not an M19 workspace API."""
 
     def __init__(
-        self, root: Path, *, push_environment: Mapping[str, str] | None = None
+        self,
+        root: Path,
+        *,
+        github_username: str | None = None,
+        github_token: SecretValue | None = None,
     ) -> None:
         self.root = root.resolve()
-        self.push_environment = dict(push_environment or {})
+        self.github_username = github_username
+        self.github_token = github_token
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _path(self, project_id: ProjectId) -> Path:
@@ -117,6 +133,30 @@ class SubprocessInitialBaselineGit:
             raise ProvisioningError(
                 ProvisioningFailure.LOCAL_GIT, "persisted remote identity differs"
             )
-        environment = dict(os.environ)
-        environment.update(self.push_environment)
-        self._run(["git", "push", "origin", "main:main"], path, environment)
+        with self._push_authentication_environment() as environment:
+            self._run(["git", "push", "origin", "main:main"], path, environment)
+
+    @contextmanager
+    def _push_authentication_environment(self) -> Iterator[dict[str, str]]:
+        """Supply one Git process with ephemeral username/PAT askpass credentials."""
+        if self.github_username is None or self.github_token is None:
+            raise ProvisioningError(
+                ProvisioningFailure.LOCAL_GIT,
+                "GitHub push authentication is unavailable",
+            )
+        with tempfile.TemporaryDirectory(
+            prefix=".m18-askpass-", dir=self.root
+        ) as temporary_directory:
+            askpass = Path(temporary_directory) / "askpass"
+            askpass.write_text(_ASKPASS_PROGRAM, encoding="utf-8")
+            askpass.chmod(0o700)
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "GIT_ASKPASS": str(askpass),
+                    "SYNTRA_GIT_USERNAME": self.github_username,
+                    "SYNTRA_GIT_PASSWORD": self.github_token.value,
+                }
+            )
+            yield environment

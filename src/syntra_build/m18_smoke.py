@@ -54,14 +54,6 @@ def main() -> None:
     token = config.secrets.github_token
     assert token is not None
     assert config.github.owner is not None
-    # Ephemeral process environment passes authentication without placing it in
-    # the remote URL or .git/config. Neither command output nor this report includes it.
-    push_environment = {
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
-        "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {token.value}",
-    }
     connection = bootstrap_database(config)
     try:
         service = RepositoryProvisioningService(
@@ -69,7 +61,8 @@ def main() -> None:
             GitHubProvisioningAdapter(config),
             SubprocessInitialBaselineGit(
                 config.filesystem.data_root / "m18-provisioning",
-                push_environment=push_environment,
+                github_username=config.github.owner,
+                github_token=token,
             ),
             owner=config.github.owner,
         )

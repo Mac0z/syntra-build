@@ -12,6 +12,12 @@ identity anchor. Ambiguous mutations are inspected before any bounded retry; ide
 visibility, or remote-branch disagreement fails closed. Credentials remain inside
 trusted adapters and are never placed in a remote URL or SQLite.
 
+The trusted initial push uses GitHub's HTTPS username/PAT flow through a per-operation
+askpass program. The owner and protected PAT exist only in the Git subprocess
+environment, terminal prompting is disabled, and the owner-only askpass directory is
+removed after success or failure. Neither the credential nor its helper is persisted in
+the project repository or Git configuration.
+
 GitHub reports a newly created empty repository's `main` ref with HTTP 409 and the
 specific `Git Repository is empty.` response. The adapter normalises only that exact
 condition to an absent remote SHA so the approved baseline can be pushed; other 409
