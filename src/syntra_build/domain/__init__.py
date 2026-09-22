@@ -93,6 +93,11 @@ from syntra_build.domain.projects import (
     ProjectState,
     RepositoryVisibility,
 )
+from syntra_build.domain.provisioning import (
+    GitHubRepository,
+    RepositoryBaseline,
+    RepositoryProvisioningStatus,
+)
 from syntra_build.domain.specification import (
     SPECIFICATION_DRAFT_INTERFACE_VERSION,
     DesignPackage,
@@ -113,6 +118,9 @@ __all__ = [
     "DesignPackageStatus",
     "DesignPackageId",
     "RepositoryVisibility",
+    "GitHubRepository",
+    "RepositoryBaseline",
+    "RepositoryProvisioningStatus",
     "ArchitectDesignRequest",
     "ArchitectDesignResponse",
     "ArchitectProposedDecision",

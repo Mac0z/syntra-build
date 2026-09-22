@@ -76,6 +76,9 @@ from syntra_build.infrastructure.persistence.projects import (
     ProjectStateTransition,
     SQLiteProjectRepository,
 )
+from syntra_build.infrastructure.persistence.provisioning import (
+    SQLiteProvisioningRepository,
+)
 from syntra_build.infrastructure.persistence.telegram_interactions import (
     SQLiteTelegramGateInteractionRepository,
     SQLiteTelegramGateNotificationRepository,
@@ -164,6 +167,7 @@ __all__ = [
     "ProjectStateTransition",
     "ProjectCreationContext",
     "SQLiteProjectRepository",
+    "SQLiteProvisioningRepository",
     "apply_migrations",
     "bootstrap_database",
     "check_database_integrity",
