@@ -5,13 +5,44 @@ from __future__ import annotations
 import json
 import os
 from datetime import UTC, datetime
+from pathlib import Path
 
 from syntra_build.adapters.github.provisioning import GitHubProvisioningAdapter
 from syntra_build.application.provisioning import RepositoryProvisioningService
 from syntra_build.domain import ProjectId
-from syntra_build.infrastructure.config import load_config
+from syntra_build.infrastructure.config import (
+    DEFAULT_ARCHITECT_API_KEY_PATH,
+    DEFAULT_GITHUB_TOKEN_PATH,
+    DEFAULT_HOST_CONFIG_PATH,
+    DEFAULT_TELEGRAM_TOKEN_PATH,
+    ApplicationConfig,
+    load_host_config,
+)
 from syntra_build.infrastructure.git_initial import SubprocessInitialBaselineGit
 from syntra_build.infrastructure.persistence import bootstrap_database
+
+
+def load_m18_host_config(
+    config_path: Path = DEFAULT_HOST_CONFIG_PATH,
+    *,
+    github_token_path: Path = DEFAULT_GITHUB_TOKEN_PATH,
+    telegram_token_path: Path = DEFAULT_TELEGRAM_TOKEN_PATH,
+    architect_api_key_path: Path = DEFAULT_ARCHITECT_API_KEY_PATH,
+) -> ApplicationConfig:
+    """Load established host files and require the M18 GitHub integration."""
+    config = load_host_config(
+        config_path,
+        github_token_path=github_token_path,
+        telegram_token_path=telegram_token_path,
+        architect_api_key_path=architect_api_key_path,
+    )
+    if (
+        not config.github.enabled
+        or config.github.owner is None
+        or config.secrets.github_token is None
+    ):
+        raise RuntimeError("GitHub provisioning configuration is required")
+    return config
 
 
 def main() -> None:
@@ -19,10 +50,10 @@ def main() -> None:
     raw_project_id = os.environ.get("SYNTRA_M18_PROJECT_ID")
     if not raw_project_id:
         raise SystemExit("SYNTRA_M18_PROJECT_ID is required")
-    config = load_config()
+    config = load_m18_host_config()
     token = config.secrets.github_token
-    if token is None or config.github.owner is None:
-        raise SystemExit("GitHub provisioning configuration is required")
+    assert token is not None
+    assert config.github.owner is not None
     # Ephemeral process environment passes authentication without placing it in
     # the remote URL or .git/config. Neither command output nor this report includes it.
     push_environment = {

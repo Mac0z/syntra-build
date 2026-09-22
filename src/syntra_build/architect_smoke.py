@@ -24,12 +24,7 @@ from syntra_build.domain import (
     ProjectId,
     SpecificationDraft,
 )
-from syntra_build.infrastructure.config import (
-    ApplicationConfig,
-    SecretInputs,
-    load_config,
-    read_protected_secret_file,
-)
+from syntra_build.infrastructure.config import ApplicationConfig, load_host_config
 from syntra_build.infrastructure.persistence import (
     SQLiteArchitectInteractionRepository,
     SQLiteDesignMessageRepository,
@@ -49,19 +44,11 @@ def _load_host_config(
     telegram_token_path: Path,
     github_token_path: Path,
 ) -> ApplicationConfig:
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    return load_config(
-        raw,
-        environ={},
-        secrets=SecretInputs(
-            architect_api_key=read_protected_secret_file(
-                architect_key_path, "Architect API key"
-            ),
-            telegram_bot_token=read_protected_secret_file(
-                telegram_token_path, "Telegram token"
-            ),
-            github_token=read_protected_secret_file(github_token_path, "GitHub token"),
-        ),
+    return load_host_config(
+        config_path,
+        architect_api_key_path=architect_key_path,
+        telegram_token_path=telegram_token_path,
+        github_token_path=github_token_path,
     )
 
 

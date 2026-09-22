@@ -29,3 +29,10 @@ already in `PROVISIONING` with an approved M17 package, then run
 `python -m syntra_build.m18_smoke`. The command performs the real mutation and prints
 only the safe project/repository IDs, visibility, baseline SHA, approved hashes,
 verification result, and final project state. It never deletes the repository.
+
+The command uses the same deployed configuration mechanism as the existing host smoke
+commands: `/etc/syntra-build/config.json` supplies ordinary configuration and
+`/etc/syntra-build/github-token` supplies the permission-checked GitHub credential.
+Telegram and Architect secret files are loaded through the same shared host loader when
+their integrations are enabled. Credentials are never accepted from the JSON file,
+printed, or embedded in the Git remote URL.
