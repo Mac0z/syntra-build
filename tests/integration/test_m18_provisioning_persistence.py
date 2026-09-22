@@ -26,8 +26,14 @@ def repository(
     connection = open_database(tmp_path / "state.db")
     apply_migrations(connection)
     SQLiteProjectRepository(connection, lambda: "transition").add(
-        Project(PID, "My Cool App", ProjectState.PROVISIONING, NOW, NOW,
-                canonical_name="my-cool-app")
+        Project(
+            PID,
+            "My Cool App",
+            ProjectState.PROVISIONING,
+            NOW,
+            NOW,
+            canonical_name="my-cool-app",
+        )
     )
     connection.commit()
     yield connection, SQLiteProvisioningRepository(connection)
@@ -58,9 +64,7 @@ def test_persisted_intent_cannot_be_rederived_differently(
     repository: tuple[sqlite3.Connection, SQLiteProvisioningRepository],
 ) -> None:
     connection, records = repository
-    records.ensure_intent(
-        PID, "Mac0z", "my-cool-app", RepositoryVisibility.PUBLIC, NOW
-    )
+    records.ensure_intent(PID, "Mac0z", "my-cool-app", RepositoryVisibility.PUBLIC, NOW)
     connection.commit()
 
     with pytest.raises(PersistenceError, match="does not match"):

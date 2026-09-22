@@ -28,82 +28,155 @@ _API_ROOT = "https://api.github.com"
 class GitHubProvisioningAdapter:
     """Keep authentication and provider response formats at the adapter boundary."""
 
-    def __init__(self, config: ApplicationConfig, *, transport: GitHubTransport = _stdlib_transport) -> None:
+    def __init__(
+        self,
+        config: ApplicationConfig,
+        *,
+        transport: GitHubTransport = _stdlib_transport,
+    ) -> None:
         token = config.secrets.github_token
         if not config.github.enabled or config.github.owner is None or token is None:
-            raise ProvisioningError(ProvisioningFailure.AUTHENTICATION, "GitHub provisioning is not configured")
+            raise ProvisioningError(
+                ProvisioningFailure.AUTHENTICATION,
+                "GitHub provisioning is not configured",
+            )
         self.owner, self._token = config.github.owner, token.value
         self._timeout, self._transport = config.github.api_timeout_seconds, transport
 
-    def _request(self, method: str, path: str, payload: Mapping[str, object] | None = None) -> tuple[int, object | None]:
+    def _request(
+        self, method: str, path: str, payload: Mapping[str, object] | None = None
+    ) -> tuple[int, object | None]:
         body = json.dumps(payload).encode() if payload is not None else None
-        request = Request(f"{_API_ROOT}{path}", data=body, method=method, headers={
-            "Accept": "application/vnd.github+json", "Authorization": f"Bearer {self._token}",
-            "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "syntra-build",
-            "Content-Type": "application/json",
-        })
+        request = Request(
+            f"{_API_ROOT}{path}",
+            data=body,
+            method=method,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self._token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "syntra-build",
+                "Content-Type": "application/json",
+            },
+        )
         try:
             response = self._transport(request, self._timeout)
         except Exception as error:
             if method != "GET":
-                raise AmbiguousGitHubResult("GitHub mutation result is ambiguous") from error
-            raise ProvisioningError(ProvisioningFailure.TRANSIENT, "GitHub request failed") from error
+                raise AmbiguousGitHubResult(
+                    "GitHub mutation result is ambiguous"
+                ) from error
+            raise ProvisioningError(
+                ProvisioningFailure.TRANSIENT, "GitHub request failed"
+            ) from error
         try:
             decoded = json.loads(response.body) if response.body else None
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ProvisioningError(ProvisioningFailure.TRANSIENT, "GitHub response was malformed") from error
+            raise ProvisioningError(
+                ProvisioningFailure.TRANSIENT, "GitHub response was malformed"
+            ) from error
         if response.status in {401, 403}:
-            raise ProvisioningError(ProvisioningFailure.AUTHENTICATION, "GitHub rejected the request")
+            raise ProvisioningError(
+                ProvisioningFailure.AUTHENTICATION, "GitHub rejected the request"
+            )
         if response.status >= 500:
-            raise ProvisioningError(ProvisioningFailure.TRANSIENT, "GitHub is temporarily unavailable")
+            raise ProvisioningError(
+                ProvisioningFailure.TRANSIENT, "GitHub is temporarily unavailable"
+            )
         return response.status, decoded
 
     def get_repository(self, owner: str, name: str) -> RemoteRepository | None:
-        status, payload = self._request("GET", f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}")
+        status, payload = self._request(
+            "GET", f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
+        )
         if status == 404:
             return None
         if status != 200 or not isinstance(payload, Mapping):
-            raise ProvisioningError(ProvisioningFailure.TRANSIENT, "repository lookup was inconclusive")
+            raise ProvisioningError(
+                ProvisioningFailure.TRANSIENT, "repository lookup was inconclusive"
+            )
         return self._repository(payload)
 
-    def create_repository(self, name: str, visibility: RepositoryVisibility) -> RemoteRepository:
-        status, payload = self._request("POST", "/user/repos", {
-            "name": name, "private": visibility is RepositoryVisibility.PRIVATE,
-            "auto_init": False,
-        })
+    def create_repository(
+        self, name: str, visibility: RepositoryVisibility
+    ) -> RemoteRepository:
+        status, payload = self._request(
+            "POST",
+            "/user/repos",
+            {
+                "name": name,
+                "private": visibility is RepositoryVisibility.PRIVATE,
+                "auto_init": False,
+            },
+        )
         if status == 422:
-            raise ProvisioningError(ProvisioningFailure.COLLISION, "repository name is unavailable")
+            raise ProvisioningError(
+                ProvisioningFailure.COLLISION, "repository name is unavailable"
+            )
         if status != 201 or not isinstance(payload, Mapping):
-            raise AmbiguousGitHubResult("repository create result is inconclusive")
+            raise ProvisioningError(
+                ProvisioningFailure.PROVIDER_REJECTION,
+                "GitHub rejected repository creation",
+            )
         return self._repository(payload)
 
     def configure_repository(self, owner: str, name: str) -> None:
-        status, _ = self._request("PATCH", f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}", {"default_branch": "main"})
-        # An empty repository may reject default_branch until main is pushed; verification remains authoritative.
-        if status not in {200, 422}:
-            raise AmbiguousGitHubResult("repository configuration result is inconclusive")
+        status, _ = self._request(
+            "PATCH",
+            f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}",
+            {"default_branch": "main"},
+        )
+        if status != 200:
+            raise ProvisioningError(
+                ProvisioningFailure.PROVIDER_REJECTION,
+                "GitHub rejected repository configuration",
+            )
 
     def main_sha(self, owner: str, name: str) -> str | None:
-        status, payload = self._request("GET", f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/git/ref/heads/main")
+        status, payload = self._request(
+            "GET",
+            f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/git/ref/heads/main",
+        )
         if status == 404:
             return None
-        if status != 200 or not isinstance(payload, Mapping) or not isinstance(payload.get("object"), Mapping):
-            raise ProvisioningError(ProvisioningFailure.TRANSIENT, "main branch lookup was inconclusive")
+        if (
+            status != 200
+            or not isinstance(payload, Mapping)
+            or not isinstance(payload.get("object"), Mapping)
+        ):
+            raise ProvisioningError(
+                ProvisioningFailure.TRANSIENT, "main branch lookup was inconclusive"
+            )
         sha = payload["object"].get("sha")
         if not isinstance(sha, str):
-            raise ProvisioningError(ProvisioningFailure.TRANSIENT, "main branch response was malformed")
+            raise ProvisioningError(
+                ProvisioningFailure.TRANSIENT, "main branch response was malformed"
+            )
         return sha
 
     def file_content(self, owner: str, name: str, sha: str, path: str) -> bytes | None:
-        status, payload = self._request("GET", f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/contents/{quote(path, safe='')}?ref={quote(sha, safe='')}")
+        status, payload = self._request(
+            "GET",
+            f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/contents/{quote(path, safe='')}?ref={quote(sha, safe='')}",
+        )
         if status == 404:
             return None
-        if status != 200 or not isinstance(payload, Mapping) or payload.get("encoding") != "base64" or not isinstance(payload.get("content"), str):
-            raise ProvisioningError(ProvisioningFailure.TRANSIENT, "repository content response was malformed")
+        if (
+            status != 200
+            or not isinstance(payload, Mapping)
+            or payload.get("encoding") != "base64"
+            or not isinstance(payload.get("content"), str)
+        ):
+            raise ProvisioningError(
+                ProvisioningFailure.TRANSIENT,
+                "repository content response was malformed",
+            )
         try:
             return base64.b64decode(payload["content"], validate=True)
         except ValueError as error:
-            raise ProvisioningError(ProvisioningFailure.TRANSIENT, "repository content was malformed") from error
+            raise ProvisioningError(
+                ProvisioningFailure.TRANSIENT, "repository content was malformed"
+            ) from error
 
     @staticmethod
     def _repository(payload: Mapping[str, object]) -> RemoteRepository:
@@ -124,6 +197,15 @@ class GitHubProvisioningAdapter:
             if default is not None and not isinstance(default, str):
                 raise ValueError
         except (KeyError, TypeError, ValueError) as error:
-            raise ProvisioningError(ProvisioningFailure.TRANSIENT, "repository identity response was malformed") from error
-        return RemoteRepository(external_id, owner, name, full_name,
-            RepositoryVisibility.PRIVATE if private else RepositoryVisibility.PUBLIC, default)
+            raise ProvisioningError(
+                ProvisioningFailure.TRANSIENT,
+                "repository identity response was malformed",
+            ) from error
+        return RemoteRepository(
+            external_id,
+            owner,
+            name,
+            full_name,
+            RepositoryVisibility.PRIVATE if private else RepositoryVisibility.PUBLIC,
+            default,
+        )

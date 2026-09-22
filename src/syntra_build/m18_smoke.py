@@ -47,17 +47,23 @@ def main() -> None:
             datetime.now(UTC),
             f"m18-smoke:{raw_project_id}",
         )
-        print(json.dumps({
-            "project_id": str(result.project_id), "project_name": result.project_name,
-            "repository_full_name": result.repository_full_name,
-            "visibility": result.visibility.value,
-            "github_external_repository_id": result.external_repository_id,
-            "baseline_commit_sha": result.baseline_commit_sha,
-            "approved_spec_hash": result.spec_hash,
-            "approved_agents_hash": result.agents_hash,
-            "final_verification": result.verified,
-            "project_state": result.project_state.value,
-        }, sort_keys=True))
+        print(
+            json.dumps(
+                {
+                    "project_id": str(result.project_id),
+                    "project_name": result.project_name,
+                    "repository_full_name": result.repository_full_name,
+                    "visibility": result.visibility.value,
+                    "github_external_repository_id": result.external_repository_id,
+                    "baseline_commit_sha": result.baseline_commit_sha,
+                    "approved_spec_hash": result.spec_hash,
+                    "approved_agents_hash": result.agents_hash,
+                    "final_verification": result.verified,
+                    "project_state": result.project_state.value,
+                },
+                sort_keys=True,
+            )
+        )
     finally:
         connection.close()
 

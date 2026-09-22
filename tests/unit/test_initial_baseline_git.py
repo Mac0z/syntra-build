@@ -18,12 +18,14 @@ def test_initial_commit_contains_only_exact_approved_bytes(tmp_path: Path) -> No
     path = tmp_path / str(project_id)
 
     assert len(sha) == 40
-    assert subprocess.check_output(
-        ["git", "show", f"{sha}:SPEC.md"], cwd=path
-    ) == files["SPEC.md"]
-    assert subprocess.check_output(
-        ["git", "show", f"{sha}:AGENTS.md"], cwd=path
-    ) == files["AGENTS.md"]
+    assert (
+        subprocess.check_output(["git", "show", f"{sha}:SPEC.md"], cwd=path)
+        == files["SPEC.md"]
+    )
+    assert (
+        subprocess.check_output(["git", "show", f"{sha}:AGENTS.md"], cwd=path)
+        == files["AGENTS.md"]
+    )
     assert subprocess.check_output(
         ["git", "ls-tree", "--name-only", sha], cwd=path, text=True
     ).splitlines() == ["AGENTS.md", "SPEC.md"]
