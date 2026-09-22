@@ -21,6 +21,10 @@ removal refuses dirty worktrees and is idempotent for an already absent path.
 reactivates it. If a recorded branch disappears after trusted progress, recovery
 recreates it only at the exact persisted head when that commit is provable from
 local object state or the expected remote branch; it never falls back to base.
+Inspection compares the observed HEAD with the immutable base (before the first
+trusted commit) or the persisted current HEAD. A mismatch fails closed without
+promoting the observed SHA; only a successful Syntra-owned commit advances the
+authoritative current HEAD.
 
 Syntra alone stages an explicit path set, commits with `Syntra Build
 <syntra@localhost>`, pushes the persisted branch to the same remote branch, and
@@ -33,6 +37,12 @@ it before the transport failed. Syntra queries the exact remote branch once: an
 expected SHA completes the operation, an absent/unchanged ref is returned to the
 bounded retry seam, and any other SHA fails closed. The uncertain push itself is
 never blindly repeated.
+Git does not provide a stable structured error taxonomy for push failures, and
+provider stderr is deliberately neither parsed nor propagated because it may
+contain sensitive transport detail. The subprocess adapter therefore
+conservatively classifies an unsuccessful push invocation as ambiguous and lets
+the application resolve it from the exact remote ref. Confirmed unchanged state
+is returned through the focused not-applied/retry seam.
 
 M18 and M19 share one ephemeral askpass facility. Credentials remain outside
 URLs, arguments, Git configuration, logs, and SQLite; askpass material is

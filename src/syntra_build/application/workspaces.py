@@ -232,8 +232,14 @@ class WorkspaceService:
         origin = self.git.origin(workspace.path)
         branch, head = self.git.branch(workspace.path), self.git.head(workspace.path)
         if origin != managed.remote_url or branch != workspace.branch_name:
-            self._mark(workspace, WorkspaceState.ERROR, head, now)
+            self._mark(workspace, WorkspaceState.ERROR, None, now)
             raise WorkspaceError("workspace Git identity differs")
+        expected_head = workspace.current_head_sha or workspace.base_sha
+        if head != expected_head:
+            # Observation must never turn an untrusted history change into
+            # authoritative evidence. Only trusted commit() advances the HEAD.
+            self._mark(workspace, WorkspaceState.ERROR, None, now)
+            raise WorkspaceError("workspace HEAD differs from persisted evidence")
         tracked, staged, untracked = self.git.changes(workspace.path)
         state = (
             WorkspaceState.DIRTY

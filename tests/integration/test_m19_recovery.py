@@ -209,6 +209,57 @@ def test_dirty_workspace_is_preserved(tmp_path: Path) -> None:
     assert (workspace.path / "dirty.txt").read_text() == "keep"
 
 
+def test_fresh_workspace_with_unexpected_head_fails_without_recording_it(
+    tmp_path: Path,
+) -> None:
+    db, git, service = prepared(tmp_path)
+    workspace = service.records.workspace_for_milestone(MID)
+    assert workspace is not None
+    # Model the persist-before-side-effect window before initial validation.
+    db.execute(
+        "UPDATE git_workspaces SET current_head_sha=NULL,state='ACTIVE' WHERE id=?",
+        (workspace.id,),
+    )
+    db.commit()
+    git.commits.add(UNEXPECTED)
+    git.branches[BRANCH] = UNEXPECTED
+
+    with pytest.raises(WorkspaceError, match="HEAD differs"):
+        service.inspect(PID, MID, NOW)
+
+    persisted = service.records.workspace_for_milestone(MID)
+    assert persisted is not None
+    assert persisted.state is WorkspaceState.ERROR
+    assert persisted.current_head_sha is None
+    assert persisted.base_sha == BASE
+
+
+def test_unexpected_local_history_is_not_adopted_by_inspect_commit_or_push(
+    tmp_path: Path,
+) -> None:
+    db, git, service = prepared(tmp_path)
+    workspace = service.records.workspace_for_milestone(MID)
+    assert workspace is not None and workspace.current_head_sha == BASE
+    git.commits.add(UNEXPECTED)
+    git.branches[BRANCH] = UNEXPECTED
+    (workspace.path / "change.txt").write_text("not trusted")
+
+    for operation in (
+        lambda: service.inspect(PID, MID, NOW),
+        lambda: service.commit(PID, MID, UNEXPECTED, ["change.txt"], "unsafe", NOW),
+        lambda: service.push(PID, MID, UNEXPECTED, NOW),
+    ):
+        with pytest.raises(WorkspaceError, match="HEAD differs"):
+            operation()
+        persisted = service.records.workspace_for_milestone(MID)
+        assert persisted is not None
+        assert persisted.state is WorkspaceState.ERROR
+        assert persisted.current_head_sha == BASE
+
+    assert db.execute("SELECT count(*) FROM commits").fetchone()[0] == 0
+    assert git.push_calls == 0
+
+
 def test_missing_branch_recovers_exact_persisted_head_from_remote(
     tmp_path: Path,
 ) -> None:
