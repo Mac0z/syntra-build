@@ -634,6 +634,62 @@ MIGRATIONS: tuple[Migration, ...] = (
                 SELECT RAISE(ABORT,'Telegram gate interaction identity is immutable'); END""",
         ),
     ),
+    Migration(
+        version=14,
+        name="014_github_repository_provisioning",
+        statements=(
+            """CREATE TABLE github_repositories (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL UNIQUE REFERENCES projects(id),
+                provider TEXT NOT NULL CHECK(provider='github'),
+                owner TEXT NOT NULL,
+                repository_name TEXT NOT NULL,
+                full_name TEXT NOT NULL UNIQUE,
+                external_repository_id INTEGER UNIQUE,
+                visibility TEXT NOT NULL CHECK(visibility IN ('public','private')),
+                default_branch TEXT,
+                status TEXT NOT NULL CHECK(status IN
+                    ('INTENDED','CREATE_AMBIGUOUS','IDENTIFIED','BASELINE_PUSHED','VERIFIED')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                verified_at TEXT,
+                CHECK(full_name=owner || '/' || repository_name),
+                CHECK(external_repository_id IS NOT NULL OR status IN
+                    ('INTENDED','CREATE_AMBIGUOUS'))
+            ) STRICT""",
+            """CREATE TABLE repository_baselines (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL UNIQUE REFERENCES projects(id),
+                github_repository_id TEXT NOT NULL UNIQUE REFERENCES github_repositories(id),
+                commit_sha TEXT NOT NULL CHECK(length(commit_sha)=40),
+                spec_document_id TEXT NOT NULL REFERENCES project_documents(id),
+                spec_revision INTEGER NOT NULL CHECK(spec_revision>=1),
+                spec_content_hash TEXT NOT NULL CHECK(length(spec_content_hash)=64),
+                agents_document_id TEXT NOT NULL REFERENCES project_documents(id),
+                agents_revision INTEGER NOT NULL CHECK(agents_revision>=1),
+                agents_content_hash TEXT NOT NULL CHECK(length(agents_content_hash)=64),
+                created_at TEXT NOT NULL,
+                verified_at TEXT,
+                UNIQUE(github_repository_id,commit_sha)
+            ) STRICT""",
+            """CREATE TRIGGER github_repository_identity_immutable BEFORE UPDATE OF
+                project_id,provider,owner,repository_name,full_name,visibility,created_at
+                ON github_repositories BEGIN
+                SELECT RAISE(ABORT,'repository intent identity is immutable'); END""",
+            """CREATE TRIGGER github_repository_external_id_immutable BEFORE UPDATE OF
+                external_repository_id ON github_repositories
+                WHEN OLD.external_repository_id IS NOT NULL
+                BEGIN SELECT RAISE(ABORT,'external repository id is immutable'); END""",
+            """CREATE TRIGGER repository_baselines_identity_immutable BEFORE UPDATE OF
+                id,project_id,github_repository_id,commit_sha,spec_document_id,spec_revision,
+                spec_content_hash,agents_document_id,agents_revision,agents_content_hash,created_at
+                ON repository_baselines BEGIN
+                SELECT RAISE(ABORT,'repository baseline is immutable except verification'); END""",
+            """CREATE TRIGGER repository_baselines_no_delete BEFORE DELETE ON
+                repository_baselines BEGIN
+                SELECT RAISE(ABORT,'repository baselines are preservation-oriented'); END""",
+        ),
+    ),
 )
 
 

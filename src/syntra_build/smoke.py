@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import re
 import sqlite3
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,12 +42,7 @@ from syntra_build.application.projects import (
 )
 from syntra_build.application.specification import DesignPackageDecisionHandler
 from syntra_build.domain import ProjectId
-from syntra_build.infrastructure.config import (
-    ApplicationConfig,
-    SecretInputs,
-    load_config,
-    read_protected_secret_file,
-)
+from syntra_build.infrastructure.config import ApplicationConfig, load_host_config
 from syntra_build.infrastructure.logging import configure_logging
 from syntra_build.infrastructure.persistence import (
     SQLiteDesignPackageRepository,
@@ -301,19 +295,11 @@ def _load_host_config(
     github_token_path: Path,
     architect_api_key_path: Path,
 ) -> ApplicationConfig:
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    if not isinstance(raw, Mapping) or not all(isinstance(key, str) for key in raw):
-        raise RuntimeError("configuration file must contain a JSON object")
-    return load_config(
-        raw,
-        environ={},
-        secrets=SecretInputs(
-            architect_api_key=read_protected_secret_file(
-                architect_api_key_path, "Architect API key"
-            ),
-            telegram_bot_token=read_protected_secret_file(token_path, "Telegram token"),
-            github_token=read_protected_secret_file(github_token_path, "GitHub token"),
-        ),
+    return load_host_config(
+        config_path,
+        telegram_token_path=token_path,
+        github_token_path=github_token_path,
+        architect_api_key_path=architect_api_key_path,
     )
 
 
