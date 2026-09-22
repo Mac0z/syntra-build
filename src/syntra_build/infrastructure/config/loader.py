@@ -278,7 +278,7 @@ def load_config(
                     "timeout_seconds",
                     env,
                     "SYNTRA_ARCHITECT_TIMEOUT_SECONDS",
-                    architect.get("api_timeout_seconds", 120.0),
+                    architect.get("api_timeout_seconds", 600.0),
                 ),
             ),
             reasoning_effort=str(

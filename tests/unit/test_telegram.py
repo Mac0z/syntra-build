@@ -12,6 +12,7 @@ import pytest
 from syntra_build.adapters.telegram import (
     HTTPResponse,
     TelegramAPIError,
+    TelegramCallbackQuery,
     TelegramClient,
     TelegramGateNotifier,
     TelegramInboundMessage,
@@ -25,7 +26,10 @@ TOKEN = "synthetic-telegram-token-never-log"
 
 
 def client(
-    tmp_path: Path, transport: Callable[[Request, float], HTTPResponse]
+    tmp_path: Path,
+    transport: Callable[[Request, float], HTTPResponse],
+    *,
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> TelegramClient:
     config = load_config(
         {
@@ -44,7 +48,7 @@ def client(
         environ={},
         secrets=SecretInputs(telegram_bot_token=SecretValue(TOKEN)),
     )
-    return TelegramClient(config, transport=transport)
+    return TelegramClient(config, transport=transport, clock=clock)
 
 
 def response(result: object, *, ok: bool = True) -> HTTPResponse:
@@ -68,6 +72,25 @@ def update(
             "chat": {"id": 300},
             "date": 1_700_000_000,
             "text": text,
+        },
+    }
+
+
+def callback_update(
+    *, user_id: int = 42, data: str = "design:spec:00000000-0000-0000-0000-000000000001"
+) -> dict[str, object]:
+    return {
+        "update_id": 101,
+        "callback_query": {
+            "id": "callback-1",
+            "from": {"id": user_id},
+            "data": data,
+            "message": {
+                "message_id": 201,
+                "message_thread_id": 7,
+                "chat": {"id": 300},
+                "date": 1_700_000_000,
+            },
         },
     }
 
@@ -98,6 +121,47 @@ def test_authorised_text_update_is_normalised_in_utc(tmp_path: Path) -> None:
         user_id=42,
         text="private message body",
         received_at=datetime(2023, 11, 14, 22, 13, 20, tzinfo=UTC),
+    )
+
+
+def test_authorised_callback_is_a_distinct_immutable_record(tmp_path: Path) -> None:
+    received_at = datetime(2026, 9, 10, 12, tzinfo=UTC)
+    gateway = client(
+        tmp_path,
+        lambda _request, _timeout: response([callback_update()]),
+        clock=lambda: received_at,
+    )
+    item = gateway.poll_updates()[0]
+    assert item.message is None
+    assert item.callback == TelegramCallbackQuery(
+        101,
+        "callback-1",
+        42,
+        300,
+        201,
+        "design:spec:00000000-0000-0000-0000-000000000001",
+        received_at,
+        7,
+    )
+
+
+def test_unauthorised_callback_is_rejected_at_transport_boundary(
+    tmp_path: Path,
+) -> None:
+    gateway = client(
+        tmp_path, lambda _request, _timeout: response([callback_update(user_id=999)])
+    )
+    item = gateway.poll_updates()[0]
+    assert item.disposition is TelegramUpdateDisposition.UNAUTHORISED
+    assert item.callback is None
+
+
+def test_oversize_callback_is_unsupported(tmp_path: Path) -> None:
+    gateway = client(
+        tmp_path, lambda _request, _timeout: response([callback_update(data="x" * 65)])
+    )
+    assert (
+        gateway.poll_updates()[0].disposition is TelegramUpdateDisposition.UNSUPPORTED
     )
 
 
@@ -193,6 +257,44 @@ def test_api_failure_is_typed_and_safe(tmp_path: Path) -> None:
     assert TOKEN not in str(captured.value)
 
 
+def test_http_400_api_envelope_preserves_safe_telegram_details(tmp_path: Path) -> None:
+    provider_response = HTTPResponse(
+        400,
+        (
+            '{"ok":false,"error_code":400,"description":"Bad Request: '
+            "query is too old and response timeout expired or query ID is invalid "
+            + TOKEN
+            + '"}'
+        ).encode(),
+    )
+    gateway = client(tmp_path, lambda _request, _timeout: provider_response)
+
+    with pytest.raises(TelegramAPIError) as captured:
+        gateway.answer_callback("expired-query")
+
+    error = captured.value
+    assert error.error_code == 400
+    assert error.http_status == 400
+    assert error.is_terminal_callback_acknowledgement
+    assert "query is too old" in (error.description or "")
+    assert TOKEN not in str(error)
+
+
+def test_unknown_http_400_api_error_is_not_terminal_callback_failure(
+    tmp_path: Path,
+) -> None:
+    gateway = client(
+        tmp_path,
+        lambda _request, _timeout: HTTPResponse(
+            400,
+            b'{"ok":false,"error_code":400,"description":"Bad Request: unknown"}',
+        ),
+    )
+    with pytest.raises(TelegramAPIError) as captured:
+        gateway.answer_callback("query")
+    assert not captured.value.is_terminal_callback_acknowledgement
+
+
 def test_network_failure_is_wrapped_chained_and_not_logged(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -270,6 +372,36 @@ def test_gate_notifier_uses_existing_bounded_gateway(tmp_path: Path) -> None:
             10.0,
         )
     ]
+
+
+def test_design_gate_notification_has_permanent_four_button_keyboard(
+    tmp_path: Path,
+) -> None:
+    observed: list[dict[str, list[str]]] = []
+
+    def transport(request: Request, _timeout: float) -> HTTPResponse:
+        observed.append(request_parameters(request))
+        return response({"message_id": 92, "chat": {"id": 300}})
+
+    gate = "00000000-0000-0000-0000-000000000005"
+    TelegramGateNotifier(client(tmp_path, transport), chat_id=300).send(
+        f"Gate: {gate}\nArtifact: design-package:any"
+    )
+    import json
+
+    keyboard = json.loads(observed[0]["reply_markup"][0])["inline_keyboard"]
+    assert [[button["text"] for button in row] for row in keyboard] == [
+        ["View SPEC", "View AGENTS"],
+        ["Approve", "Request changes"],
+    ]
+    callbacks = [button["callback_data"] for row in keyboard for button in row]
+    assert callbacks == [
+        f"design:spec:{gate}",
+        f"design:agents:{gate}",
+        f"design:approve:{gate}",
+        f"design:changes:{gate}",
+    ]
+    assert all(len(value.encode()) <= 64 for value in callbacks)
 
 
 def test_lifecycle_logs_exclude_text_and_token(

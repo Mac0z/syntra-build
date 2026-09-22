@@ -166,7 +166,7 @@ class ArchitectConfig:
     enabled: bool = False
     provider: str | None = None
     model: str | None = None
-    api_timeout_seconds: float = 120.0
+    api_timeout_seconds: float = 600.0
     reasoning_effort: str = "high"
 
     def __post_init__(self) -> None:

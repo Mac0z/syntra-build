@@ -113,7 +113,7 @@ class OpenAIArchitectProvider:
         api_key: str,
         model: str,
         reasoning_effort: str = "high",
-        timeout_seconds: float = 120.0,
+        timeout_seconds: float = 600.0,
         transport: Transport | None = None,
     ) -> None:
         if not api_key or not model or timeout_seconds <= 0:
