@@ -13,6 +13,7 @@ from syntra_build.domain.identifiers import JobId, MilestoneId, ProjectId
 from syntra_build.infrastructure.codex_runner import (
     DirectProcessLauncher,
     LocalCodexCliRunner,
+    SudoCodexLauncher,
     sanitised_codex_environment,
 )
 from syntra_build.infrastructure.persistence import apply_migrations, open_database
@@ -127,7 +128,8 @@ def test_environment_is_an_allowlist_without_control_plane_credentials() -> None
             "SYNTRA_DATABASE": "/secret/state.db",
         }
     )
-    assert clean["HOME"] == "/home/syntra-codex"
+    assert "HOME" not in clean
+    assert "XDG_CONFIG_HOME" not in clean
     assert not (
         {
             "GITHUB_TOKEN",
@@ -139,6 +141,38 @@ def test_environment_is_an_allowlist_without_control_plane_credentials() -> None
         }
         & clean.keys()
     )
+
+
+def test_production_launcher_has_exact_fixed_operation_and_cleanup_contract(
+    tmp_path: Path,
+) -> None:
+    helper = Path("/usr/local/libexec/syntra-codex-launch")
+    launcher = SudoCodexLauncher(helper)
+    workspace = tmp_path / "assigned"
+    base = ["sudo", "-n", str(helper), str(workspace), "/usr/bin/codex"]
+    assert [*launcher.command("/usr/bin/codex", workspace), "exec", "-"] == [
+        *base,
+        "exec",
+        "-",
+    ]
+    assert launcher.cleanup_command(workspace) == (
+        "sudo",
+        "-n",
+        str(helper),
+        "--cleanup",
+        str(workspace),
+    )
+
+
+def test_host_helper_is_syntax_valid_and_declares_isolated_acl_plan() -> None:
+    helper = Path("scripts/host/syntra-codex-launch")
+    subprocess.run(["bash", "-n", helper], check=True)
+    source = helper.read_text(encoding="utf-8")
+    assert "flock 9" in source
+    assert 'setfacl -Rm "u:$worker:rwX" "$workspace"' in source
+    assert 'setfacl -Rm "u:$worker:rX" "$repository"' in source
+    assert '/usr/bin/env -i HOME="$home" USER="$worker"' in source
+    assert "if [[ $# -ne 4 || $3 != exec || $4 != - ]]" in source
 
 
 def test_success_preserves_files_without_commit_and_captures_private_artifacts(

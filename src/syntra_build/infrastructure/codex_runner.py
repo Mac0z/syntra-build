@@ -24,15 +24,15 @@ from syntra_build.domain.codex import (
 from syntra_build.infrastructure.persistence.codex import SQLiteCodexRunRepository
 
 _MAX_PROMPT_BYTES = 1_048_576
-_ENV_ALLOWLIST = frozenset(
-    {"HOME", "LANG", "LC_ALL", "PATH", "TERM", "TMPDIR", "XDG_CONFIG_HOME"}
-)
+_ENV_ALLOWLIST = frozenset({"LANG", "LC_ALL", "PATH", "TERM", "TMPDIR"})
 
 
 class ProcessLauncher(Protocol):
     """Host-specific, narrow identity transition seam."""
 
     def command(self, executable: str, worktree: Path) -> Sequence[str]: ...
+
+    def cleanup_command(self, worktree: Path) -> Sequence[str] | None: ...
 
 
 class SudoCodexLauncher:
@@ -46,6 +46,9 @@ class SudoCodexLauncher:
     def command(self, executable: str, worktree: Path) -> Sequence[str]:
         return ("sudo", "-n", str(self.helper), str(worktree), executable)
 
+    def cleanup_command(self, worktree: Path) -> Sequence[str]:
+        return ("sudo", "-n", str(self.helper), "--cleanup", str(worktree))
+
 
 class DirectProcessLauncher:
     """Non-privileged test/development seam; never changes OS identity."""
@@ -53,6 +56,10 @@ class DirectProcessLauncher:
     def command(self, executable: str, worktree: Path) -> Sequence[str]:
         del worktree
         return (executable,)
+
+    def cleanup_command(self, worktree: Path) -> None:
+        del worktree
+        return None
 
 
 def sanitised_codex_environment(
@@ -184,6 +191,21 @@ class LocalCodexCliRunner:
             # normalised without copying provider details into application logs.
             status = CodexProcessStatus.FAILED
         finally:
+            cleanup = self._launcher.cleanup_command(request.worktree_path)
+            if cleanup is not None:
+                try:
+                    subprocess.run(
+                        cleanup,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        timeout=self._grace,
+                    )
+                except OSError, subprocess.TimeoutExpired:
+                    # A stale ACL is reconciled under the global helper lock on
+                    # the next launch; M27 can also retry explicit cleanup.
+                    pass
             with self._lock:
                 self._cancellations.pop(key, None)
         completed = datetime.now(UTC)

@@ -27,6 +27,9 @@ def main() -> int:
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--attempt", type=int, required=True)
     parser.add_argument("--worktree", type=Path, required=True)
+    parser.add_argument("--other-worktree", type=Path, required=True)
+    parser.add_argument("--secret-path", type=Path, required=True)
+    parser.add_argument("--state-path", type=Path, required=True)
     parser.add_argument("--executable", required=True)
     parser.add_argument("--agents-file", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=30.0)
@@ -44,6 +47,17 @@ def main() -> int:
         service = WorkspaceService(
             connection, TrustedGit(args.data_root / "git-auth"), args.data_root
         )
+        assigned = args.worktree.resolve(strict=True)
+        other = args.other_worktree.resolve(strict=True)
+        workspace_root = (args.data_root / "workspaces").resolve(strict=True)
+        if (
+            assigned == other
+            or workspace_root not in other.parents
+            or args.secret_path.resolve(strict=True)
+            == args.state_path.resolve(strict=True)
+        ):
+            parser.error("host-smoke denial targets are invalid")
+        before = service.inspect(project_id, milestone_id)
         runner = BoundCodexRunner(service, provider)
         result = runner.run(
             CodexRunRequest(
@@ -56,12 +70,19 @@ def main() -> int:
                 args.worktree,
                 {
                     "objective": "M20 disposable identity and isolation smoke",
-                    "task": "Create or replace .syntra-m20-smoke with the text ok.",
+                    "task": (
+                        "Report id -un, HOME, pwd, and environment variable names; "
+                        "create .syntra-m20-smoke containing ok; prove these paths "
+                        "cannot be read or written: "
+                        f"other workspace={other}, secret={args.secret_path}, "
+                        f"state={args.state_path}. Do not alter Git HEAD."
+                    ),
                 },
                 args.agents_file.read_text(encoding="utf-8"),
                 args.timeout,
             )
         )
+        after = service.inspect(project_id, milestone_id)
     print(
         json.dumps(
             {
@@ -72,6 +93,8 @@ def main() -> int:
                 "stdout_reference": result.stdout_reference,
                 "stderr_reference": result.stderr_reference,
                 "summary": result.summary,
+                "head_unchanged": before.head_sha == after.head_sha,
+                "filesystem_changes_present": not after.clean,
             },
             sort_keys=True,
         )

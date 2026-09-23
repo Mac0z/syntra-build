@@ -2,26 +2,95 @@
 # Installed root-owned (0755). This is intentionally not a general command wrapper.
 set -euo pipefail
 
-if [[ $# -ne 2 ]]; then
-  echo "usage: syntra-codex-launch <managed-worktree> <codex-executable>" >&2
+workspace_root=/var/lib/syntra-build/workspaces
+repository_root=/var/lib/syntra-build/repositories
+worker=syntra-codex
+
+validate_workspace() {
+  local candidate project milestone
+  candidate=$(realpath -e -- "$1")
+  case "$candidate" in
+    "$workspace_root"/*/*) ;;
+    *) echo "workspace is outside the managed root" >&2; exit 65 ;;
+  esac
+  project=${candidate#"$workspace_root"/}
+  project=${project%%/*}
+  milestone=${candidate##*/}
+  [[ $project =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ \
+    && $milestone =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ \
+    && $candidate == "$workspace_root/$project/$milestone" \
+    && -e $candidate/.git ]] || {
+    echo "workspace is not an exact managed M19 path" >&2
+    exit 65
+  }
+  printf '%s\n' "$candidate"
+}
+
+remove_worker_acl() {
+  local candidate=$1 project=${1#"$workspace_root"/}
+  project=${project%%/*}
+  setfacl -R -x "u:$worker" "$candidate" 2>/dev/null || true
+  find "$candidate" -type d -exec setfacl -x "d:u:$worker" {} + 2>/dev/null || true
+  if [[ -d $repository_root/$project/repo.git ]]; then
+    setfacl -R -x "u:$worker" "$repository_root/$project/repo.git" 2>/dev/null || true
+  fi
+  setfacl -x "u:$worker" "$workspace_root/$project" \
+    "$repository_root/$project" 2>/dev/null || true
+}
+
+if [[ $# -eq 2 && $1 == --cleanup ]]; then
+  workspace=$(validate_workspace "$2")
+  exec 9>/run/lock/syntra-codex.lock
+  flock 9
+  remove_worker_acl "$workspace"
+  exit 0
+fi
+
+if [[ $# -ne 4 || $3 != exec || $4 != - ]]; then
+  echo "usage: syntra-codex-launch <managed-worktree> <approved-codex> exec -" >&2
   exit 64
 fi
-workspace=$(realpath -e -- "$1")
-workspace_root=/var/lib/syntra-build/workspaces
-case "$workspace/" in
-  "$workspace_root"/*/) ;;
-  *) echo "workspace is outside the managed root" >&2; exit 65 ;;
-esac
+workspace=$(validate_workspace "$1")
 case "$2" in
   /usr/bin/codex|/usr/local/bin/codex) executable=$2 ;;
   *) echo "executable is not an approved Codex CLI path" >&2; exit 65 ;;
 esac
-[[ -x $executable && -e $workspace/.git ]] || {
-  echo "Codex executable or registered Git worktree is unavailable" >&2
+[[ -x $executable ]] || {
+  echo "Codex executable is unavailable" >&2
   exit 66
 }
-shift 2
+
+project=${workspace#"$workspace_root"/}
+project=${project%%/*}
+repository="$repository_root/$project/repo.git"
+[[ -d $repository ]] || { echo "managed repository is unavailable" >&2; exit 66; }
+home=$(getent passwd "$worker" | cut -d: -f6)
+[[ -n $home && -d $home ]] || { echo "worker home is unavailable" >&2; exit 66; }
+
+# One shared Unix identity cannot isolate two simultaneous ACL grants. Serialize
+# at this privilege boundary, reconcile stale access left by interruption, then
+# grant only this persisted workspace and its project-specific Git metadata.
+exec 9>/run/lock/syntra-codex.lock
+flock 9
+find "$workspace_root" -mindepth 2 -maxdepth 2 -type d \
+  -exec setfacl -R -x "u:$worker" {} + 2>/dev/null || true
+find "$workspace_root" -mindepth 2 -type d \
+  -exec setfacl -x "d:u:$worker" {} + 2>/dev/null || true
+find "$repository_root" -mindepth 2 -maxdepth 2 -type d \
+  -exec setfacl -R -x "u:$worker" {} + 2>/dev/null || true
+setfacl -m "u:$worker:x" /var/lib/syntra-build "$workspace_root" \
+  "$workspace_root/$project" "$repository_root" "$repository_root/$project"
+setfacl -Rm "u:$worker:rwX" "$workspace"
+find "$workspace" -type d -exec setfacl -m "d:u:$worker:rwX" {} +
+setfacl -Rm "u:$worker:rX" "$repository"
+trap 'remove_worker_acl "$workspace"' EXIT
 
 cd -- "$workspace"
-exec /usr/bin/setpriv --reuid=syntra-codex --regid=syntra-codex \
-  --init-groups --no-new-privs "$executable" "$@"
+/usr/bin/setpriv --reuid="$worker" --regid="$worker" --init-groups --no-new-privs \
+  /usr/bin/env -i HOME="$home" USER="$worker" LOGNAME="$worker" \
+  XDG_CONFIG_HOME="$home/.config" PATH=/usr/local/bin:/usr/bin:/bin \
+  LANG=C.UTF-8 LC_ALL=C.UTF-8 TMPDIR=/tmp \
+  GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 "$executable" exec - &
+child=$!
+trap 'kill -TERM "$child" 2>/dev/null || true' TERM INT HUP
+wait "$child"
