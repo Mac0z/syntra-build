@@ -30,6 +30,10 @@ class PullRequestRecord:
     title: str
 
 
+class PullRequestPersistenceConflict(RuntimeError):
+    """Persisted ownership differs from the requested PR lifecycle identity."""
+
+
 class SQLitePullRequestRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
@@ -42,6 +46,19 @@ class SQLitePullRequestRepository:
         body_hash: str,
         now: datetime,
     ) -> None:
+        existing = self.connection.execute(
+            "SELECT * FROM pull_request_creation_intents WHERE milestone_id=?",
+            (str(request.milestone_id),),
+        ).fetchone()
+        if existing is not None and (
+            existing["project_id"] != str(request.project_id)
+            or existing["github_repository_id"] != github_repository_id
+            or existing["head_branch"] != request.head_branch
+            or existing["base_branch"] != request.base_branch
+        ):
+            raise PullRequestPersistenceConflict(
+                "persisted pull request intent identity differs"
+            )
         self.connection.execute(
             """INSERT INTO pull_request_creation_intents
             (id,project_id,milestone_id,github_repository_id,correlation_id,
@@ -65,6 +82,19 @@ class SQLitePullRequestRepository:
                 now.isoformat(),
             ),
         )
+
+    def mark_intent(
+        self, milestone_id: MilestoneId, status: str, now: datetime
+    ) -> None:
+        if status not in {"RECONCILING", "AMBIGUOUS", "VERIFIED", "BLOCKED"}:
+            raise ValueError("invalid pull request intent status")
+        cursor = self.connection.execute(
+            """UPDATE pull_request_creation_intents SET status=?,updated_at=?
+            WHERE milestone_id=?""",
+            (status, now.isoformat(), str(milestone_id)),
+        )
+        if cursor.rowcount != 1:
+            raise PullRequestPersistenceConflict("pull request intent does not exist")
 
     def for_milestone(self, milestone_id: MilestoneId) -> PullRequestRecord | None:
         row = self.connection.execute(
@@ -132,7 +162,9 @@ class SQLitePullRequestRepository:
                 or existing.head_branch != descriptor.head_branch
                 or existing.base_branch != descriptor.base_branch
             ):
-                raise ValueError("persisted pull request identity differs")
+                raise PullRequestPersistenceConflict(
+                    "persisted pull request identity differs"
+                )
             self.connection.execute(
                 """UPDATE pull_requests SET state=?,head_sha=?,web_url=?,title=?,updated_at=?,
                 merged_at=?,merge_commit_sha=?,closed_at=?,last_reconciled_at=? WHERE id=?""",

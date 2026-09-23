@@ -879,6 +879,8 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=18,
         name="018_pull_request_lifecycle",
         statements=(
+            """CREATE UNIQUE INDEX one_commit_per_change_set
+                ON commits(change_set_id) WHERE change_set_id IS NOT NULL""",
             "ALTER TABLE milestones ADD COLUMN active_pull_request_id TEXT REFERENCES pull_requests(id)",
             """CREATE TABLE pull_request_creation_intents (
                 id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
@@ -907,6 +909,10 @@ MIGRATIONS: tuple[Migration, ...] = (
             ) STRICT""",
             "CREATE UNIQUE INDEX one_open_pr_per_milestone ON pull_requests(milestone_id) WHERE state='OPEN'",
             "CREATE INDEX pull_requests_project_state ON pull_requests(project_id,state)",
+            """CREATE TRIGGER pull_request_intent_identity_immutable BEFORE UPDATE OF
+                project_id,milestone_id,github_repository_id,head_branch,base_branch,
+                created_at ON pull_request_creation_intents BEGIN
+                SELECT RAISE(ABORT,'pull request intent identity is immutable'); END""",
             """CREATE TRIGGER pull_requests_identity_immutable BEFORE UPDATE OF
                 id,project_id,milestone_id,github_repository_id,external_pr_number,
                 head_branch,base_branch,created_at ON pull_requests BEGIN

@@ -23,6 +23,7 @@ from syntra_build.domain.pull_requests import (
 )
 from syntra_build.infrastructure.persistence.connection import transaction
 from syntra_build.infrastructure.persistence.pull_requests import (
+    PullRequestPersistenceConflict,
     PullRequestRecord,
     SQLitePullRequestRepository,
 )
@@ -101,20 +102,45 @@ class PullRequestLifecycleService:
                 PullRequestFailure.PRECONDITION,
                 "accepted M21 change-set evidence is required",
             )
-        files = json.loads(evidence["files_json"])
-        commit = self.workspace.commit(
-            project_id,
-            milestone_id,
-            evidence["head_sha_before_commit"],
-            [item["path"] for item in files],
-            commit_message or f"Apply accepted ChangeSet {change_set_id}",
-            now,
-            expected_diff_hash=evidence["diff_hash"],
-        )
+        existing = self.connection.execute(
+            "SELECT * FROM commits WHERE change_set_id=?", (change_set_id,)
+        ).fetchall()
+        if len(existing) > 1:
+            raise PullRequestError(
+                PullRequestFailure.PRECONDITION,
+                "accepted change set has conflicting trusted commits",
+            )
+        if existing:
+            commit_row = existing[0]
+            if (
+                commit_row["project_id"] != str(project_id)
+                or commit_row["milestone_id"] != str(milestone_id)
+                or commit_row["worktree_id"] != evidence["worktree_id"]
+                or commit_row["branch_name"] != evidence["branch_name"]
+                or commit_row["validated_diff_hash"] != evidence["diff_hash"]
+                or commit_row["parent_sha"] != evidence["head_sha_before_commit"]
+            ):
+                raise PullRequestError(
+                    PullRequestFailure.PRECONDITION,
+                    "trusted commit identity conflicts with accepted change set",
+                )
+            commit_sha = commit_row["commit_sha"]
+        else:
+            files = json.loads(evidence["files_json"])
+            commit = self.workspace.commit(
+                project_id,
+                milestone_id,
+                evidence["head_sha_before_commit"],
+                [item["path"] for item in files],
+                commit_message or f"Apply accepted ChangeSet {change_set_id}",
+                now,
+                expected_diff_hash=evidence["diff_hash"],
+            )
+            commit_sha = commit.commit_sha
         return self.establish_for_commit(
             project_id,
             milestone_id,
-            commit.commit_sha,
+            commit_sha,
             change_set_id,
             correlation_id,
             now=now,
@@ -194,15 +220,29 @@ class PullRequestLifecycleService:
             title,
             body,
         )
-        with transaction(self.connection):
-            self.records.ensure_intent(
-                str(uuid4()),
-                repo["id"],
-                request,
-                sha256(body.encode()).hexdigest(),
-                now,
-            )
-        candidate = self._create_or_get(repo["full_name"], request)
+        try:
+            with transaction(self.connection):
+                self.records.ensure_intent(
+                    str(uuid4()),
+                    repo["id"],
+                    request,
+                    sha256(body.encode()).hexdigest(),
+                    now,
+                )
+        except PullRequestPersistenceConflict as error:
+            raise PullRequestError(
+                PullRequestFailure.PR_IDENTITY_MISMATCH, str(error)
+            ) from error
+        try:
+            candidate = self._create_or_get(repo["full_name"], request, now)
+        except PullRequestError as error:
+            if error.failure in {
+                PullRequestFailure.PR_COLLISION,
+                PullRequestFailure.PR_IDENTITY_MISMATCH,
+            }:
+                with transaction(self.connection):
+                    self.records.mark_intent(milestone_id, "BLOCKED", now)
+            raise
         live = self.github.get(
             repo["full_name"], candidate.pull_request_number, project_id, milestone_id
         )
@@ -216,17 +256,39 @@ class PullRequestLifecycleService:
                 raise
             # Preserve independently observed terminal state for later recovery;
             # M22 still fails closed and never creates a replacement.
-            with transaction(self.connection):
-                self.records.save_verified(str(uuid4()), repo["id"], live, title, now)
+            try:
+                with transaction(self.connection):
+                    self.records.save_verified(
+                        str(uuid4()), repo["id"], live, title, now
+                    )
+            except PullRequestPersistenceConflict as conflict:
+                raise PullRequestError(
+                    PullRequestFailure.PR_IDENTITY_MISMATCH, str(conflict)
+                ) from conflict
             raise
-        with transaction(self.connection):
-            return self.records.save_verified(
-                str(uuid4()), repo["id"], live, title, now
-            )
+        try:
+            with transaction(self.connection):
+                return self.records.save_verified(
+                    str(uuid4()), repo["id"], live, title, now
+                )
+        except PullRequestPersistenceConflict as error:
+            raise PullRequestError(
+                PullRequestFailure.PR_IDENTITY_MISMATCH, str(error)
+            ) from error
 
     def _create_or_get(
-        self, full_name: str, request: PullRequestCreateRequest
+        self, full_name: str, request: PullRequestCreateRequest, now: datetime
     ) -> PullRequestDescriptor:
+        persisted = self.records.for_milestone(request.milestone_id)
+        if persisted is not None:
+            # A known implementation PR is authoritative ownership evidence even
+            # when GitHub no longer lists it as open. Observe it; never replace it.
+            return self.github.get(
+                full_name,
+                persisted.external_pr_number,
+                request.project_id,
+                request.milestone_id,
+            )
         existing = list(
             self.github.find_open(
                 full_name, request.head_branch, request.project_id, request.milestone_id
@@ -254,6 +316,8 @@ class PullRequestLifecycleService:
         try:
             return self.github.create(full_name, request)
         except AmbiguousGitHubResult:
+            with transaction(self.connection):
+                self.records.mark_intent(request.milestone_id, "AMBIGUOUS", now)
             reconciled = list(
                 self.github.find_open(
                     full_name,
@@ -272,12 +336,20 @@ class PullRequestLifecycleService:
             if len(matches) == 1:
                 return matches[0]
             if reconciled:
+                with transaction(self.connection):
+                    self.records.mark_intent(request.milestone_id, "BLOCKED", now)
                 raise PullRequestError(
                     PullRequestFailure.PR_COLLISION,
                     "ambiguous create found conflicting pull requests",
                 ) from None
             # A confirmed absence permits exactly one bounded retry.
-            return self.github.create(full_name, request)
+            try:
+                return self.github.create(full_name, request)
+            except AmbiguousGitHubResult as error:
+                raise PullRequestError(
+                    PullRequestFailure.AMBIGUOUS,
+                    "bounded pull request creation retry remained ambiguous",
+                ) from error
 
     @staticmethod
     def _verify(

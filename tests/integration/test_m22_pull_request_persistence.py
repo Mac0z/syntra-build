@@ -19,6 +19,7 @@ from syntra_build.infrastructure.persistence.migrations import (
     apply_migrations,
 )
 from syntra_build.infrastructure.persistence.pull_requests import (
+    PullRequestPersistenceConflict,
     SQLitePullRequestRepository,
 )
 
@@ -115,3 +116,125 @@ def test_pr_identity_constraints_and_mutable_reconciliation(tmp_path: Path) -> N
                 merge_commit_sha,closed_at,last_reconciled_at FROM pull_requests WHERE id=?""",
                 (str(uuid4()), first.id),
             )
+
+
+def test_change_set_commit_and_intent_identity_are_unique(tmp_path: Path) -> None:
+    with open_database(tmp_path / "constraints.sqlite") as connection:
+        apply_migrations(connection)
+        project, milestone, repository = _seed(connection)
+        now = datetime.now(UTC).isoformat()
+        git_repository, workspace, change_set = (str(uuid4()) for _ in range(3))
+        connection.execute(
+            """INSERT INTO git_repositories
+            (id,project_id,github_repository_id,repository_path,remote_name,remote_url,
+             default_branch,last_known_main_sha,created_at,updated_at)
+            VALUES (?,?,?,?,'origin',?,'main',?,?,?)""",
+            (
+                git_repository,
+                str(project),
+                repository,
+                "/tmp/repo.git",
+                "https://github.com/owner/repo.git",
+                "a" * 40,
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            """INSERT INTO git_workspaces
+            (id,project_id,milestone_id,git_repository_id,branch_name,worktree_path,
+             base_branch,base_sha,current_head_sha,state,created_at)
+            VALUES (?,?,?,?,?,?,'main',?,?,'READY',?)""",
+            (
+                workspace,
+                str(project),
+                str(milestone),
+                git_repository,
+                "syntra/m22",
+                "/tmp/worktree",
+                "a" * 40,
+                "b" * 40,
+                now,
+            ),
+        )
+        diff_hash = "sha256:" + "1" * 64
+        connection.execute(
+            """INSERT INTO change_sets
+            (id,interface_version,project_id,milestone_id,worktree_id,branch_name,
+             base_sha,head_sha_before_commit,diff_hash,is_empty,files_json,decision,
+             correlation_id,scanner_version,policy_version,created_at)
+            VALUES (?,'1.0',?,?,?,?,?,?,?,0,'[]','ACCEPT','c','s','p',?)""",
+            (
+                change_set,
+                str(project),
+                str(milestone),
+                workspace,
+                "syntra/m22",
+                "a" * 40,
+                "a" * 40,
+                diff_hash,
+                now,
+            ),
+        )
+
+        def insert_commit(identifier: str, sha: str) -> None:
+            connection.execute(
+                """INSERT INTO commits
+                (id,project_id,milestone_id,worktree_id,commit_sha,parent_sha,
+                 branch_name,message,author_name,author_email,created_at,change_set_id,
+                 validated_diff_hash) VALUES (?,?,?,?,?,?,?,'message','Syntra Build',
+                 'syntra@localhost',?,?,?)""",
+                (
+                    identifier,
+                    str(project),
+                    str(milestone),
+                    workspace,
+                    sha,
+                    "a" * 40,
+                    "syntra/m22",
+                    now,
+                    change_set,
+                    diff_hash,
+                ),
+            )
+
+        insert_commit(str(uuid4()), "b" * 40)
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_commit(str(uuid4()), "c" * 40)
+
+        from syntra_build.domain.pull_requests import PullRequestCreateRequest
+
+        records = SQLitePullRequestRepository(connection)
+        request = PullRequestCreateRequest(
+            "1.0",
+            "c",
+            project,
+            milestone,
+            77,
+            "syntra/m22",
+            "main",
+            "b" * 40,
+            "title",
+            "body",
+        )
+        with transaction(connection):
+            records.ensure_intent(
+                str(uuid4()), repository, request, "2" * 64, datetime.now(UTC)
+            )
+        wrong = PullRequestCreateRequest(
+            "1.0",
+            "c",
+            project,
+            milestone,
+            77,
+            "other",
+            "main",
+            "b" * 40,
+            "title",
+            "body",
+        )
+        with pytest.raises(PullRequestPersistenceConflict):
+            with transaction(connection):
+                records.ensure_intent(
+                    str(uuid4()), repository, wrong, "2" * 64, datetime.now(UTC)
+                )
