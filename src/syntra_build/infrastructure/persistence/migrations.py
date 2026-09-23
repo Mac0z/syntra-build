@@ -921,6 +921,71 @@ MIGRATIONS: tuple[Migration, ...] = (
                 SELECT RAISE(ABORT,'pull requests are preservation-oriented'); END""",
         ),
     ),
+    Migration(
+        version=19,
+        name="019_ci_monitoring",
+        statements=(
+            "CREATE UNIQUE INDEX pull_requests_ci_identity ON pull_requests(project_id,milestone_id,id)",
+            """CREATE TABLE ci_runs (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                milestone_id TEXT NOT NULL,
+                pull_request_id TEXT NOT NULL,
+                head_sha TEXT NOT NULL CHECK(length(head_sha)=40),
+                attempt_number INTEGER NOT NULL CHECK(attempt_number>0),
+                overall_status TEXT NOT NULL CHECK(overall_status IN
+                    ('QUEUED','RUNNING','PASSED','FAILED','CANCELLED','UNKNOWN')),
+                failure_classification TEXT CHECK(failure_classification IS NULL OR
+                    failure_classification IN ('IMPLEMENTATION','TEST','CONFIGURATION',
+                    'TRANSIENT_INFRASTRUCTURE','EXTERNAL_DEPENDENCY','UNKNOWN')),
+                external_workflow_run_id TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                last_checked_at TEXT NOT NULL,
+                summary_json TEXT NOT NULL CHECK(json_valid(summary_json)),
+                retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count>=0),
+                next_check_at TEXT,
+                UNIQUE(pull_request_id,head_sha,attempt_number),
+                FOREIGN KEY(project_id,milestone_id,pull_request_id)
+                    REFERENCES pull_requests(project_id,milestone_id,id)
+            ) STRICT""",
+            """CREATE TABLE ci_checks (
+                id TEXT PRIMARY KEY,
+                ci_run_id TEXT NOT NULL REFERENCES ci_runs(id),
+                name TEXT NOT NULL,
+                external_check_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('QUEUED','RUNNING','COMPLETED')),
+                conclusion TEXT CHECK(conclusion IS NULL OR conclusion IN
+                    ('PASSED','FAILED','CANCELLED','SKIPPED','NEUTRAL','UNKNOWN')),
+                started_at TEXT,
+                completed_at TEXT,
+                details_url TEXT,
+                failure_summary TEXT,
+                UNIQUE(ci_run_id,external_check_id)
+            ) STRICT""",
+            "CREATE INDEX ci_runs_milestone_checked ON ci_runs(milestone_id,last_checked_at)",
+            "CREATE INDEX ci_checks_run_status ON ci_checks(ci_run_id,status)",
+            """CREATE TRIGGER ci_runs_identity_immutable BEFORE UPDATE OF
+                id,project_id,milestone_id,pull_request_id,head_sha,started_at
+                ON ci_runs BEGIN SELECT RAISE(ABORT,'CI run identity is immutable'); END""",
+            """CREATE TRIGGER ci_runs_no_delete BEFORE DELETE ON ci_runs BEGIN
+                SELECT RAISE(ABORT,'CI runs are preservation-oriented'); END""",
+            """CREATE TRIGGER ci_checks_identity_immutable BEFORE UPDATE OF
+                id,ci_run_id,external_check_id ON ci_checks BEGIN
+                SELECT RAISE(ABORT,'CI check identity is immutable'); END""",
+            """CREATE TRIGGER ci_checks_no_delete BEFORE DELETE ON ci_checks BEGIN
+                SELECT RAISE(ABORT,'CI checks are preservation-oriented'); END""",
+        ),
+    ),
+    Migration(
+        version=20,
+        name="020_ci_reconcile_job_uniqueness",
+        statements=(
+            """CREATE UNIQUE INDEX one_active_ci_reconcile_per_milestone
+                ON jobs(milestone_id,job_type) WHERE job_type='CI_RECONCILE'
+                AND state IN ('QUEUED','DISPATCHED','RUNNING','WAITING_EXTERNAL','RETRY_WAIT')""",
+        ),
+    ),
 )
 
 

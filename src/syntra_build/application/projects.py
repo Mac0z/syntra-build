@@ -251,9 +251,34 @@ class SQLiteProjectQueryService:
     def __init__(self, projects: SQLiteProjectRepository):
         self._projects = projects
 
-    @staticmethod
-    def _summary(project: Project) -> ProjectSummary:
-        return ProjectSummary(project.id, project.name, project.state)
+    def _summary(self, project: Project) -> ProjectSummary:
+        from syntra_build.domain.ci import CI_INTERFACE_VERSION, CIProgress
+        from syntra_build.domain.identifiers import MilestoneId
+        from syntra_build.infrastructure.persistence.ci import SQLiteCIRepository
+
+        row = self._projects.connection.execute(
+            """SELECT m.id,p.id AS pull_request_id,p.external_pr_number,p.head_sha
+            FROM milestones m JOIN pull_requests p ON p.id=m.active_pull_request_id
+            WHERE m.project_id=? AND m.state='CI_RUNNING'
+            ORDER BY m.sequence_number LIMIT 1""",
+            (str(project.id),),
+        ).fetchone()
+        progress = None
+        if row is not None:
+            run = SQLiteCIRepository(self._projects.connection).latest_for_head(
+                row["pull_request_id"], row["head_sha"]
+            )
+            if run is not None and run.head_sha == row["head_sha"]:
+                progress = CIProgress(
+                    CI_INTERFACE_VERSION,
+                    project.id,
+                    MilestoneId.from_string(row["id"]),
+                    row["external_pr_number"],
+                    run.head_sha,
+                    run.overall_status,
+                    run.checks,
+                )
+        return ProjectSummary(project.id, project.name, project.state, progress)
 
     def list_projects(self) -> tuple[ProjectSummary, ...]:
         return tuple(self._summary(project) for project in self._projects.list_all())

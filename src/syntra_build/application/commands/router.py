@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+from syntra_build.application.ci_status import format_ci_progress
 from syntra_build.application.commands.models import (
     Command,
     CommandResponse,
@@ -182,7 +183,10 @@ class CommandRouter:
 
     @staticmethod
     def _format_status(project: ProjectSummary) -> str:
-        return f"Project: {project.name}\nState: {project.state.value}"
+        text = f"Project: {project.name}\nState: {project.state.value}"
+        if project.ci_progress is not None:
+            text += f"\n{format_ci_progress(project.ci_progress)}"
+        return text
 
     @staticmethod
     def _response(

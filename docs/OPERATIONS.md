@@ -600,6 +600,17 @@ completed:
 stop polling
 ```
 
+Terminal CI failures classified as transient infrastructure (and cancelled
+runs selected by the conservative retry policy) are re-run through the trusted
+GitHub Actions adapter after durable retry intent is recorded. Each re-run is a
+new preserved CI attempt for the same head SHA. Observation/API failures remain
+ordinary reconciliation retries. Retry exhaustion blocks the milestone.
+
+Due CI checks run as lightweight `WorkerClass.CI` jobs. The scheduler retains
+its control-thread SQLite connection; each CI executor opens, owns and closes a
+separate database connection inside its worker thread. SQLite thread checking
+remains enabled, and no connection crosses the scheduler/worker boundary.
+
 Webhooks may replace polling later if operationally worthwhile.
 
 Version one should favour simplicity.

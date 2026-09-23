@@ -54,6 +54,11 @@ class SQLiteProjectRepository:
         self._connection = connection
         self._id_factory = id_factory
 
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Expose the shared unit-of-work connection to composed read services."""
+        return self._connection
+
     def add(self, project: Project) -> None:
         changed_at = project.last_state_change_at or project.created_at
         try:

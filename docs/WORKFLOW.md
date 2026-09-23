@@ -725,6 +725,12 @@ Syntra stores:
 - creation timestamp;
 - CI status.
 
+After the implementation PR identity and exact head are verified and persisted,
+the workflow layer atomically advances `PR_CREATING` (or rework `PUSHING`) to
+`CI_RUNNING` and creates one durable `WorkerClass.CI` bootstrap job. Recovery
+reuses the verified PR and active job rather than creating duplicates. Later
+polling jobs are driven by the persisted CI attempt's `next_check_at` value.
+
 ---
 
 # 14. CI Workflow

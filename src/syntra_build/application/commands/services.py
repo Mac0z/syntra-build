@@ -8,6 +8,7 @@ from typing import Protocol
 
 from syntra_build.application.commands.models import Command, InboundMessage
 from syntra_build.domain import ProjectId, ProjectState
+from syntra_build.domain.ci import CIProgress
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +16,7 @@ class ProjectSummary:
     id: ProjectId
     name: str
     state: ProjectState
+    ci_progress: CIProgress | None = None
 
 
 class ResolutionOutcome(StrEnum):
