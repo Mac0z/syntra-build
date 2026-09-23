@@ -162,7 +162,7 @@ class SQLiteArchitectReviewRepository:
         self, project_id: str, milestone_id: str, pull_request_id: str
     ) -> ReviewRecord | None:
         row = self.connection.execute(
-            """SELECT r.*,(SELECT count(*) FROM architect_review_findings f WHERE f.review_id=r.id) AS finding_count FROM architect_reviews r WHERE r.project_id=? AND r.milestone_id=? AND r.pull_request_id=? ORDER BY r.created_at DESC,r.id DESC LIMIT 1""",
+            """SELECT r.*,(SELECT count(*) FROM architect_review_findings f WHERE f.review_id=r.id) AS finding_count FROM architect_reviews r WHERE r.project_id=? AND r.milestone_id=? AND r.pull_request_id=? ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1""",
             (project_id, milestone_id, pull_request_id),
         ).fetchone()
         return None if row is None else self._record(row)
@@ -176,7 +176,7 @@ class SQLiteArchitectReviewRepository:
             FROM architect_reviews r JOIN architect_requests q
               ON q.id=r.architect_request_id
             WHERE r.project_id=? AND r.milestone_id=? AND q.correlation_id=?
-            ORDER BY r.created_at DESC,r.id DESC LIMIT 1""",
+            ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1""",
             (project_id, milestone_id, correlation_id),
         ).fetchone()
         return None if row is None else self._record(row)

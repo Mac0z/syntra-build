@@ -185,4 +185,7 @@ python -m syntra_build.m24_smoke --database /var/lib/syntra-build/syntra.db \
 
 Migration 021 is forward-only. It preserves existing Architect DESIGN and
 SPECIFICATION_DRAFT audit history while adding exact-SHA reviews, findings, and
-review-rework tasks. Rollback requires restoring a pre-migration backup.
+review-rework tasks. A `CHANGES_REQUIRED` verdict atomically queues one durable
+Codex-class `CODEX_REVIEW_REWORK` job for the existing milestone worktree and PR;
+the scheduler dispatches that job through the normal bounded Codex capacity.
+Rollback requires restoring a pre-migration backup.

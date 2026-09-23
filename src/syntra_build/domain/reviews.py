@@ -173,6 +173,8 @@ class ArchitectReview:
             and not self.findings
         ):
             raise DomainValidationError("CHANGES_REQUIRED requires actionable findings")
+        if self.verdict is ArchitectReviewVerdict.APPROVE and self.findings:
+            raise DomainValidationError("APPROVE cannot contain unresolved findings")
 
     @classmethod
     def from_dict(cls, value: object) -> ArchitectReview:

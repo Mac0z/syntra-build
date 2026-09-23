@@ -990,6 +990,8 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=21,
         name="021_architect_reviews",
         statements=(
+            "ALTER TABLE milestones ADD COLUMN definition_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(definition_json))",
+            "ALTER TABLE milestones ADD COLUMN automated_acceptance_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(automated_acceptance_json))",
             "PRAGMA defer_foreign_keys=ON",
             "DROP TRIGGER architect_responses_no_update",
             "DROP TRIGGER architect_responses_no_delete",
@@ -1027,6 +1029,10 @@ MIGRATIONS: tuple[Migration, ...] = (
             ) STRICT""",
             "CREATE INDEX architect_reviews_pr_created ON architect_reviews(pull_request_id,created_at,id)",
             "CREATE INDEX architect_findings_review_status ON architect_review_findings(review_id,status)",
+            """CREATE UNIQUE INDEX one_active_review_rework_codex_job
+                ON jobs(milestone_id,job_type)
+                WHERE job_type='CODEX_REVIEW_REWORK' AND state IN
+                ('QUEUED','DISPATCHED','RUNNING','WAITING_EXTERNAL','RETRY_WAIT')""",
             """CREATE TABLE architect_rework_tasks (
                 id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE REFERENCES architect_reviews(id),
                 project_id TEXT NOT NULL, milestone_id TEXT NOT NULL, pull_request_id TEXT NOT NULL,

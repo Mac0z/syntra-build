@@ -10,12 +10,8 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import uuid4
 
-from syntra_build.application.architect import (
-    ArchitectError,
-    ArchitectFailureKind,
-    ArchitectProvider,
-)
-from syntra_build.application.pull_requests import GitHubPullRequestGateway
+from syntra_build.application.architect import ArchitectError, ArchitectFailureKind
+from syntra_build.application.review_rework import ReviewReworkCoordinator
 from syntra_build.domain.design import ARCHITECT_INTERFACE_VERSION, DocumentType
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
 from syntra_build.domain.milestone_state_machine import MilestoneTransitionRequest
@@ -50,6 +46,25 @@ class ReviewContextGateway(Protocol):
     ) -> str: ...
 
 
+class ReviewPullRequestGateway(Protocol):
+    def get(
+        self,
+        repository_full_name: str,
+        number: int,
+        project_id: ProjectId,
+        milestone_id: MilestoneId,
+    ) -> PullRequestDescriptor: ...
+
+
+class ReviewArchitectProvider(Protocol):
+    provider_name: str
+    model: str
+
+    def review(self, request: ArchitectReviewRequest) -> ArchitectReview: ...
+
+    def telemetry(self) -> dict[str, int | str | None]: ...
+
+
 class ArchitectReviewError(RuntimeError):
     pass
 
@@ -60,9 +75,9 @@ class ArchitectReviewService:
     def __init__(
         self,
         connection: sqlite3.Connection,
-        github_prs: GitHubPullRequestGateway,
+        github_prs: ReviewPullRequestGateway,
         review_context: ReviewContextGateway,
-        provider: ArchitectProvider,
+        provider: ReviewArchitectProvider,
         *,
         architect_rework_limit: int = 3,
         reasoning_effort: str = "high",
@@ -84,6 +99,9 @@ class ArchitectReviewService:
         self.prs = SQLitePullRequestRepository(connection)
         self.milestones = SQLiteMilestoneRepository(connection, id_factory)
         self.reviews = SQLiteArchitectReviewRepository(connection)
+        self.rework = ReviewReworkCoordinator(
+            connection, clock=clock, id_factory=id_factory
+        )
 
     def review(
         self,
@@ -158,24 +176,12 @@ class ArchitectReviewService:
                 superseded=stale,
             )
             if stale:
-                # Fresh CI must be obtained for the independently observed new head.
-                self.milestones.apply_transition(
-                    MilestoneTransitionRequest(
-                        milestone_id,
-                        project_id,
-                        MilestoneState.ARCHITECT_REVIEW,
-                        MilestoneState.CI_RUNNING,
-                        "PR head changed during Architect review",
-                        "SYSTEM",
-                        "architect-review",
-                        correlation_id,
-                        completed,
-                        metadata={
-                            "stale_review_sha": request.head_sha,
-                            "current_head_sha": final_live.head_sha,
-                        },
-                    )
-                )
+                # The authoritative state machine has no ARCHITECT_REVIEW ->
+                # CI_RUNNING edge. Preserve the historical interaction and updated
+                # head, but do not invent a transition or accept stale evidence.
+                # The existing PR/CI reconciliation path must observe passing CI
+                # for this new persisted head before a subsequent review can start.
+                pass
             elif response.verdict is ArchitectReviewVerdict.APPROVE:
                 # A later explicit APPROVE is the persisted resolution evidence; code
                 # movement alone never closes a finding.
@@ -211,10 +217,11 @@ class ArchitectReviewService:
                     response.findings,
                     request.agents_instructions,
                 )
+                rework_task_id = self.id_factory()
                 self.connection.execute(
                     "INSERT INTO architect_rework_tasks VALUES (?,?,?,?,?,'REVIEW_REWORK',?,?)",
                     (
-                        self.id_factory(),
+                        rework_task_id,
                         record.id,
                         str(project_id),
                         str(milestone_id),
@@ -225,7 +232,7 @@ class ArchitectReviewService:
                         completed.isoformat(),
                     ),
                 )
-                self.milestones.apply_rework_transition(
+                changed = self.milestones.apply_rework_transition(
                     MilestoneTransitionRequest(
                         milestone_id,
                         project_id,
@@ -242,6 +249,16 @@ class ArchitectReviewService:
                     self.limit,
                     exhaustion_reason="Architect review rework limit exhausted",
                 )
+                if changed.state is MilestoneState.REVIEW_REWORK:
+                    self.rework.enqueue(
+                        project_id,
+                        milestone_id,
+                        record.id,
+                        rework_task_id,
+                        pr_id,
+                        correlation_id,
+                        completed,
+                    )
             # M25/M26 verdicts are durably represented but deliberately cause no transition.
         return record
 
@@ -419,8 +436,20 @@ class ArchitectApprovalFreshness:
         pull_request_id: str,
         current_head_sha: str,
     ) -> bool:
+        current_pr = self.connection.execute(
+            """SELECT 1 FROM pull_requests WHERE id=? AND project_id=?
+            AND milestone_id=? AND state='OPEN' AND head_sha=?""",
+            (
+                pull_request_id,
+                str(project_id),
+                str(milestone_id),
+                current_head_sha,
+            ),
+        ).fetchone()
+        if current_pr is None:
+            return False
         row = self.connection.execute(
-            """SELECT r.verdict,r.reviewed_sha,r.superseded_at FROM architect_reviews r WHERE r.project_id=? AND r.milestone_id=? AND r.pull_request_id=? ORDER BY r.created_at DESC,r.id DESC LIMIT 1""",
+            """SELECT r.verdict,r.reviewed_sha,r.superseded_at FROM architect_reviews r WHERE r.project_id=? AND r.milestone_id=? AND r.pull_request_id=? ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1""",
             (str(project_id), str(milestone_id), pull_request_id),
         ).fetchone()
         if (
@@ -435,7 +464,7 @@ class ArchitectApprovalFreshness:
             (pull_request_id, current_head_sha),
         ).fetchone()
         blocking = self.connection.execute(
-            """SELECT 1 FROM architect_review_findings f JOIN architect_reviews r ON r.id=f.review_id WHERE r.project_id=? AND r.milestone_id=? AND r.pull_request_id=? AND f.status='OPEN' AND f.severity IN ('major','critical') LIMIT 1""",
+            """SELECT 1 FROM architect_review_findings f JOIN architect_reviews r ON r.id=f.review_id WHERE r.project_id=? AND r.milestone_id=? AND r.pull_request_id=? AND f.status='OPEN' LIMIT 1""",
             (str(project_id), str(milestone_id), pull_request_id),
         ).fetchone()
         return ci is not None and blocking is None
