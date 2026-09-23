@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Installed root-owned (0755). This is intentionally not a general command wrapper.
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+  echo "usage: syntra-codex-launch <managed-worktree> <codex-executable>" >&2
+  exit 64
+fi
+workspace=$(realpath -e -- "$1")
+workspace_root=/var/lib/syntra-build/workspaces
+case "$workspace/" in
+  "$workspace_root"/*/) ;;
+  *) echo "workspace is outside the managed root" >&2; exit 65 ;;
+esac
+case "$2" in
+  /usr/bin/codex|/usr/local/bin/codex) executable=$2 ;;
+  *) echo "executable is not an approved Codex CLI path" >&2; exit 65 ;;
+esac
+[[ -x $executable && -e $workspace/.git ]] || {
+  echo "Codex executable or registered Git worktree is unavailable" >&2
+  exit 66
+}
+shift 2
+
+cd -- "$workspace"
+exec /usr/bin/setpriv --reuid=syntra-codex --regid=syntra-codex \
+  --init-groups --no-new-privs "$executable" "$@"

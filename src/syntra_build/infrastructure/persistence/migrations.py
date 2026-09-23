@@ -756,6 +756,67 @@ MIGRATIONS: tuple[Migration, ...] = (
                 SELECT RAISE(ABORT,'commit evidence is preservation-oriented'); END""",
         ),
     ),
+    Migration(
+        version=16,
+        name="016_codex_runs",
+        statements=(
+            """CREATE TABLE codex_runs (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT NOT NULL REFERENCES milestones(id),
+                job_id TEXT NOT NULL REFERENCES jobs(id),
+                worktree_id TEXT NOT NULL REFERENCES git_workspaces(id),
+                correlation_id TEXT NOT NULL,
+                interface_version TEXT NOT NULL CHECK(interface_version='1.0'),
+                attempt_number INTEGER NOT NULL CHECK(attempt_number>=1),
+                task_payload_json TEXT NOT NULL CHECK(json_valid(task_payload_json)),
+                task_content_hash TEXT NOT NULL CHECK(length(task_content_hash)=64),
+                process_status TEXT NOT NULL CHECK(process_status IN
+                    ('RUNNING','SUCCEEDED','FAILED','TIMED_OUT','CANCELLED','ABANDONED')),
+                process_id INTEGER,
+                worker_identity TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                timeout_seconds REAL NOT NULL CHECK(timeout_seconds>0),
+                exit_code INTEGER,
+                stdout_reference TEXT NOT NULL,
+                stderr_reference TEXT NOT NULL,
+                summary TEXT,
+                known_issues_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(known_issues_json)),
+                result_metadata_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(result_metadata_json)),
+                error_id TEXT,
+                UNIQUE(job_id,attempt_number),
+                FOREIGN KEY(project_id,milestone_id) REFERENCES milestones(project_id,id),
+                FOREIGN KEY(project_id,job_id) REFERENCES jobs(project_id,id)
+            ) STRICT""",
+            """CREATE TABLE codex_run_tests (
+                id TEXT PRIMARY KEY,
+                codex_run_id TEXT NOT NULL REFERENCES codex_runs(id),
+                command TEXT NOT NULL,
+                status TEXT NOT NULL,
+                summary TEXT,
+                duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms>=0),
+                output_reference TEXT
+            ) STRICT""",
+            "CREATE INDEX codex_runs_project_milestone_started ON codex_runs(project_id,milestone_id,started_at)",
+            "CREATE INDEX codex_runs_status_started ON codex_runs(process_status,started_at)",
+            """CREATE TRIGGER codex_runs_identity_immutable BEFORE UPDATE OF
+                id,project_id,milestone_id,job_id,worktree_id,correlation_id,
+                interface_version,attempt_number,task_payload_json,task_content_hash,
+                started_at,timeout_seconds,stdout_reference,stderr_reference
+                ON codex_runs BEGIN
+                SELECT RAISE(ABORT,'Codex run identity is immutable'); END""",
+            """CREATE TRIGGER codex_runs_terminal_immutable BEFORE UPDATE ON codex_runs
+                WHEN OLD.process_status<>'RUNNING' BEGIN
+                SELECT RAISE(ABORT,'terminal Codex runs are immutable'); END""",
+            """CREATE TRIGGER codex_runs_no_delete BEFORE DELETE ON codex_runs BEGIN
+                SELECT RAISE(ABORT,'Codex runs are preservation-oriented'); END""",
+            """CREATE TRIGGER codex_run_tests_no_update BEFORE UPDATE ON codex_run_tests BEGIN
+                SELECT RAISE(ABORT,'Codex test reports are immutable'); END""",
+            """CREATE TRIGGER codex_run_tests_no_delete BEFORE DELETE ON codex_run_tests BEGIN
+                SELECT RAISE(ABORT,'Codex test reports are preservation-oriented'); END""",
+        ),
+    ),
 )
 
 
