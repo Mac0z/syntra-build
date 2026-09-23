@@ -98,6 +98,14 @@ from syntra_build.domain.provisioning import (
     RepositoryBaseline,
     RepositoryProvisioningStatus,
 )
+from syntra_build.domain.reviews import (
+    ArchitectReview,
+    ArchitectReviewRequest,
+    ArchitectReviewVerdict,
+    ArchitectReworkTask,
+    ReviewFinding,
+    ReviewFindingSeverity,
+)
 from syntra_build.domain.specification import (
     SPECIFICATION_DRAFT_INTERFACE_VERSION,
     DesignPackage,
@@ -123,6 +131,12 @@ __all__ = [
     "RepositoryProvisioningStatus",
     "ArchitectDesignRequest",
     "ArchitectDesignResponse",
+    "ArchitectReview",
+    "ArchitectReviewRequest",
+    "ArchitectReviewVerdict",
+    "ArchitectReworkTask",
+    "ReviewFinding",
+    "ReviewFindingSeverity",
     "ArchitectProposedDecision",
     "DecisionSource",
     "DesignMessage",

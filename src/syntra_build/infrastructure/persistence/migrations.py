@@ -986,6 +986,58 @@ MIGRATIONS: tuple[Migration, ...] = (
                 AND state IN ('QUEUED','DISPATCHED','RUNNING','WAITING_EXTERNAL','RETRY_WAIT')""",
         ),
     ),
+    Migration(
+        version=21,
+        name="021_architect_reviews",
+        statements=(
+            "PRAGMA defer_foreign_keys=ON",
+            "DROP TRIGGER architect_responses_no_update",
+            "DROP TRIGGER architect_responses_no_delete",
+            "ALTER TABLE architect_responses RENAME TO architect_responses_m24",
+            "CREATE TABLE architect_requests_m24 AS SELECT * FROM architect_requests WHERE 0",
+            "INSERT INTO architect_requests_m24 SELECT * FROM architect_requests",
+            "DROP TABLE architect_requests",
+            """CREATE TABLE architect_requests (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), milestone_id TEXT, job_id TEXT REFERENCES jobs(id), session_id TEXT REFERENCES architect_sessions(id), request_type TEXT NOT NULL CHECK(request_type IN ('DESIGN','SPECIFICATION_DRAFT','REVIEW')), provider TEXT NOT NULL, model TEXT NOT NULL, reasoning_level TEXT NOT NULL, request_schema_version TEXT NOT NULL, request_payload_json TEXT NOT NULL, correlation_id TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT, external_request_id TEXT, status TEXT NOT NULL CHECK(status IN ('STARTED','SUCCEEDED','FAILED')), failure_classification TEXT, FOREIGN KEY(project_id,milestone_id) REFERENCES milestones(project_id,id), UNIQUE(project_id,correlation_id,id)) STRICT""",
+            """INSERT INTO architect_requests (id,project_id,session_id,request_type,provider,model,reasoning_level,request_schema_version,request_payload_json,correlation_id,started_at,completed_at,external_request_id,status,failure_classification) SELECT * FROM architect_requests_m24""",
+            "DROP TABLE architect_requests_m24",
+            """CREATE TABLE architect_responses (id TEXT PRIMARY KEY, architect_request_id TEXT NOT NULL UNIQUE REFERENCES architect_requests(id), response_type TEXT NOT NULL CHECK(response_type IN ('DESIGN','SPECIFICATION_DRAFT','REVIEW')), response_schema_version TEXT NOT NULL, normalised_payload_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status='ACCEPTED'), created_at TEXT NOT NULL, validation_status TEXT NOT NULL CHECK(validation_status='VALID'), provider TEXT NOT NULL, model TEXT NOT NULL, input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER, total_tokens INTEGER, CHECK(input_tokens IS NULL OR input_tokens>=0), CHECK(cached_input_tokens IS NULL OR cached_input_tokens>=0), CHECK(output_tokens IS NULL OR output_tokens>=0), CHECK(reasoning_tokens IS NULL OR reasoning_tokens>=0), CHECK(total_tokens IS NULL OR total_tokens>=0)) STRICT""",
+            "INSERT INTO architect_responses SELECT * FROM architect_responses_m24",
+            "DROP TABLE architect_responses_m24",
+            "CREATE INDEX architect_requests_project_created ON architect_requests(project_id,started_at,id)",
+            "CREATE TRIGGER architect_responses_no_update BEFORE UPDATE ON architect_responses BEGIN SELECT RAISE(ABORT,'architect responses are append-only'); END",
+            "CREATE TRIGGER architect_responses_no_delete BEFORE DELETE ON architect_responses BEGIN SELECT RAISE(ABORT,'architect responses are append-only'); END",
+            "CREATE UNIQUE INDEX pull_requests_review_identity ON pull_requests(project_id,milestone_id,id)",
+            """CREATE TABLE architect_reviews (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL, milestone_id TEXT NOT NULL,
+                architect_request_id TEXT NOT NULL UNIQUE REFERENCES architect_requests(id),
+                pull_request_id TEXT NOT NULL, reviewed_sha TEXT NOT NULL CHECK(length(reviewed_sha)=40),
+                verdict TEXT NOT NULL CHECK(verdict IN ('APPROVE','CHANGES_REQUIRED','HUMAN_TEST_REQUIRED','HUMAN_DECISION_REQUIRED','BLOCKED')),
+                summary TEXT NOT NULL CHECK(length(trim(summary))>0), created_at TEXT NOT NULL,
+                superseded_at TEXT,
+                FOREIGN KEY(project_id,milestone_id,pull_request_id) REFERENCES pull_requests(project_id,milestone_id,id)
+            ) STRICT""",
+            """CREATE TABLE architect_review_findings (
+                id TEXT PRIMARY KEY, review_id TEXT NOT NULL REFERENCES architect_reviews(id),
+                finding_code TEXT NOT NULL, severity TEXT NOT NULL CHECK(severity IN ('info','minor','major','critical')),
+                requirement_ref TEXT NOT NULL, description TEXT NOT NULL, recommended_action TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('OPEN','RESOLVED','SUPERSEDED','ACCEPTED')),
+                resolved_by_review_id TEXT REFERENCES architect_reviews(id), created_at TEXT NOT NULL,
+                UNIQUE(review_id,finding_code),
+                CHECK((status IN ('OPEN','ACCEPTED') AND resolved_by_review_id IS NULL) OR status IN ('RESOLVED','SUPERSEDED'))
+            ) STRICT""",
+            "CREATE INDEX architect_reviews_pr_created ON architect_reviews(pull_request_id,created_at,id)",
+            "CREATE INDEX architect_findings_review_status ON architect_review_findings(review_id,status)",
+            """CREATE TABLE architect_rework_tasks (
+                id TEXT PRIMARY KEY, review_id TEXT NOT NULL UNIQUE REFERENCES architect_reviews(id),
+                project_id TEXT NOT NULL, milestone_id TEXT NOT NULL, pull_request_id TEXT NOT NULL,
+                task_type TEXT NOT NULL CHECK(task_type='REVIEW_REWORK'), task_payload_json TEXT NOT NULL CHECK(json_valid(task_payload_json)),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id,milestone_id,pull_request_id) REFERENCES pull_requests(project_id,milestone_id,id)
+            ) STRICT""",
+            "CREATE TRIGGER architect_reviews_no_delete BEFORE DELETE ON architect_reviews BEGIN SELECT RAISE(ABORT,'Architect reviews are preservation-oriented'); END",
+            "CREATE TRIGGER architect_findings_no_delete BEFORE DELETE ON architect_review_findings BEGIN SELECT RAISE(ABORT,'Architect findings are preservation-oriented'); END",
+        ),
+    ),
 )
 
 

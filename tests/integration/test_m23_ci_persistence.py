@@ -109,24 +109,24 @@ def _seed(
 
 
 def test_migrations_019_and_020_are_contiguous_and_upgrade_018(tmp_path: Path) -> None:
-    assert MIGRATIONS[-2].version == 19
-    assert MIGRATIONS[-2].name == "019_ci_monitoring"
-    assert MIGRATIONS[-1].version == 20
-    assert MIGRATIONS[-1].name == "020_ci_reconcile_job_uniqueness"
+    assert MIGRATIONS[-3].version == 19
+    assert MIGRATIONS[-3].name == "019_ci_monitoring"
+    assert MIGRATIONS[-2].version == 20
+    assert MIGRATIONS[-2].name == "020_ci_reconcile_job_uniqueness"
     with open_database(tmp_path / "clean.db") as connection:
         apply_migrations(connection)
-        assert current_schema_version(connection) == 20
+        assert current_schema_version(connection) == 21
     with open_database(tmp_path / "from-018.db") as connection:
-        apply_migrations(connection, MIGRATIONS[:-2])
+        apply_migrations(connection, MIGRATIONS[:-3])
         apply_migrations(connection)
-        assert current_schema_version(connection) == 20
+        assert current_schema_version(connection) == 21
 
 
 def test_old_019_upgrades_to_020_and_rejects_duplicate_active_ci_jobs(
     tmp_path: Path,
 ) -> None:
     with open_database(tmp_path / "from-old-019.db") as connection:
-        apply_migrations(connection, MIGRATIONS[:-1])
+        apply_migrations(connection, MIGRATIONS[:-2])
         assert current_schema_version(connection) == 19
         assert (
             connection.execute(
@@ -152,7 +152,7 @@ def test_old_019_upgrades_to_020_and_rejects_duplicate_active_ci_jobs(
                 worker_class=WorkerClass.CI,
             )
         )
-        apply_migrations(connection)
+        apply_migrations(connection, MIGRATIONS[:-1])
         assert current_schema_version(connection) == 20
         assert (
             connection.execute(
