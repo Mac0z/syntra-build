@@ -4,7 +4,7 @@ import logging
 import os
 import sqlite3
 import subprocess
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +33,32 @@ from syntra_build.infrastructure.persistence.workspaces import SQLiteWorkspaceRe
 NOW = datetime(2026, 9, 23, tzinfo=UTC)
 PID = ProjectId(UUID(int=210))
 MID = MilestoneId(UUID(int=211))
+
+
+class MutateBeforeStageGit(TrustedGit):
+    def stage(self, worktree: Path, paths: Iterable[str]) -> None:
+        (worktree / "race.txt").write_text("content B\n")
+        super().stage(worktree, paths)
+
+
+class AlterIndexContentGit(TrustedGit):
+    def stage(self, worktree: Path, paths: Iterable[str]) -> None:
+        super().stage(worktree, paths)
+        (worktree / "race.txt").write_text("altered index content\n")
+        super().stage(worktree, ("race.txt",))
+
+
+class AlterIndexPathsGit(TrustedGit):
+    def stage(self, worktree: Path, paths: Iterable[str]) -> None:
+        super().stage(worktree, paths)
+        (worktree / "injected.txt").write_text("not validated\n")
+        super().stage(worktree, ("injected.txt",))
+
+
+class MutateAfterStageGit(TrustedGit):
+    def stage(self, worktree: Path, paths: Iterable[str]) -> None:
+        super().stage(worktree, paths)
+        (worktree / "race.txt").write_text("content B\n")
 
 
 def git(path: Path, *args: str, env: dict[str, str] | None = None) -> str:
@@ -353,6 +379,107 @@ def test_validation_from_earlier_trusted_head_cannot_be_reused(
             "must not use A evidence",
             expected_diff_hash=current.canonical_hash,
         )
+
+
+@pytest.mark.parametrize(
+    "git_type",
+    (MutateBeforeStageGit, AlterIndexContentGit, AlterIndexPathsGit),
+)
+def test_index_verification_refuses_staging_races_without_committing(
+    validation_workspace: tuple[
+        sqlite3.Connection, Path, TrustedGit, ChangeValidationService
+    ],
+    git_type: type[TrustedGit],
+) -> None:
+    db, worktree, trusted, validation = validation_workspace
+    original_head = trusted.head(worktree)
+    (worktree / "race.txt").write_text("content A\n")
+    accepted = validation.validate(PID, MID, "staging-race")
+    racing_service = WorkspaceService(
+        db, git_type(trusted.authentication_root), worktree.parents[2]
+    )
+
+    with pytest.raises(WorkspaceError, match="staged index differs"):
+        racing_service.commit(
+            PID,
+            MID,
+            accepted.trusted_head_sha,
+            ["race.txt"],
+            "must not commit raced content",
+            expected_diff_hash=accepted.diff_hash,
+        )
+
+    assert trusted.head(worktree) == original_head
+    assert db.execute("SELECT count(*) FROM commits").fetchone()[0] == 0
+
+
+def test_mutation_after_staging_commits_validated_index_and_leaves_dirty_workspace(
+    validation_workspace: tuple[
+        sqlite3.Connection, Path, TrustedGit, ChangeValidationService
+    ],
+) -> None:
+    db, worktree, trusted, validation = validation_workspace
+    (worktree / "race.txt").write_text("content A\n")
+    accepted = validation.validate(PID, MID, "post-stage-race")
+    racing_service = WorkspaceService(
+        db, MutateAfterStageGit(trusted.authentication_root), worktree.parents[2]
+    )
+
+    commit = racing_service.commit(
+        PID,
+        MID,
+        accepted.trusted_head_sha,
+        ["race.txt"],
+        "commit validated index",
+        expected_diff_hash=accepted.diff_hash,
+    )
+
+    assert git(worktree, "show", f"{commit.commit_sha}:race.txt") == "content A"
+    assert (worktree / "race.txt").read_text() == "content B\n"
+    persisted = SQLiteWorkspaceRepository(db).workspace_for_milestone(MID)
+    assert persisted is not None and persisted.state is WorkspaceState.DIRTY
+
+
+def test_index_verification_handles_deletion_symlink_and_binary_exactly(
+    validation_workspace: tuple[
+        sqlite3.Connection, Path, TrustedGit, ChangeValidationService
+    ],
+) -> None:
+    db, worktree, trusted, validation = validation_workspace
+    (worktree / "delete.txt").unlink()
+    (worktree / "link.txt").symlink_to("tracked.txt")
+    binary = b"\x00\xffvalidated\x10"
+    (worktree / "binary.dat").write_bytes(binary)
+    accepted = validation.validate(PID, MID, "index-kinds")
+    service = WorkspaceService(db, trusted, worktree.parents[2])
+
+    commit = service.commit(
+        PID,
+        MID,
+        accepted.trusted_head_sha,
+        ["binary.dat", "delete.txt", "link.txt"],
+        "commit exact index kinds",
+        expected_diff_hash=accepted.diff_hash,
+    )
+
+    assert git(worktree, "show", f"{commit.commit_sha}:link.txt") == "tracked.txt"
+    binary_result = subprocess.run(
+        ["git", "show", f"{commit.commit_sha}:binary.dat"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+    )
+    assert binary_result.stdout == binary
+    assert (
+        subprocess.run(
+            ["git", "cat-file", "-e", f"{commit.commit_sha}:delete.txt"],
+            cwd=worktree,
+            check=False,
+        ).returncode
+        != 0
+    )
+    persisted = SQLiteWorkspaceRepository(db).workspace_for_milestone(MID)
+    assert persisted is not None and persisted.state is WorkspaceState.READY
 
 
 def test_wrong_remote_branch_and_unexpected_commit_are_blocked(

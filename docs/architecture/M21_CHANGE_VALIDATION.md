@@ -29,10 +29,22 @@ secret text. Binary content is exact-byte hash-bound and reported as unscanned.
 Trusted commit requires an accepted persisted change set and recomputes the
 canonical hash against the current persisted trusted HEAD immediately before
 staging. ACCEPT evidence must match the workspace, trusted HEAD, and diff hash;
-the resulting commit immutably records that exact change-set ID and hash. A mismatch refuses the commit,
+the resulting commit immutably records that exact change-set ID and hash.
+
+Trusted staging then stages exactly the accepted path set. Syntra describes the
+resulting index and compares each path's status, Git mode, file kind, binary
+classification, and exact SHA-256 content identity with persisted ChangeSet
+evidence. The Codex-observed `staged` flag remains audit metadata and is not part
+of this comparison: the trusted staging operation intentionally stages the full
+accepted ChangeSet. A mismatch refuses the commit,
 including modification or removal of an untracked file. Validation performs no
 commit, push, pull-request, CI or review operation and preserves rejected
 workspaces for diagnosis and rework.
+
+Once the index matches, `git commit` consumes that verified immutable input.
+Working-tree mutation after staging cannot change the committed bytes. Syntra
+checks for residual changes after commit and records the workspace as `DIRTY`
+rather than discarding them; a clean post-commit workspace becomes `READY`.
 
 For a disposable M19/M20 acceptance worktree, run validation with
 `python -m syntra_build.m21_smoke` and the database, data root, project,

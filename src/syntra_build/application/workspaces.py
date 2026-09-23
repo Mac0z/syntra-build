@@ -310,15 +310,50 @@ class WorkspaceService:
             validated_paths
         ):
             raise WorkspaceError("commit paths differ from the validated change set")
-        sha, parent = self.git.commit(workspace.path, selected_paths, message)
+        accepted_files = cast(list[dict[str, object]], json.loads(evidence.files_json))
+        expected_index = {
+            (
+                item["path"],
+                item["status"],
+                item["binary"],
+                item["content_hash"],
+                item["file_kind"],
+                item["mode"],
+            )
+            for item in accepted_files
+        }
+        self.git.stage(workspace.path, selected_paths)
+        staged_files = self.git.index_changes(workspace.path, trusted_head)
+        actual_index = {
+            (
+                item.path,
+                item.status,
+                item.binary,
+                item.content_hash,
+                item.file_kind,
+                item.mode,
+            )
+            for item in staged_files
+        }
+        if actual_index != expected_index:
+            raise WorkspaceError(
+                "staged index differs from accepted validation evidence"
+            )
+        sha, parent = self.git.commit_staged(workspace.path, message)
         commit = TrustedCommit(
             str(uuid4()), workspace.id, sha, parent, workspace.branch_name, message, now
+        )
+        tracked, staged, untracked = self.git.changes(workspace.path)
+        post_commit_state = (
+            WorkspaceState.DIRTY
+            if tracked or staged or untracked
+            else WorkspaceState.READY
         )
         with transaction(self.connection):
             self.records.save_commit(
                 commit, project_id, milestone_id, evidence.id, expected_diff_hash
             )
-            self.records.update_workspace(workspace.id, WorkspaceState.READY, sha, now)
+            self.records.update_workspace(workspace.id, post_commit_state, sha, now)
         return commit
 
     def push(

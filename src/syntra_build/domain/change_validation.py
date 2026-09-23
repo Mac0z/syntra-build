@@ -39,6 +39,8 @@ class ChangedFile:
     staged: bool
     binary: bool
     content_hash: str | None
+    file_kind: str
+    mode: str | None
     lines_added: int | None = None
     lines_deleted: int | None = None
 

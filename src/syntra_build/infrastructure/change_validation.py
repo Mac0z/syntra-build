@@ -133,7 +133,18 @@ class ChangeCollector:
                 status = "MODIFIED"
             else:
                 continue
-            item = ChangedFile(name, status, name in staged, binary, digest)
+            git_mode = (
+                None
+                if not exists
+                else "120000"
+                if kind == "symlink"
+                else "100755"
+                if mode is not None and mode & 0o111
+                else "100644"
+            )
+            item = ChangedFile(
+                name, status, name in staged, binary, digest, kind, git_mode
+            )
             files.append(item)
             canonical.append(
                 {

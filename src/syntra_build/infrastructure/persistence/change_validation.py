@@ -30,6 +30,8 @@ class SQLiteValidationRepository:
                 "staged": item.staged,
                 "binary": item.binary,
                 "content_hash": item.content_hash,
+                "file_kind": item.file_kind,
+                "mode": item.mode,
             }
             for item in change_set.files
         ]
