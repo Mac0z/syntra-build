@@ -4,13 +4,18 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import get_ident
 from uuid import uuid4
 
 import pytest
 
 from syntra_build.application.ci_monitor import CIMonitor
 from syntra_build.application.ci_policy import RequiredCheckPolicy
-from syntra_build.application.ci_scheduler import CIJobCoordinator
+from syntra_build.application.ci_scheduler import (
+    CIJobCoordinator,
+    CIReconciliationExecutor,
+)
+from syntra_build.application.scheduler import Scheduler, WorkerCapacity
 from syntra_build.domain.ci import (
     CICheck,
     CICheckConclusion,
@@ -19,13 +24,16 @@ from syntra_build.domain.ci import (
     CIObservation,
     CIOverallStatus,
 )
-from syntra_build.domain.identifiers import MilestoneId, ProjectId
+from syntra_build.domain.identifiers import JobId, MilestoneId, ProjectId
+from syntra_build.domain.jobs import Job, JobState, WorkerClass
 from syntra_build.domain.pull_requests import PullRequestDescriptor, PullRequestState
+from syntra_build.infrastructure.config import SchedulerConfig
 from syntra_build.infrastructure.persistence.ci import SQLiteCIRepository
 from syntra_build.infrastructure.persistence.connection import (
     open_database,
     transaction,
 )
+from syntra_build.infrastructure.persistence.jobs import SQLiteJobRepository
 from syntra_build.infrastructure.persistence.migrations import (
     MIGRATIONS,
     apply_migrations,
@@ -634,3 +642,107 @@ def test_terminal_transient_rerun_same_sha_can_pass(tmp_path: Path) -> None:
             SQLiteCIRepository(connection).get(failed.id).overall_status
             is CIOverallStatus.FAILED
         )
+
+
+def test_scheduler_ci_executor_owns_worker_thread_database_connection(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "thread-owned.db"
+    control_thread = get_ident()
+    worker_threads: list[int] = []
+    with open_database(database_path) as control_connection:
+        apply_migrations(control_connection)
+        project, milestone, _, _ = _seed(control_connection)
+        jobs = SQLiteJobRepository(control_connection, lambda: str(uuid4()))
+        job_id = JobId.generate()
+        now = datetime.now(UTC)
+        jobs.add(
+            Job(
+                job_id,
+                project,
+                "CI_RECONCILE",
+                JobState.QUEUED,
+                0,
+                now,
+                now,
+                milestone,
+                correlation_id="ci-thread-test",
+                worker_class=WorkerClass.CI,
+            )
+        )
+
+        class StablePullRequest:
+            def get(
+                self,
+                repository_full_name: str,
+                number: int,
+                project_id: ProjectId,
+                milestone_id: MilestoneId,
+            ) -> PullRequestDescriptor:
+                return PullRequestDescriptor(
+                    "1.0",
+                    project_id,
+                    milestone_id,
+                    77,
+                    number,
+                    PullRequestState.OPEN,
+                    "syntra/m23",
+                    "main",
+                    "a" * 40,
+                    "https://example/pr/12",
+                )
+
+            def find_open(self, *args: object) -> tuple[()]:
+                return ()
+
+            def create(self, *args: object) -> PullRequestDescriptor:
+                raise AssertionError("CI monitoring is read-only")
+
+        class RunningActions:
+            def observe(
+                self,
+                repository_full_name: str,
+                pull_request_number: int,
+                head_sha: str,
+            ) -> CIObservation:
+                return CIObservation(
+                    (CICheck("validate", "job", CICheckStatus.RUNNING),),
+                    ("run",),
+                )
+
+            def rerun(self, repository_full_name: str, workflow_run_id: str) -> None:
+                raise AssertionError("no rerun expected")
+
+        def monitor_factory(worker_connection: sqlite3.Connection) -> CIMonitor:
+            worker_threads.append(get_ident())
+            # This query would raise ProgrammingError if the control connection
+            # had crossed into the ThreadPoolExecutor worker.
+            worker_connection.execute("SELECT 1").fetchone()
+            return CIMonitor(worker_connection, StablePullRequest(), RunningActions())
+
+        executor = CIReconciliationExecutor(database_path, monitor_factory)
+        capacity = WorkerCapacity(SchedulerConfig().worker_class_limits())
+        scheduler = Scheduler(
+            jobs,
+            capacity,
+            {WorkerClass.CI: executor},
+            clock=lambda: datetime.now(UTC),
+        )
+        try:
+            assert scheduler.run_once().dispatched == 1
+            scheduler.wait_for_wake(2)
+            assert scheduler.run_once().completed == 1
+            assert jobs.get(job_id).state is JobState.SUCCEEDED
+            run = SQLiteCIRepository(control_connection).latest_for_head(
+                control_connection.execute(
+                    "SELECT id FROM pull_requests WHERE milestone_id=?",
+                    (str(milestone),),
+                ).fetchone()["id"],
+                "a" * 40,
+            )
+            assert run is not None and run.overall_status is CIOverallStatus.RUNNING
+            assert worker_threads and worker_threads[0] != control_thread
+            assert capacity.in_use(WorkerClass.CODEX) == 0
+            assert capacity.in_use(WorkerClass.CI) == 0
+        finally:
+            scheduler.close()

@@ -6,6 +6,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
 
 from syntra_build.application.ci_monitor import CIMonitor
@@ -15,6 +16,7 @@ from syntra_build.application.scheduler.core import (
 )
 from syntra_build.domain.identifiers import JobId, MilestoneId, ProjectId
 from syntra_build.domain.jobs import Job, JobState, WorkerClass
+from syntra_build.infrastructure.persistence.connection import open_database
 from syntra_build.infrastructure.persistence.jobs import SQLiteJobRepository
 
 CI_RECONCILE_JOB = "CI_RECONCILE"
@@ -69,15 +71,28 @@ class CIJobCoordinator:
 
 
 class CIReconciliationExecutor:
-    def __init__(self, monitor: CIMonitor) -> None:
-        self.monitor = monitor
+    """Create all SQLite-owning reconciliation objects on the worker thread."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        monitor_factory: Callable[[sqlite3.Connection], CIMonitor],
+    ) -> None:
+        self.database_path = database_path
+        self.monitor_factory = monitor_factory
 
     def execute(self, job: Job) -> JobExecutionResult:
         if job.worker_class is not WorkerClass.CI or job.milestone_id is None:
             raise ValueError("CI reconciliation requires a CI milestone job")
-        record = self.monitor.reconcile(
-            job.project_id, job.milestone_id, job.correlation_id
-        )
+        # ``execute`` runs in Scheduler's ThreadPoolExecutor. Opening here keeps
+        # normal SQLite thread affinity intact: the worker creates, owns and closes
+        # this connection, while scheduler repositories retain their control-thread
+        # connection.
+        with open_database(self.database_path) as connection:
+            monitor = self.monitor_factory(connection)
+            record = monitor.reconcile(
+                job.project_id, job.milestone_id, job.correlation_id
+            )
         return JobExecutionResult(
             JobExecutionDisposition.SUCCEEDED,
             result={
