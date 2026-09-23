@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,14 +12,7 @@ from pathlib import Path
 from syntra_build.application.provisioning import ProvisioningError, ProvisioningFailure
 from syntra_build.domain import ProjectId
 from syntra_build.infrastructure.config import SecretValue
-
-_ASKPASS_PROGRAM = """#!/bin/sh
-case "$1" in
-  *Username*) printf '%s\\n' "$SYNTRA_GIT_USERNAME" ;;
-  *Password*) printf '%s\\n' "$SYNTRA_GIT_PASSWORD" ;;
-  *) exit 1 ;;
-esac
-"""
+from syntra_build.infrastructure.git_auth import git_authentication_environment
 
 
 class SubprocessInitialBaselineGit:
@@ -144,19 +136,7 @@ class SubprocessInitialBaselineGit:
                 ProvisioningFailure.LOCAL_GIT,
                 "GitHub push authentication is unavailable",
             )
-        with tempfile.TemporaryDirectory(
-            prefix=".m18-askpass-", dir=self.root
-        ) as temporary_directory:
-            askpass = Path(temporary_directory) / "askpass"
-            askpass.write_text(_ASKPASS_PROGRAM, encoding="utf-8")
-            askpass.chmod(0o700)
-            environment = dict(os.environ)
-            environment.update(
-                {
-                    "GIT_TERMINAL_PROMPT": "0",
-                    "GIT_ASKPASS": str(askpass),
-                    "SYNTRA_GIT_USERNAME": self.github_username,
-                    "SYNTRA_GIT_PASSWORD": self.github_token.value,
-                }
-            )
+        with git_authentication_environment(
+            self.root, self.github_username, self.github_token
+        ) as environment:
             yield environment

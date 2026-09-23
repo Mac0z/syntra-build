@@ -690,6 +690,72 @@ MIGRATIONS: tuple[Migration, ...] = (
                 SELECT RAISE(ABORT,'repository baselines are preservation-oriented'); END""",
         ),
     ),
+    Migration(
+        version=15,
+        name="015_git_workspaces",
+        statements=(
+            """CREATE TABLE git_repositories (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL UNIQUE REFERENCES projects(id),
+                github_repository_id TEXT NOT NULL UNIQUE REFERENCES github_repositories(id),
+                repository_path TEXT NOT NULL UNIQUE,
+                remote_name TEXT NOT NULL CHECK(remote_name='origin'),
+                remote_url TEXT NOT NULL,
+                default_branch TEXT NOT NULL,
+                last_fetch_at TEXT,
+                last_known_main_sha TEXT CHECK(last_known_main_sha IS NULL OR length(last_known_main_sha)=40),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            ) STRICT""",
+            """CREATE TABLE git_workspaces (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT NOT NULL UNIQUE REFERENCES milestones(id),
+                git_repository_id TEXT NOT NULL REFERENCES git_repositories(id),
+                branch_name TEXT NOT NULL,
+                worktree_path TEXT NOT NULL UNIQUE,
+                base_branch TEXT NOT NULL,
+                base_sha TEXT NOT NULL CHECK(length(base_sha)=40),
+                current_head_sha TEXT CHECK(current_head_sha IS NULL OR length(current_head_sha)=40),
+                state TEXT NOT NULL CHECK(state IN ('ACTIVE','DIRTY','READY','ORPHANED','REMOVED','ERROR')),
+                created_at TEXT NOT NULL,
+                last_validated_at TEXT,
+                removed_at TEXT,
+                UNIQUE(project_id,milestone_id),
+                UNIQUE(git_repository_id,branch_name),
+                FOREIGN KEY(project_id,milestone_id) REFERENCES milestones(project_id,id)
+            ) STRICT""",
+            """CREATE TABLE commits (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT NOT NULL REFERENCES milestones(id),
+                worktree_id TEXT NOT NULL REFERENCES git_workspaces(id),
+                commit_sha TEXT NOT NULL UNIQUE CHECK(length(commit_sha)=40),
+                parent_sha TEXT NOT NULL CHECK(length(parent_sha)=40),
+                branch_name TEXT NOT NULL,
+                message TEXT NOT NULL CHECK(length(trim(message))>0),
+                author_name TEXT NOT NULL CHECK(author_name='Syntra Build'),
+                author_email TEXT NOT NULL CHECK(author_email='syntra@localhost'),
+                created_at TEXT NOT NULL,
+                pushed_at TEXT,
+                FOREIGN KEY(project_id,milestone_id) REFERENCES milestones(project_id,id)
+            ) STRICT""",
+            """CREATE TRIGGER git_repositories_identity_immutable BEFORE UPDATE OF
+                project_id,github_repository_id,repository_path,remote_name,remote_url,
+                default_branch,created_at ON git_repositories BEGIN
+                SELECT RAISE(ABORT,'managed Git repository identity is immutable'); END""",
+            """CREATE TRIGGER git_workspaces_identity_immutable BEFORE UPDATE OF
+                project_id,milestone_id,git_repository_id,branch_name,worktree_path,
+                base_branch,base_sha,created_at ON git_workspaces BEGIN
+                SELECT RAISE(ABORT,'Git workspace identity is immutable'); END""",
+            """CREATE TRIGGER commits_identity_immutable BEFORE UPDATE OF
+                id,project_id,milestone_id,worktree_id,commit_sha,parent_sha,branch_name,
+                message,author_name,author_email,created_at ON commits BEGIN
+                SELECT RAISE(ABORT,'commit evidence is immutable except pushed time'); END""",
+            """CREATE TRIGGER commits_no_delete BEFORE DELETE ON commits BEGIN
+                SELECT RAISE(ABORT,'commit evidence is preservation-oriented'); END""",
+        ),
+    ),
 )
 
 
