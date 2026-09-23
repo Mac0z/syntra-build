@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -77,9 +78,11 @@ class CIReconciliationExecutor:
         self,
         database_path: Path,
         monitor_factory: Callable[[sqlite3.Connection], CIMonitor],
+        connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
     ) -> None:
         self.database_path = database_path
         self.monitor_factory = monitor_factory
+        self.connection_factory = connection_factory
 
     def execute(self, job: Job) -> JobExecutionResult:
         if job.worker_class is not WorkerClass.CI or job.milestone_id is None:
@@ -88,7 +91,7 @@ class CIReconciliationExecutor:
         # normal SQLite thread affinity intact: the worker creates, owns and closes
         # this connection, while scheduler repositories retain their control-thread
         # connection.
-        with open_database(self.database_path) as connection:
+        with closing(self.connection_factory(self.database_path)) as connection:
             monitor = self.monitor_factory(connection)
             record = monitor.reconcile(
                 job.project_id, job.milestone_id, job.correlation_id

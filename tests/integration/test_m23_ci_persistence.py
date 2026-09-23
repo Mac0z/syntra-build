@@ -4,7 +4,8 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import get_ident
+from threading import Event, get_ident
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -650,6 +651,7 @@ def test_scheduler_ci_executor_owns_worker_thread_database_connection(
     database_path = tmp_path / "thread-owned.db"
     control_thread = get_ident()
     worker_threads: list[int] = []
+    worker_closed = Event()
     with open_database(database_path) as control_connection:
         apply_migrations(control_connection)
         project, milestone, _, _ = _seed(control_connection)
@@ -720,7 +722,23 @@ def test_scheduler_ci_executor_owns_worker_thread_database_connection(
             worker_connection.execute("SELECT 1").fetchone()
             return CIMonitor(worker_connection, StablePullRequest(), RunningActions())
 
-        executor = CIReconciliationExecutor(database_path, monitor_factory)
+        class TrackedConnection:
+            def __init__(self, connection: sqlite3.Connection) -> None:
+                self.connection = connection
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self.connection, name)
+
+            def close(self) -> None:
+                self.connection.close()
+                worker_closed.set()
+
+        def connection_factory(path: Path) -> sqlite3.Connection:
+            return cast(sqlite3.Connection, TrackedConnection(open_database(path)))
+
+        executor = CIReconciliationExecutor(
+            database_path, monitor_factory, connection_factory
+        )
         capacity = WorkerCapacity(SchedulerConfig().worker_class_limits())
         scheduler = Scheduler(
             jobs,
@@ -742,6 +760,7 @@ def test_scheduler_ci_executor_owns_worker_thread_database_connection(
             )
             assert run is not None and run.overall_status is CIOverallStatus.RUNNING
             assert worker_threads and worker_threads[0] != control_thread
+            assert worker_closed.is_set()
             assert capacity.in_use(WorkerClass.CODEX) == 0
             assert capacity.in_use(WorkerClass.CI) == 0
         finally:
