@@ -65,6 +65,19 @@ class ReviewArchitectProvider(Protocol):
     def telemetry(self) -> dict[str, int | str | None]: ...
 
 
+class ReviewHumanInterventions(Protocol):
+    def create_from_review(
+        self,
+        review_id: str,
+        review: ArchitectReview,
+        pull_request_id: str,
+        ci_run_id: str,
+        *,
+        causation_id: str,
+        occurred_at: datetime | None = None,
+    ) -> object: ...
+
+
 class ArchitectReviewError(RuntimeError):
     pass
 
@@ -83,6 +96,7 @@ class ArchitectReviewService:
         reasoning_effort: str = "high",
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         id_factory: Callable[[], str] = lambda: str(uuid4()),
+        human_interventions: ReviewHumanInterventions | None = None,
     ) -> None:
         self.connection, self.github_prs, self.review_context, self.provider = (
             connection,
@@ -97,6 +111,7 @@ class ArchitectReviewService:
             id_factory,
         )
         self.prs = SQLitePullRequestRepository(connection)
+        self.human_interventions = human_interventions
         self.milestones = SQLiteMilestoneRepository(connection, id_factory)
         self.reviews = SQLiteArchitectReviewRepository(connection)
         self.rework = ReviewReworkCoordinator(
@@ -272,7 +287,30 @@ class ArchitectReviewService:
                         correlation_id,
                         completed,
                     )
-            # M25/M26 verdicts are durably represented but deliberately cause no transition.
+            elif (
+                response.verdict
+                in {
+                    ArchitectReviewVerdict.HUMAN_TEST_REQUIRED,
+                    ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED,
+                }
+                and self.human_interventions is None
+            ):
+                raise ArchitectReviewError(
+                    "human verdict requires the M25 intervention service"
+                )
+        if response.verdict in {
+            ArchitectReviewVerdict.HUMAN_TEST_REQUIRED,
+            ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED,
+        }:
+            assert self.human_interventions is not None
+            self.human_interventions.create_from_review(
+                record.id,
+                response,
+                pr_id,
+                str(request.ci_result["run_id"]),
+                causation_id=request_id,
+                occurred_at=completed,
+            )
         return record
 
     def _build_request(

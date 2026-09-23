@@ -9,6 +9,7 @@ from syntra_build.domain._validation import require_text
 from syntra_build.domain.design import ARCHITECT_INTERFACE_VERSION
 from syntra_build.domain.errors import DomainValidationError
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
+from syntra_build.domain.milestones import MilestoneState
 
 
 class ArchitectReviewVerdict(StrEnum):
@@ -24,6 +25,71 @@ class ReviewFindingSeverity(StrEnum):
     MINOR = "minor"
     MAJOR = "major"
     CRITICAL = "critical"
+
+
+@dataclass(frozen=True, slots=True)
+class ArchitectHumanGateRequest:
+    """Validated advisory detail for an M25 human intervention."""
+
+    prompt: str
+    resume_milestone_state: MilestoneState
+    options: tuple[str, ...] = ()
+    test_instructions: str | None = None
+    artifact_reference: str | None = None
+
+    def __post_init__(self) -> None:
+        require_text(self.prompt, "human_gate.prompt")
+        if not isinstance(self.resume_milestone_state, MilestoneState):
+            raise DomainValidationError("human gate requires a valid resume target")
+        if len(set(self.options)) != len(self.options) or any(
+            not isinstance(item, str) or not item.strip() for item in self.options
+        ):
+            raise DomainValidationError("human gate options must be unique text")
+        if self.test_instructions is not None:
+            require_text(self.test_instructions, "human_gate.test_instructions")
+        if self.artifact_reference is not None:
+            require_text(self.artifact_reference, "human_gate.artifact_reference")
+
+    @classmethod
+    def from_dict(cls, value: object) -> ArchitectHumanGateRequest:
+        fields = {
+            "prompt",
+            "resume_milestone_state",
+            "options",
+            "test_instructions",
+            "artifact_reference",
+        }
+        if (
+            not isinstance(value, dict)
+            or set(value) != fields
+            or not isinstance(value["options"], list)
+        ):
+            raise DomainValidationError("malformed Architect human gate request")
+        try:
+            return cls(
+                str(value["prompt"]),
+                MilestoneState(str(value["resume_milestone_state"])),
+                tuple(str(item) for item in value["options"]),
+                str(value["test_instructions"])
+                if value["test_instructions"] is not None
+                else None,
+                str(value["artifact_reference"])
+                if value["artifact_reference"] is not None
+                else None,
+            )
+        except (TypeError, ValueError) as error:
+            raise DomainValidationError(
+                "malformed Architect human gate request"
+            ) from error
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "prompt": self.prompt,
+            "resume_milestone_state": self.resume_milestone_state.value,
+            "options": list(self.options),
+            "test_instructions": self.test_instructions,
+            "artifact_reference": self.artifact_reference,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +214,7 @@ class ArchitectReview:
     verdict: ArchitectReviewVerdict
     summary: str
     findings: tuple[ReviewFinding, ...]
+    human_gate: ArchitectHumanGateRequest | None = None
 
     def __post_init__(self) -> None:
         if self.interface_version != ARCHITECT_INTERFACE_VERSION:
@@ -175,10 +242,28 @@ class ArchitectReview:
             raise DomainValidationError("CHANGES_REQUIRED requires actionable findings")
         if self.verdict is ArchitectReviewVerdict.APPROVE and self.findings:
             raise DomainValidationError("APPROVE cannot contain unresolved findings")
+        needs_gate = self.verdict in {
+            ArchitectReviewVerdict.HUMAN_TEST_REQUIRED,
+            ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED,
+        }
+        if needs_gate != (self.human_gate is not None):
+            raise DomainValidationError(
+                "human verdicts require exactly one gate request"
+            )
+        if self.human_gate is not None:
+            if self.verdict is ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED:
+                if not self.human_gate.options:
+                    raise DomainValidationError(
+                        "human decisions require allowed options"
+                    )
+            elif self.human_gate.options or self.human_gate.test_instructions is None:
+                raise DomainValidationError(
+                    "human tests require instructions, not options"
+                )
 
     @classmethod
     def from_dict(cls, value: object) -> ArchitectReview:
-        fields = {
+        required = {
             "interface_version",
             "correlation_id",
             "project_id",
@@ -189,9 +274,11 @@ class ArchitectReview:
             "summary",
             "findings",
         }
+        allowed = required | {"human_gate"}
         if (
             not isinstance(value, dict)
-            or set(value) != fields
+            or not required.issubset(value)
+            or not set(value).issubset(allowed)
             or not isinstance(value["findings"], list)
         ):
             raise DomainValidationError("malformed Architect review")
@@ -209,6 +296,9 @@ class ArchitectReview:
                 ArchitectReviewVerdict(str(value["verdict"])),
                 str(value["summary"]),
                 tuple(ReviewFinding.from_dict(item) for item in value["findings"]),
+                ArchitectHumanGateRequest.from_dict(value["human_gate"])
+                if value.get("human_gate") is not None
+                else None,
             )
         except DomainValidationError:
             raise
@@ -226,6 +316,7 @@ class ArchitectReview:
             "verdict": self.verdict.value,
             "summary": self.summary,
             "findings": [item.to_dict() for item in self.findings],
+            "human_gate": self.human_gate.to_dict() if self.human_gate else None,
         }
 
 

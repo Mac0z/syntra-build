@@ -189,3 +189,21 @@ review-rework tasks. A `CHANGES_REQUIRED` verdict atomically queues one durable
 Codex-class `CODEX_REVIEW_REWORK` job for the existing milestone worktree and PR;
 the scheduler dispatches that job through the normal bounded Codex capacity.
 Rollback requires restoring a pre-migration backup.
+
+### M25 human-intervention smoke check
+
+After a real Architect-requested gate has been delivered through Telegram, the
+host operator can exercise the same authenticated, correlated response service
+once without starting a scheduler or polling loop:
+
+```bash
+python -m syntra_build.m25_smoke --database /var/lib/syntra-build/syntra.db \
+  --gate-id GATE_ID --responder-id TELEGRAM_USER_ID --response PASS \
+  --feedback "acceptance completed" --correlation-id m25-host-smoke
+```
+
+The command prints only the gate identifier and resulting gate/milestone state.
+`FAIL` and `BLOCKED` are also supported. Migration 022 is forward-only and adds
+immutable exact-PR/head/CI human-test bindings and results while preserving all
+existing human-gate, response, and Architect-review history. Rollback requires
+restoring a version-21 backup.

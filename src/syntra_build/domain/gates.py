@@ -74,6 +74,8 @@ class HumanGate:
     created_by: str = "SYSTEM"
     correlation_id: str = "uncorrelated"
     artifact_reference: str | None = None
+    architect_review_id: str | None = None
+    causation_id: str | None = None
 
     @property
     def created_at(self) -> datetime:

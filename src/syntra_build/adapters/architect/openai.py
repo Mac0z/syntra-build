@@ -116,6 +116,7 @@ REVIEW_SCHEMA: dict[str, object] = {
         "verdict",
         "summary",
         "findings",
+        "human_gate",
     ],
     "properties": {
         "interface_version": {"type": "string", "const": "1.0"},
@@ -158,6 +159,53 @@ REVIEW_SCHEMA: dict[str, object] = {
                     "recommended_action": {"type": "string", "minLength": 1},
                 },
             },
+        },
+        "human_gate": {
+            "anyOf": [
+                {"type": "null"},
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "prompt",
+                        "resume_milestone_state",
+                        "options",
+                        "test_instructions",
+                        "artifact_reference",
+                    ],
+                    "properties": {
+                        "prompt": {"type": "string", "minLength": 1},
+                        "resume_milestone_state": {
+                            "type": "string",
+                            "enum": [
+                                "PREPARING_TASK",
+                                "CODING",
+                                "ARCHITECT_REVIEW",
+                                "MERGE_READY",
+                                "REVIEW_REWORK",
+                                "BLOCKED",
+                            ],
+                        },
+                        "options": {
+                            "type": "array",
+                            "items": {"type": "string", "minLength": 1},
+                            "uniqueItems": True,
+                        },
+                        "test_instructions": {
+                            "anyOf": [
+                                {"type": "string", "minLength": 1},
+                                {"type": "null"},
+                            ]
+                        },
+                        "artifact_reference": {
+                            "anyOf": [
+                                {"type": "string", "minLength": 1},
+                                {"type": "null"},
+                            ]
+                        },
+                    },
+                },
+            ]
         },
     },
 }
