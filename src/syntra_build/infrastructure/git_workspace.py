@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
 from pathlib import Path
 
+from syntra_build.domain.change_validation import ChangedFile
 from syntra_build.domain.workspaces import AmbiguousPushError, WorkspaceError
 from syntra_build.infrastructure.config import SecretValue
 from syntra_build.infrastructure.git_auth import git_authentication_environment
@@ -128,6 +130,13 @@ class TrustedGit:
     def head(self, worktree: Path) -> str:
         return self._run(worktree, ["rev-parse", "HEAD"])
 
+    def common_dir(self, worktree: Path) -> Path:
+        value = self._run(worktree, ["rev-parse", "--git-common-dir"])
+        return (worktree / value).resolve(strict=True)
+
+    def is_bare(self, repository: Path) -> bool:
+        return self._run(repository, ["rev-parse", "--is-bare-repository"]) == "true"
+
     def changes(
         self, worktree: Path
     ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
@@ -151,14 +160,71 @@ class TrustedGit:
     def commit(
         self, worktree: Path, paths: Iterable[str], message: str
     ) -> tuple[str, str]:
+        self.stage(worktree, paths)
+        return self.commit_staged(worktree, message)
+
+    def stage(self, worktree: Path, paths: Iterable[str]) -> None:
         selected = tuple(paths)
         if not selected or any(
             not item or Path(item).is_absolute() or ".." in Path(item).parts
             for item in selected
         ):
             raise WorkspaceError("explicit safe staging paths are required")
-        parent = self.head(worktree)
         self._run(worktree, ["add", "--", *selected])
+
+    def index_changes(
+        self, worktree: Path, trusted_head: str
+    ) -> tuple[ChangedFile, ...]:
+        """Describe the exact index tree that a subsequent commit would consume."""
+        names = tuple(
+            item
+            for item in self._run(
+                worktree, ["diff", "--cached", "--name-only", "-z", trusted_head]
+            ).split("\0")
+            if item
+        )
+        result: list[ChangedFile] = []
+        for name in sorted(names, key=os.fsencode):
+            raw = self._run(worktree, ["ls-files", "-s", "--", name])
+            if not raw:
+                result.append(
+                    ChangedFile(name, "DELETED", True, False, None, "deleted", None)
+                )
+                continue
+            metadata = raw.split("\t", 1)[0].split()
+            mode, blob = metadata[0], metadata[1]
+            payload = subprocess.run(
+                ["git", "cat-file", "blob", blob],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                timeout=30,
+            ).stdout
+            base_exists = (
+                subprocess.run(
+                    ["git", "cat-file", "-e", f"{trusted_head}:{name}"],
+                    cwd=worktree,
+                    check=False,
+                    capture_output=True,
+                    timeout=30,
+                ).returncode
+                == 0
+            )
+            result.append(
+                ChangedFile(
+                    name,
+                    "MODIFIED" if base_exists else "ADDED",
+                    True,
+                    b"\0" in payload[:8192],
+                    hashlib.sha256(payload).hexdigest(),
+                    "symlink" if mode == "120000" else "file",
+                    mode,
+                )
+            )
+        return tuple(result)
+
+    def commit_staged(self, worktree: Path, message: str) -> tuple[str, str]:
+        parent = self.head(worktree)
         environment = dict(os.environ)
         environment.update(
             GIT_AUTHOR_NAME="Syntra Build",

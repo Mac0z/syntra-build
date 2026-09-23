@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from collections.abc import Iterable
@@ -22,7 +23,11 @@ from syntra_build.domain.workspaces import (
     WorkspaceInspection,
     WorkspaceState,
 )
+from syntra_build.infrastructure.change_validation import ChangeCollector
 from syntra_build.infrastructure.git_workspace import TrustedGit
+from syntra_build.infrastructure.persistence.change_validation import (
+    SQLiteValidationRepository,
+)
 from syntra_build.infrastructure.persistence.connection import transaction
 from syntra_build.infrastructure.persistence.milestones import SQLiteMilestoneRepository
 from syntra_build.infrastructure.persistence.workspaces import SQLiteWorkspaceRepository
@@ -271,6 +276,8 @@ class WorkspaceService:
         paths: Iterable[str],
         message: str,
         now: datetime | None = None,
+        *,
+        expected_diff_hash: str | None = None,
     ) -> TrustedCommit:
         now = now or datetime.now(UTC)
         inspection = self.inspect(project_id, milestone_id, now)
@@ -280,13 +287,73 @@ class WorkspaceService:
             or inspection.current_branch != workspace.branch_name
         ):
             raise WorkspaceError("workspace HEAD or branch changed before commit")
-        sha, parent = self.git.commit(workspace.path, paths, message)
+        if expected_diff_hash is None:
+            raise WorkspaceError("an accepted validated diff hash is required")
+        trusted_head = workspace.current_head_sha or workspace.base_sha
+        current = ChangeCollector().collect(workspace.path, trusted_head)
+        validations = SQLiteValidationRepository(self.connection)
+        if current.canonical_hash != expected_diff_hash:
+            raise WorkspaceError("workspace diff changed after validation")
+        evidence = validations.accepted_evidence(
+            workspace.id, trusted_head, expected_diff_hash
+        )
+        if evidence is None:
+            raise WorkspaceError(
+                "diff hash has no accepted validation evidence for trusted HEAD"
+            )
+        selected_paths = tuple(paths)
+        validated_paths = {
+            item["path"]
+            for item in cast(list[dict[str, object]], json.loads(evidence.files_json))
+        }
+        if set(selected_paths) != validated_paths or len(selected_paths) != len(
+            validated_paths
+        ):
+            raise WorkspaceError("commit paths differ from the validated change set")
+        accepted_files = cast(list[dict[str, object]], json.loads(evidence.files_json))
+        expected_index = {
+            (
+                item["path"],
+                item["status"],
+                item["binary"],
+                item["content_hash"],
+                item["file_kind"],
+                item["mode"],
+            )
+            for item in accepted_files
+        }
+        self.git.stage(workspace.path, selected_paths)
+        staged_files = self.git.index_changes(workspace.path, trusted_head)
+        actual_index = {
+            (
+                item.path,
+                item.status,
+                item.binary,
+                item.content_hash,
+                item.file_kind,
+                item.mode,
+            )
+            for item in staged_files
+        }
+        if actual_index != expected_index:
+            raise WorkspaceError(
+                "staged index differs from accepted validation evidence"
+            )
+        sha, parent = self.git.commit_staged(workspace.path, message)
         commit = TrustedCommit(
             str(uuid4()), workspace.id, sha, parent, workspace.branch_name, message, now
         )
+        tracked, staged, untracked = self.git.changes(workspace.path)
+        post_commit_state = (
+            WorkspaceState.DIRTY
+            if tracked or staged or untracked
+            else WorkspaceState.READY
+        )
         with transaction(self.connection):
-            self.records.save_commit(commit, project_id, milestone_id)
-            self.records.update_workspace(workspace.id, WorkspaceState.READY, sha, now)
+            self.records.save_commit(
+                commit, project_id, milestone_id, evidence.id, expected_diff_hash
+            )
+            self.records.update_workspace(workspace.id, post_commit_state, sha, now)
         return commit
 
     def push(
