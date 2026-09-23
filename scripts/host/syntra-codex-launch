@@ -90,7 +90,7 @@ cd -- "$workspace"
   /usr/bin/env -i HOME="$home" USER="$worker" LOGNAME="$worker" \
   XDG_CONFIG_HOME="$home/.config" PATH=/usr/local/bin:/usr/bin:/bin \
   LANG=C.UTF-8 LC_ALL=C.UTF-8 TMPDIR=/tmp \
-  GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 "$executable" exec - &
+  GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 "$executable" exec - <&0 &
 child=$!
 trap 'kill -TERM "$child" 2>/dev/null || true' TERM INT HUP
 wait "$child"

@@ -173,6 +173,35 @@ def test_host_helper_is_syntax_valid_and_declares_isolated_acl_plan() -> None:
     assert 'setfacl -Rm "u:$worker:rX" "$repository"' in source
     assert '/usr/bin/env -i HOME="$home" USER="$worker"' in source
     assert "if [[ $# -ne 4 || $3 != exec || $4 != - ]]" in source
+    assert '"$executable" exec - <&0 &' in source
+
+
+def test_async_helper_structure_preserves_parent_stdin_for_worker(
+    tmp_path: Path,
+) -> None:
+    """Exercise the helper's background-child and wait structure without root."""
+    captured = tmp_path / "worker-stdin"
+    helper = tmp_path / "helper-analogue"
+    helper.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+captured=$1
+/bin/cat >"$captured" <&0 &
+child=$!
+trap 'kill -TERM "$child" 2>/dev/null || true' TERM INT HUP
+wait "$child"
+""",
+        encoding="utf-8",
+    )
+    helper.chmod(0o755)
+    payload = b"bounded Architect task\nwith exact binary-safe bytes: \\x00 is text\n"
+    completed = subprocess.run(
+        [helper, captured], input=payload, capture_output=True, check=False
+    )
+    assert completed.returncode == 0
+    assert completed.stdout == b""
+    assert completed.stderr == b""
+    assert captured.read_bytes() == payload
 
 
 def test_success_preserves_files_without_commit_and_captures_private_artifacts(

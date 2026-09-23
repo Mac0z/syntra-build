@@ -38,7 +38,10 @@ stale ACL before granting access. No shared group grants cross-project access.
 Before dispatch, `BoundCodexRunner` asks M19 to re-prove the persisted project,
 milestone, repository registration, remote, branch, path containment, and HEAD.
 The CLI receives a bounded prompt over stdin and runs with that exact worktree
-as its current directory. Its environment is rebuilt from an allowlist:
+as its current directory. The helper explicitly connects its original stdin to
+the asynchronously supervised Codex child (`<&0`), so `codex exec -` receives
+the runner's prompt unchanged while signal forwarding and ACL cleanup remain in
+the supervising helper. Its environment is rebuilt from an allowlist:
 `PATH`, locale, `TERM`, and `TMPDIR`. The helper then discards that environment
 again with `env -i` and sets `HOME` from the `syntra-codex` passwd entry,
 `USER=LOGNAME=syntra-codex`, `XDG_CONFIG_HOME=$HOME/.config`, a fixed approved
