@@ -159,3 +159,13 @@ and protected GitHub token configuration.
 - [Engineering instructions](AGENTS.md)
 - [Design documents](docs/)
 - [Architecture Decision Records](docs/adr/)
+### M23 GitHub Actions smoke check
+
+On the configured Syntra host, reconcile one already-persisted M22 pull request
+against its exact expected head (the GitHub operations are read-only):
+
+```bash
+python -m syntra_build.m23_smoke --database /var/lib/syntra-build/syntra.db \
+  --project-id PROJECT_ID --milestone-id MILESTONE_ID \
+  --expected-head-sha 40_CHARACTER_SHA --correlation-id m23-host-smoke
+```
