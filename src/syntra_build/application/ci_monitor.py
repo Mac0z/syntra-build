@@ -26,17 +26,22 @@ from syntra_build.domain.ci import (
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
 from syntra_build.domain.milestone_state_machine import MilestoneTransitionRequest
 from syntra_build.domain.milestones import MilestoneState
-from syntra_build.domain.pull_requests import PullRequestState
+from syntra_build.domain.pull_requests import PullRequestDescriptor, PullRequestState
 from syntra_build.infrastructure.persistence.ci import CIRunRecord, SQLiteCIRepository
 from syntra_build.infrastructure.persistence.connection import transaction
 from syntra_build.infrastructure.persistence.milestones import SQLiteMilestoneRepository
 from syntra_build.infrastructure.persistence.pull_requests import (
+    PullRequestRecord,
     SQLitePullRequestRepository,
 )
 
 
 class CIActionsGateway(Protocol):
-    def observe(self, repository_full_name: str, head_sha: str) -> CIObservation: ...
+    def observe(
+        self, repository_full_name: str, pull_request_number: int, head_sha: str
+    ) -> CIObservation: ...
+
+    def rerun(self, repository_full_name: str, workflow_run_id: str) -> None: ...
 
 
 class CIMonitorError(RuntimeError):
@@ -69,7 +74,12 @@ class CIMonitor:
         self.milestones = SQLiteMilestoneRepository(connection, lambda: str(uuid4()))
 
     def reconcile(
-        self, project_id: ProjectId, milestone_id: MilestoneId, correlation_id: str
+        self,
+        project_id: ProjectId,
+        milestone_id: MilestoneId,
+        correlation_id: str,
+        *,
+        expected_head_sha: str | None = None,
     ) -> CIRunRecord:
         now = self.clock()
         milestone = self.milestones.get(milestone_id, project_id)
@@ -88,25 +98,36 @@ class CIMonitor:
         live = self.github_prs.get(
             repo["full_name"], persisted.external_pr_number, project_id, milestone_id
         )
-        if (
-            live.repository_id != repo["external_repository_id"]
-            or live.pull_request_number != persisted.external_pr_number
-            or live.head_branch != persisted.head_branch
-            or live.base_branch != persisted.base_branch
-        ):
-            raise CIMonitorError(
-                "live pull request identity differs from persisted ownership"
-            )
-        if live.state is not PullRequestState.OPEN:
-            raise CIMonitorError("implementation pull request is not open")
+        self._verify_live_pr(live, persisted, repo["external_repository_id"])
+        if expected_head_sha is not None and live.head_sha != expected_head_sha:
+            raise CIMonitorError("live PR head differs from expected head SHA")
         # M22's repository owns mutable PR observations. This preserves old CI runs,
         # while making the independently fetched live head the current PR head.
         with transaction(self.connection):
             self.prs.save_verified(
                 persisted.id, persisted.github_repository_id, live, persisted.title, now
             )
+        prior = self.runs.latest_for_head(persisted.id, live.head_sha)
+        if (
+            prior is not None
+            and self._retryable_terminal(prior)
+            and prior.next_check_at is not None
+            and prior.next_check_at <= now
+        ):
+            return self._start_rerun(
+                project_id,
+                milestone_id,
+                persisted.id,
+                repo["full_name"],
+                live.head_sha,
+                prior,
+                correlation_id,
+                now,
+            )
         try:
-            observation = self.actions.observe(repo["full_name"], live.head_sha)
+            observation = self.actions.observe(
+                repo["full_name"], persisted.external_pr_number, live.head_sha
+            )
         except CIProviderError as error:
             return self._provider_failure(
                 project_id,
@@ -123,7 +144,6 @@ class CIMonitor:
             if status is CIOverallStatus.FAILED
             else None
         )
-        prior = self.runs.latest(str(milestone_id))
         started = (
             prior.started_at
             if prior is not None and prior.head_sha == live.head_sha
@@ -141,13 +161,7 @@ class CIMonitor:
                 CIFailureClassification.UNKNOWN,
             }
         )
-        attempt = (
-            prior.retry_count + 1
-            if retryable_result
-            and prior is not None
-            and prior.head_sha == live.head_sha
-            else (1 if retryable_result else 0)
-        )
+        retry_count = prior.retry_count if prior is not None else 0
         next_at = (
             None
             if status
@@ -159,7 +173,7 @@ class CIMonitor:
             else self.polling.next_at(started, now)
         )
         if retryable_result:
-            next_at = self.retries.next_at(attempt - 1, now)
+            next_at = self.retries.next_at(retry_count, now)
         with transaction(self.connection):
             record = self.runs.reconcile(
                 str(project_id),
@@ -171,16 +185,104 @@ class CIMonitor:
                 observation.external_workflow_run_ids,
                 classification,
                 now,
-                retry_count=attempt,
+                retry_count=retry_count,
                 next_check_at=next_at,
                 summary={
                     "check_count": len(observation.checks),
                     "policy": "all_applicable_actions_jobs",
                 },
             )
-            self._transition(record, project_id, milestone_id, correlation_id, now)
             if retryable_result and next_at is None:
                 self._block(record, project_id, milestone_id, correlation_id, now)
+                return record
+        # Close the observation-to-transition race with a second independent PR read.
+        final_live = self.github_prs.get(
+            repo["full_name"], persisted.external_pr_number, project_id, milestone_id
+        )
+        self._verify_live_pr(final_live, persisted, repo["external_repository_id"])
+        if final_live.head_sha != live.head_sha:
+            with transaction(self.connection):
+                self.prs.save_verified(
+                    persisted.id,
+                    persisted.github_repository_id,
+                    final_live,
+                    persisted.title,
+                    now,
+                )
+            return record
+        with transaction(self.connection):
+            self._transition(record, project_id, milestone_id, correlation_id, now)
+        return record
+
+    @staticmethod
+    def _verify_live_pr(live: object, persisted: object, repository_id: int) -> None:
+        # Kept in one boundary so initial and pre-transition reads enforce exactly
+        # the same repository, PR, branch and open-state identity.
+        if not isinstance(live, PullRequestDescriptor) or not isinstance(
+            persisted, PullRequestRecord
+        ):
+            raise CIMonitorError("pull request response type was invalid")
+        if (
+            live.repository_id != repository_id
+            or live.pull_request_number != persisted.external_pr_number
+            or live.head_branch != persisted.head_branch
+            or live.base_branch != persisted.base_branch
+        ):
+            raise CIMonitorError(
+                "live pull request identity differs from persisted ownership"
+            )
+        if live.state is not PullRequestState.OPEN:
+            raise CIMonitorError("implementation pull request is not open")
+
+    @staticmethod
+    def _retryable_terminal(record: CIRunRecord) -> bool:
+        return record.overall_status in {
+            CIOverallStatus.FAILED,
+            CIOverallStatus.CANCELLED,
+        } and record.failure_classification in {
+            CIFailureClassification.TRANSIENT_INFRASTRUCTURE,
+            CIFailureClassification.EXTERNAL_DEPENDENCY,
+            CIFailureClassification.UNKNOWN,
+            None,
+        }
+
+    def _start_rerun(
+        self,
+        project_id: ProjectId,
+        milestone_id: MilestoneId,
+        pr_id: str,
+        repository_full_name: str,
+        head_sha: str,
+        prior: CIRunRecord,
+        correlation_id: str,
+        now: datetime,
+    ) -> CIRunRecord:
+        if not prior.external_workflow_run_ids:
+            with transaction(self.connection):
+                self._block(prior, project_id, milestone_id, correlation_id, now)
+            return prior
+        next_count = prior.retry_count + 1
+        next_poll = self.polling.next_at(now, now)
+        # Durable intent precedes the external mutation. A restart observes this
+        # queued attempt instead of blindly issuing another rerun.
+        with transaction(self.connection):
+            record = self.runs.reconcile(
+                str(project_id),
+                str(milestone_id),
+                pr_id,
+                head_sha,
+                CIOverallStatus.QUEUED,
+                (),
+                prior.external_workflow_run_ids,
+                None,
+                now,
+                retry_count=next_count,
+                next_check_at=next_poll,
+                summary={"rerun_of_ci_run_id": prior.id},
+                new_attempt=True,
+            )
+        for workflow_run_id in prior.external_workflow_run_ids:
+            self.actions.rerun(repository_full_name, workflow_run_id)
         return record
 
     def _provider_failure(
@@ -193,7 +295,7 @@ class CIMonitor:
         error: CIProviderError,
         now: datetime,
     ) -> CIRunRecord:
-        previous = self.runs.latest(str(milestone_id))
+        previous = self.runs.latest_for_head(pr_id, head_sha)
         attempt = (
             previous.retry_count + 1
             if previous and previous.head_sha == head_sha
@@ -302,13 +404,8 @@ class CIMonitor:
 
     def progress(self, project_id: ProjectId, milestone_id: MilestoneId) -> CIProgress:
         pr = self.prs.for_milestone(milestone_id)
-        run = self.runs.latest(str(milestone_id))
-        if (
-            pr is None
-            or run is None
-            or pr.project_id != project_id
-            or run.head_sha != pr.head_sha
-        ):
+        run = self.runs.latest_for_head(pr.id, pr.head_sha) if pr is not None else None
+        if pr is None or run is None or pr.project_id != project_id:
             raise CIMonitorError("fresh CI progress is unavailable")
         return CIProgress(
             CI_INTERFACE_VERSION,

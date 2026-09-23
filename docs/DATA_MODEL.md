@@ -1503,6 +1503,7 @@ project_id
 milestone_id
 pull_request_id
 head_sha
+attempt_number
 overall_status
 failure_classification
 external_workflow_run_id
@@ -1530,6 +1531,11 @@ UNKNOWN
 ## 33.4 Freshness rule
 
 A CI run is valid only for its exact `head_sha`.
+
+Each provider execution/re-run is a separate monotonically numbered attempt for
+that pull request and head SHA. Terminal attempts remain immutable historical
+evidence; a later attempt for the same SHA may become the current passing
+evidence after a trusted infrastructure re-run.
 
 When a new commit is pushed:
 

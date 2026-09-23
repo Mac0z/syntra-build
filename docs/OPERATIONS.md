@@ -600,6 +600,12 @@ completed:
 stop polling
 ```
 
+Terminal CI failures classified as transient infrastructure (and cancelled
+runs selected by the conservative retry policy) are re-run through the trusted
+GitHub Actions adapter after durable retry intent is recorded. Each re-run is a
+new preserved CI attempt for the same head SHA. Observation/API failures remain
+ordinary reconciliation retries. Retry exhaustion blocks the milestone.
+
 Webhooks may replace polling later if operationally worthwhile.
 
 Version one should favour simplicity.

@@ -932,6 +932,7 @@ MIGRATIONS: tuple[Migration, ...] = (
                 milestone_id TEXT NOT NULL,
                 pull_request_id TEXT NOT NULL,
                 head_sha TEXT NOT NULL CHECK(length(head_sha)=40),
+                attempt_number INTEGER NOT NULL CHECK(attempt_number>0),
                 overall_status TEXT NOT NULL CHECK(overall_status IN
                     ('QUEUED','RUNNING','PASSED','FAILED','CANCELLED','UNKNOWN')),
                 failure_classification TEXT CHECK(failure_classification IS NULL OR
@@ -944,7 +945,7 @@ MIGRATIONS: tuple[Migration, ...] = (
                 summary_json TEXT NOT NULL CHECK(json_valid(summary_json)),
                 retry_count INTEGER NOT NULL DEFAULT 0 CHECK(retry_count>=0),
                 next_check_at TEXT,
-                UNIQUE(pull_request_id,head_sha),
+                UNIQUE(pull_request_id,head_sha,attempt_number),
                 FOREIGN KEY(project_id,milestone_id,pull_request_id)
                     REFERENCES pull_requests(project_id,milestone_id,id)
             ) STRICT""",

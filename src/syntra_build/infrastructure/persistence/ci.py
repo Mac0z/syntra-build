@@ -25,6 +25,7 @@ class CIRunRecord:
     milestone_id: str
     pull_request_id: str
     head_sha: str
+    attempt_number: int
     overall_status: CIOverallStatus
     failure_classification: CIFailureClassification | None
     started_at: datetime
@@ -32,6 +33,7 @@ class CIRunRecord:
     retry_count: int
     next_check_at: datetime | None
     checks: tuple[CICheck, ...]
+    external_workflow_run_ids: tuple[str, ...]
 
 
 class SQLiteCIRepository:
@@ -53,9 +55,11 @@ class SQLiteCIRepository:
         retry_count: int = 0,
         next_check_at: datetime | None = None,
         summary: dict[str, object] | None = None,
+        new_attempt: bool = False,
     ) -> CIRunRecord:
         row = self.connection.execute(
-            "SELECT * FROM ci_runs WHERE pull_request_id=? AND head_sha=?",
+            """SELECT * FROM ci_runs WHERE pull_request_id=? AND head_sha=?
+            ORDER BY attempt_number DESC LIMIT 1""",
             (pull_request_id, head_sha),
         ).fetchone()
         completed = (
@@ -69,20 +73,22 @@ class SQLiteCIRepository:
             else None
         )
         payload = json.dumps(summary or {}, sort_keys=True, separators=(",", ":"))
-        if row is None:
+        if row is None or new_attempt:
             run_id = str(uuid4())
+            attempt_number = int(row["attempt_number"]) + 1 if row else 1
             self.connection.execute(
                 """INSERT INTO ci_runs
-                (id,project_id,milestone_id,pull_request_id,head_sha,overall_status,
+                (id,project_id,milestone_id,pull_request_id,head_sha,attempt_number,overall_status,
                  failure_classification,external_workflow_run_id,started_at,completed_at,
                  last_checked_at,summary_json,retry_count,next_check_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     run_id,
                     project_id,
                     milestone_id,
                     pull_request_id,
                     head_sha,
+                    attempt_number,
                     status,
                     classification,
                     ",".join(workflow_ids) or None,
@@ -205,6 +211,7 @@ class SQLiteCIRepository:
             row["milestone_id"],
             row["pull_request_id"],
             row["head_sha"],
+            row["attempt_number"],
             CIOverallStatus(row["overall_status"]),
             CIFailureClassification(row["failure_classification"])
             if row["failure_classification"]
@@ -214,11 +221,23 @@ class SQLiteCIRepository:
             row["retry_count"],
             parse(row["next_check_at"]),
             checks,
+            tuple(filter(None, (row["external_workflow_run_id"] or "").split(","))),
         )
 
     def latest(self, milestone_id: str) -> CIRunRecord | None:
         row = self.connection.execute(
-            "SELECT id FROM ci_runs WHERE milestone_id=? ORDER BY started_at DESC,id DESC LIMIT 1",
+            """SELECT id FROM ci_runs WHERE milestone_id=?
+            ORDER BY started_at DESC,attempt_number DESC,id DESC LIMIT 1""",
             (milestone_id,),
+        ).fetchone()
+        return self.get(row["id"]) if row else None
+
+    def latest_for_head(
+        self, pull_request_id: str, head_sha: str
+    ) -> CIRunRecord | None:
+        row = self.connection.execute(
+            """SELECT id FROM ci_runs WHERE pull_request_id=? AND head_sha=?
+            ORDER BY attempt_number DESC LIMIT 1""",
+            (pull_request_id, head_sha),
         ).fetchone()
         return self.get(row["id"]) if row else None

@@ -9,10 +9,13 @@ from uuid import uuid4
 import pytest
 
 from syntra_build.application.ci_monitor import CIMonitor
+from syntra_build.application.ci_policy import RequiredCheckPolicy
+from syntra_build.application.ci_scheduler import CIJobCoordinator
 from syntra_build.domain.ci import (
     CICheck,
     CICheckConclusion,
     CICheckStatus,
+    CIFailureClassification,
     CIObservation,
     CIOverallStatus,
 )
@@ -164,8 +167,9 @@ def test_ci_identity_rejects_cross_project_relationship(tmp_path: Path) -> None:
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 """INSERT INTO ci_runs
-                (id,project_id,milestone_id,pull_request_id,head_sha,overall_status,started_at,last_checked_at,summary_json)
-                VALUES (?,?,?,?,?,'UNKNOWN',?,?,'{}')""",
+                (id,project_id,milestone_id,pull_request_id,head_sha,attempt_number,
+                 overall_status,started_at,last_checked_at,summary_json)
+                VALUES (?,?,?,?,?,1,'UNKNOWN',?,?,'{}')""",
                 (
                     str(uuid4()),
                     str(other_project),
@@ -177,6 +181,173 @@ def test_ci_identity_rejects_cross_project_relationship(tmp_path: Path) -> None:
                 ),
             )
         assert project != other_project and milestone != other_milestone
+
+
+@pytest.mark.parametrize(
+    ("first_status", "first_conclusion"),
+    [
+        (CIOverallStatus.FAILED, CICheckConclusion.FAILED),
+        (CIOverallStatus.CANCELLED, CICheckConclusion.CANCELLED),
+    ],
+)
+def test_same_sha_retry_preserves_terminal_attempt_then_passes(
+    tmp_path: Path,
+    first_status: CIOverallStatus,
+    first_conclusion: CICheckConclusion,
+) -> None:
+    with open_database(tmp_path / f"{first_status}.db") as connection:
+        apply_migrations(connection)
+        project, milestone, _, pr_id = _seed(connection)
+        records = SQLiteCIRepository(connection)
+        now = datetime.now(UTC)
+        terminal = CICheck(
+            "validate", "old-job", CICheckStatus.COMPLETED, first_conclusion
+        )
+        with transaction(connection):
+            old = records.reconcile(
+                str(project),
+                str(milestone),
+                pr_id,
+                "a" * 40,
+                first_status,
+                (terminal,),
+                ("run-1",),
+                None,
+                now,
+            )
+            queued = records.reconcile(
+                str(project),
+                str(milestone),
+                pr_id,
+                "a" * 40,
+                CIOverallStatus.QUEUED,
+                (),
+                ("run-1",),
+                None,
+                now,
+                retry_count=1,
+                new_attempt=True,
+            )
+            current = records.reconcile(
+                str(project),
+                str(milestone),
+                pr_id,
+                "a" * 40,
+                CIOverallStatus.PASSED,
+                (
+                    CICheck(
+                        "validate",
+                        "new-job",
+                        CICheckStatus.COMPLETED,
+                        CICheckConclusion.PASSED,
+                    ),
+                ),
+                ("run-1",),
+                None,
+                now,
+            )
+        assert old.id != queued.id == current.id
+        assert old.attempt_number == 1 and current.attempt_number == 2
+        assert records.get(old.id).overall_status is first_status
+        latest = records.latest_for_head(pr_id, "a" * 40)
+        assert latest is not None and latest.overall_status is CIOverallStatus.PASSED
+
+
+def test_due_running_ci_enqueues_lightweight_ci_job_but_terminal_stops(
+    tmp_path: Path,
+) -> None:
+    from datetime import timedelta
+
+    with open_database(tmp_path / "schedule.db") as connection:
+        apply_migrations(connection)
+        project, milestone, _, pr_id = _seed(connection)
+        now = datetime.now(UTC)
+        records = SQLiteCIRepository(connection)
+        with transaction(connection):
+            running = records.reconcile(
+                str(project),
+                str(milestone),
+                pr_id,
+                "a" * 40,
+                CIOverallStatus.RUNNING,
+                (CICheck("validate", "job", CICheckStatus.RUNNING),),
+                ("run",),
+                None,
+                now,
+                next_check_at=now - timedelta(seconds=1),
+            )
+        coordinator = CIJobCoordinator(connection, id_factory=lambda: str(uuid4()))
+        assert coordinator.enqueue_due(now) == 1
+        job = connection.execute(
+            "SELECT * FROM jobs WHERE milestone_id=?", (str(milestone),)
+        ).fetchone()
+        assert job["worker_class"] == "CI" and job["job_type"] == "CI_RECONCILE"
+        connection.execute("UPDATE jobs SET state='SUCCEEDED' WHERE id=?", (job["id"],))
+        with transaction(connection):
+            records.reconcile(
+                str(project),
+                str(milestone),
+                pr_id,
+                "a" * 40,
+                CIOverallStatus.PASSED,
+                (
+                    CICheck(
+                        "validate",
+                        "job",
+                        CICheckStatus.COMPLETED,
+                        CICheckConclusion.PASSED,
+                    ),
+                ),
+                ("run",),
+                None,
+                now,
+                next_check_at=None,
+            )
+        assert records.get(running.id).next_check_at is None
+        assert coordinator.enqueue_due(now + timedelta(minutes=1)) == 0
+
+
+def test_unit_test_failure_classification_enters_ci_rework(tmp_path: Path) -> None:
+    from typing import cast
+
+    from syntra_build.application.ci_monitor import CIActionsGateway
+    from syntra_build.application.pull_requests import GitHubPullRequestGateway
+
+    with open_database(tmp_path / "test-rework.db") as connection:
+        apply_migrations(connection)
+        project, milestone, _, pr_id = _seed(connection)
+        now = datetime.now(UTC)
+        failed_check = CICheck(
+            "validate",
+            "job",
+            CICheckStatus.COMPLETED,
+            CICheckConclusion.FAILED,
+            failure_summary="Run unit tests",
+        )
+        classification = RequiredCheckPolicy().classify((failed_check,))
+        with transaction(connection):
+            record = SQLiteCIRepository(connection).reconcile(
+                str(project),
+                str(milestone),
+                pr_id,
+                "a" * 40,
+                CIOverallStatus.FAILED,
+                (failed_check,),
+                ("run",),
+                classification,
+                now,
+            )
+            monitor = CIMonitor(
+                connection,
+                cast(GitHubPullRequestGateway, object()),
+                cast(CIActionsGateway, object()),
+            )
+            monitor._transition(record, project, milestone, "test-failure", now)
+        assert classification is CIFailureClassification.TEST
+        state = connection.execute(
+            "SELECT state FROM milestones WHERE id=?", (str(milestone),)
+        ).fetchone()[0]
+        assert state == "CI_REWORK"
 
 
 def test_monitor_reconciles_new_head_idempotently_and_advances_only_fresh_pass(
@@ -219,7 +390,10 @@ def test_monitor_reconciles_new_head_idempotently_and_advances_only_fresh_pass(
             passing = False
 
             def observe(
-                self, repository_full_name: str, head_sha: str
+                self,
+                repository_full_name: str,
+                pull_request_number: int,
+                head_sha: str,
             ) -> CIObservation:
                 check = (
                     CICheck(
@@ -232,6 +406,9 @@ def test_monitor_reconciles_new_head_idempotently_and_advances_only_fresh_pass(
                     else CICheck("validate", "job-1", CICheckStatus.RUNNING)
                 )
                 return CIObservation((check,), ("run-1",))
+
+            def rerun(self, repository_full_name: str, workflow_run_id: str) -> None:
+                raise AssertionError("no rerun expected")
 
         prs, actions = PullRequests(), Actions()
         monitor = CIMonitor(connection, prs, actions)
@@ -249,3 +426,211 @@ def test_monitor_reconciles_new_head_idempotently_and_advances_only_fresh_pass(
             == "ARCHITECT_REVIEW"
         )
         assert connection.execute("SELECT count(*) FROM ci_runs").fetchone()[0] == 2
+
+
+def test_monitor_closes_stale_head_race_before_transition(tmp_path: Path) -> None:
+    with open_database(tmp_path / "race.db") as connection:
+        apply_migrations(connection)
+        project, milestone, _, _ = _seed(connection)
+
+        class MovingPullRequest:
+            calls = 0
+
+            def get(
+                self,
+                repository_full_name: str,
+                number: int,
+                project_id: ProjectId,
+                milestone_id: MilestoneId,
+            ) -> PullRequestDescriptor:
+                self.calls += 1
+                head = "a" * 40 if self.calls == 1 else "b" * 40
+                return PullRequestDescriptor(
+                    "1.0",
+                    project_id,
+                    milestone_id,
+                    77,
+                    number,
+                    PullRequestState.OPEN,
+                    "syntra/m23",
+                    "main",
+                    head,
+                    "https://example/pr/12",
+                )
+
+            def find_open(self, *args: object) -> tuple[()]:
+                return ()
+
+            def create(self, *args: object) -> PullRequestDescriptor:
+                raise AssertionError("CI monitoring is read-only")
+
+        class PassingActions:
+            def observe(
+                self,
+                repository_full_name: str,
+                pull_request_number: int,
+                head_sha: str,
+            ) -> CIObservation:
+                assert pull_request_number == 12 and head_sha == "a" * 40
+                return CIObservation(
+                    (
+                        CICheck(
+                            "validate",
+                            "job-a",
+                            CICheckStatus.COMPLETED,
+                            CICheckConclusion.PASSED,
+                        ),
+                    ),
+                    ("run-a",),
+                )
+
+            def rerun(self, repository_full_name: str, workflow_run_id: str) -> None:
+                raise AssertionError("no rerun expected")
+
+        record = CIMonitor(connection, MovingPullRequest(), PassingActions()).reconcile(
+            project, milestone, "race"
+        )
+        assert record.head_sha == "a" * 40
+        milestone_row = connection.execute(
+            "SELECT state FROM milestones WHERE id=?", (str(milestone),)
+        ).fetchone()
+        pr_row = connection.execute(
+            "SELECT head_sha FROM pull_requests WHERE milestone_id=?", (str(milestone),)
+        ).fetchone()
+        assert milestone_row["state"] == "CI_RUNNING"
+        assert pr_row["head_sha"] == "b" * 40
+
+
+def test_expected_head_guard_precedes_any_ci_mutation(tmp_path: Path) -> None:
+    from syntra_build.application.ci_monitor import CIMonitorError
+
+    with open_database(tmp_path / "expected.db") as connection:
+        apply_migrations(connection)
+        project, milestone, _, _ = _seed(connection)
+
+        class UnexpectedPullRequest:
+            def get(
+                self,
+                repository_full_name: str,
+                number: int,
+                project_id: ProjectId,
+                milestone_id: MilestoneId,
+            ) -> PullRequestDescriptor:
+                return PullRequestDescriptor(
+                    "1.0",
+                    project_id,
+                    milestone_id,
+                    77,
+                    number,
+                    PullRequestState.OPEN,
+                    "syntra/m23",
+                    "main",
+                    "b" * 40,
+                    "https://example/pr/12",
+                )
+
+            def find_open(self, *args: object) -> tuple[()]:
+                return ()
+
+            def create(self, *args: object) -> PullRequestDescriptor:
+                raise AssertionError("CI monitoring is read-only")
+
+        class UnusedActions:
+            def observe(
+                self, repository_full_name: str, pull_request_number: int, head_sha: str
+            ) -> CIObservation:
+                raise AssertionError("expected-head guard must precede Actions")
+
+            def rerun(self, repository_full_name: str, workflow_run_id: str) -> None:
+                raise AssertionError("expected-head guard must precede rerun")
+
+        monitor = CIMonitor(connection, UnexpectedPullRequest(), UnusedActions())
+        with pytest.raises(CIMonitorError, match="expected head"):
+            monitor.reconcile(project, milestone, "smoke", expected_head_sha="a" * 40)
+        assert connection.execute("SELECT count(*) FROM ci_runs").fetchone()[0] == 0
+        state = connection.execute(
+            "SELECT state FROM milestones WHERE id=?", (str(milestone),)
+        ).fetchone()[0]
+        assert state == "CI_RUNNING"
+
+
+def test_terminal_transient_rerun_same_sha_can_pass(tmp_path: Path) -> None:
+    from datetime import timedelta
+
+    with open_database(tmp_path / "rerun.db") as connection:
+        apply_migrations(connection)
+        project, milestone, _, _ = _seed(connection)
+        now = datetime.now(UTC)
+
+        class StablePullRequest:
+            def get(
+                self,
+                repository_full_name: str,
+                number: int,
+                project_id: ProjectId,
+                milestone_id: MilestoneId,
+            ) -> PullRequestDescriptor:
+                return PullRequestDescriptor(
+                    "1.0",
+                    project_id,
+                    milestone_id,
+                    77,
+                    number,
+                    PullRequestState.OPEN,
+                    "syntra/m23",
+                    "main",
+                    "a" * 40,
+                    "https://example/pr/12",
+                )
+
+            def find_open(self, *args: object) -> tuple[()]:
+                return ()
+
+            def create(self, *args: object) -> PullRequestDescriptor:
+                raise AssertionError("CI monitoring is read-only")
+
+        class RetryActions:
+            passing = False
+            reruns: list[str] = []
+
+            def observe(
+                self, repository_full_name: str, pull_request_number: int, head_sha: str
+            ) -> CIObservation:
+                return CIObservation(
+                    (
+                        CICheck(
+                            "validate",
+                            "new-job" if self.passing else "old-job",
+                            CICheckStatus.COMPLETED,
+                            CICheckConclusion.PASSED
+                            if self.passing
+                            else CICheckConclusion.FAILED,
+                            failure_summary=None
+                            if self.passing
+                            else "hosted runner lost",
+                        ),
+                    ),
+                    ("run-1",),
+                )
+
+            def rerun(self, repository_full_name: str, workflow_run_id: str) -> None:
+                self.reruns.append(workflow_run_id)
+                self.passing = True
+
+        actions = RetryActions()
+        clock_value = [now]
+        monitor = CIMonitor(
+            connection, StablePullRequest(), actions, clock=lambda: clock_value[0]
+        )
+        failed = monitor.reconcile(project, milestone, "retry")
+        assert failed.overall_status is CIOverallStatus.FAILED
+        clock_value[0] += timedelta(seconds=5)
+        queued = monitor.reconcile(project, milestone, "retry")
+        assert queued.attempt_number == 2 and actions.reruns == ["run-1"]
+        clock_value[0] += timedelta(seconds=20)
+        passed = monitor.reconcile(project, milestone, "retry")
+        assert passed.overall_status is CIOverallStatus.PASSED
+        assert (
+            SQLiteCIRepository(connection).get(failed.id).overall_status
+            is CIOverallStatus.FAILED
+        )

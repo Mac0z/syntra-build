@@ -26,6 +26,13 @@ from syntra_build.application.commands import (
 )
 from syntra_build.application.commands.router import HELP_TEXT, CommandRouter
 from syntra_build.domain import ProjectId, ProjectState
+from syntra_build.domain.ci import (
+    CICheck,
+    CICheckStatus,
+    CIOverallStatus,
+    CIProgress,
+)
+from syntra_build.domain.identifiers import MilestoneId
 
 NOW = datetime(2026, 9, 8, 12, tzinfo=UTC)
 FLOW_ID = ProjectId(UUID("00000000-0000-0000-0000-000000000001"))
@@ -180,6 +187,26 @@ def test_status_resolves_id_or_exact_canonical_name(reference: str) -> None:
     )
     assert queries.calls == [("resolve", reference), ("status", FLOW_ID)]
     assert not commands.calls and not audit.requests
+
+
+def test_status_command_includes_live_ci_check_progress() -> None:
+    progress = CIProgress(
+        "1.0",
+        FLOW_ID,
+        MilestoneId.generate(),
+        31,
+        "a" * 40,
+        CIOverallStatus.RUNNING,
+        (CICheck("validate", "job-1", CICheckStatus.RUNNING),),
+    )
+    project = ProjectSummary(FLOW_ID, "FlowTrack", ProjectState.BUILDING, progress)
+    queries = FakeQueries(
+        resolution=ProjectResolution(ResolutionOutcome.FOUND, project)
+    )
+    router, *_ = make_router(queries=queries)
+    response = router.route(inbound("status FlowTrack")).text
+    assert "PR #31 CI is running for aaaaaaa" in response
+    assert "validate: RUNNING" in response
 
 
 @pytest.mark.parametrize(

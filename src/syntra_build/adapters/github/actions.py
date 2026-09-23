@@ -53,10 +53,10 @@ class GitHubActionsAdapter:
         self._timeout = config.github.api_timeout_seconds
         self._transport = transport
 
-    def _get(self, path: str) -> Mapping[str, object]:
+    def _request(self, method: str, path: str) -> Mapping[str, object] | None:
         request = Request(
             f"{_API_ROOT}{path}",
-            method="GET",
+            method=method,
             headers={
                 "Accept": "application/vnd.github+json",
                 "Authorization": f"Bearer {self._token}",
@@ -78,10 +78,13 @@ class GitHubActionsAdapter:
             raise CIProviderError(
                 CIProviderFailure.TRANSIENT, "GitHub CI is temporarily unavailable"
             )
-        if response.status != 200:
+        expected = {200} if method == "GET" else {201}
+        if response.status not in expected:
             raise CIProviderError(
                 CIProviderFailure.REJECTION, "GitHub rejected CI discovery"
             )
+        if not response.body and method == "POST":
+            return None
         try:
             payload = json.loads(response.body)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -94,7 +97,17 @@ class GitHubActionsAdapter:
             )
         return payload
 
-    def observe(self, repository_full_name: str, head_sha: str) -> CIObservation:
+    def _get(self, path: str) -> Mapping[str, object]:
+        payload = self._request("GET", path)
+        if payload is None:
+            raise CIProviderError(
+                CIProviderFailure.MALFORMED, "GitHub CI response was empty"
+            )
+        return payload
+
+    def observe(
+        self, repository_full_name: str, pull_request_number: int, head_sha: str
+    ) -> CIObservation:
         repo = quote(repository_full_name, safe="/")
         runs: list[Mapping[str, object]] = []
         page = 1
@@ -121,11 +134,25 @@ class GitHubActionsAdapter:
             page += 1
         # The endpoint filter is independently checked: provider mistakes cannot
         # associate evidence from a different revision or trigger.
-        applicable = [
-            r
-            for r in runs
-            if r.get("head_sha") == head_sha and r.get("event") == "pull_request"
-        ]
+        applicable = []
+        for run in runs:
+            pull_requests = run.get("pull_requests")
+            if not isinstance(pull_requests, list):
+                raise CIProviderError(
+                    CIProviderFailure.MALFORMED,
+                    "workflow run pull-request identity was missing",
+                )
+            numbers = {
+                item.get("number")
+                for item in pull_requests
+                if isinstance(item, Mapping)
+            }
+            if (
+                run.get("head_sha") == head_sha
+                and run.get("event") == "pull_request"
+                and pull_request_number in numbers
+            ):
+                applicable.append(run)
         checks: list[CICheck] = []
         run_ids: list[str] = []
         for run in applicable:
@@ -154,6 +181,12 @@ class GitHubActionsAdapter:
         # Stable identity removes duplicate jobs returned during page movement.
         unique = {item.external_check_id: item for item in checks}
         return CIObservation(tuple(unique.values()), tuple(run_ids))
+
+    def rerun(self, repository_full_name: str, workflow_run_id: str) -> None:
+        """Start one trusted GitHub re-run after persisted retry intent."""
+        repo = quote(repository_full_name, safe="/")
+        run_id = quote(workflow_run_id, safe="")
+        self._request("POST", f"/repos/{repo}/actions/runs/{run_id}/rerun")
 
     @staticmethod
     def _normalize_job(job: Mapping[str, object]) -> CICheck:

@@ -150,6 +150,7 @@ class Scheduler:
         retry_policy: RetryBackoffPolicy | None = None,
         retry_promotion_limit: int = 100,
         exhaustion_handler: Callable[[Job, datetime], None] | None = None,
+        due_work_enqueuer: Callable[[datetime], None] | None = None,
     ):
         self._jobs = jobs
         self._capacity = capacity
@@ -169,6 +170,7 @@ class Scheduler:
         self._retry_promotion_limit = retry_promotion_limit
         self._fairness_cursor: dict[tuple[WorkerClass, int], str] = {}
         self._exhaustion_handler = exhaustion_handler
+        self._due_work_enqueuer = due_work_enqueuer
 
     @property
     def is_draining(self) -> bool:
@@ -189,6 +191,8 @@ class Scheduler:
         """Harvest completed work, then claim as many due jobs as capacity permits."""
         with self._lock:
             completed, failures, errors = self._harvest()
+            if self._due_work_enqueuer is not None:
+                self._due_work_enqueuer(self._now())
             if hasattr(self._jobs, "due_retries"):
                 promotion = promote_due_retries(
                     cast(RetryJobRepository, self._jobs),

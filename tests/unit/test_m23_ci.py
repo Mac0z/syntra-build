@@ -22,6 +22,7 @@ from syntra_build.domain.ci import (
     CICheck,
     CICheckConclusion,
     CICheckStatus,
+    CIFailureClassification,
     CIOverallStatus,
     CIProgress,
 )
@@ -74,6 +75,29 @@ def test_required_policy_fails_closed(
     assert RequiredCheckPolicy().evaluate(checks) is expected
 
 
+@pytest.mark.parametrize(
+    ("step", "expected"),
+    [
+        ("Run unit tests", CIFailureClassification.TEST),
+        ("Run lint checks", CIFailureClassification.IMPLEMENTATION),
+        ("Run static type checks", CIFailureClassification.IMPLEMENTATION),
+        ("Compile application", CIFailureClassification.IMPLEMENTATION),
+        ("Unrecognised provider failure", CIFailureClassification.UNKNOWN),
+    ],
+)
+def test_failure_classification_matches_ci_step_names(
+    step: str, expected: CIFailureClassification
+) -> None:
+    check = CICheck(
+        "validate",
+        "1",
+        CICheckStatus.COMPLETED,
+        CICheckConclusion.FAILED,
+        failure_summary=step,
+    )
+    assert RequiredCheckPolicy().classify((check,)) is expected
+
+
 def _config(tmp_path: Path) -> ApplicationConfig:
     data = tmp_path / "data"
     data.mkdir()
@@ -113,13 +137,23 @@ def test_actions_adapter_exact_head_multiple_jobs_and_pagination(
             ]
             return GitHubHTTPResponse(200, json.dumps({"jobs": jobs}).encode())
         runs = [
-            {"id": 9, "head_sha": "a" * 40, "event": "pull_request"},
-            {"id": 10, "head_sha": "b" * 40, "event": "pull_request"},
+            {
+                "id": 9,
+                "head_sha": "a" * 40,
+                "event": "pull_request",
+                "pull_requests": [{"number": 31}],
+            },
+            {
+                "id": 10,
+                "head_sha": "a" * 40,
+                "event": "pull_request",
+                "pull_requests": [{"number": 99}],
+            },
         ]
         return GitHubHTTPResponse(200, json.dumps({"workflow_runs": runs}).encode())
 
     observed = GitHubActionsAdapter(_config(tmp_path), transport=transport).observe(
-        "owner/repo", "a" * 40
+        "owner/repo", 31, "a" * 40
     )
     assert [item.name for item in observed.checks] == ["validate", "tests"]
     assert observed.external_workflow_run_ids == ("9",)
@@ -140,8 +174,22 @@ def test_actions_adapter_classifies_provider_failures(
 ) -> None:
     adapter = GitHubActionsAdapter(_config(tmp_path), transport=lambda r, t: response)
     with pytest.raises(CIProviderError) as caught:
-        adapter.observe("owner/repo", "a" * 40)
+        adapter.observe("owner/repo", 31, "a" * 40)
     assert caught.value.failure is failure
+
+
+def test_actions_adapter_uses_trusted_rerun_endpoint(tmp_path: Path) -> None:
+    seen: list[Request] = []
+
+    def transport(request: Request, timeout: float) -> GitHubHTTPResponse:
+        seen.append(request)
+        return GitHubHTTPResponse(201, b"")
+
+    GitHubActionsAdapter(_config(tmp_path), transport=transport).rerun(
+        "owner/repo", "123"
+    )
+    assert seen[0].method == "POST"
+    assert seen[0].full_url.endswith("/repos/owner/repo/actions/runs/123/rerun")
 
 
 def test_polling_and_retry_are_pure_and_bounded() -> None:

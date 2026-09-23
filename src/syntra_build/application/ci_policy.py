@@ -38,7 +38,16 @@ class RequiredCheckPolicy:
             for item in checks
             if item.conclusion is CICheckConclusion.FAILED
         ).casefold()
-        if any(word in summaries for word in ("pytest", "test failed", "tests failed")):
+        if any(
+            word in summaries
+            for word in (
+                "pytest",
+                "test failed",
+                "tests failed",
+                "run unit tests",
+                "unit test",
+            )
+        ):
             return CIFailureClassification.TEST
         if any(
             word in summaries for word in ("syntax", "compile", "lint", "type check")

@@ -29,9 +29,12 @@ def main() -> int:
         monitor = CIMonitor(
             connection, GitHubPullRequestAdapter(config), GitHubActionsAdapter(config)
         )
-        run = monitor.reconcile(project_id, milestone_id, args.correlation_id)
-        if run.head_sha != args.expected_head_sha:
-            raise RuntimeError("live PR head differs from --expected-head-sha")
+        run = monitor.reconcile(
+            project_id,
+            milestone_id,
+            args.correlation_id,
+            expected_head_sha=args.expected_head_sha,
+        )
         pr = monitor.prs.for_milestone(milestone_id)
         assert pr is not None
     print(
