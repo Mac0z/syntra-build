@@ -169,3 +169,23 @@ python -m syntra_build.m23_smoke --database /var/lib/syntra-build/syntra.db \
   --project-id PROJECT_ID --milestone-id MILESTONE_ID \
   --expected-head-sha 40_CHARACTER_SHA --correlation-id m23-host-smoke
 ```
+
+### M24 Architect review smoke check
+
+Run one bounded review of an existing `ARCHITECT_REVIEW` milestone. The command
+fails closed unless the supplied SHA is the live open PR head and has exact-head
+passing CI evidence. The Architect receives the trusted diff and approved source
+documents, but no GitHub credential or mutation capability:
+
+```bash
+python -m syntra_build.m24_smoke --database /var/lib/syntra-build/syntra.db \
+  --project-id PROJECT_ID --milestone-id MILESTONE_ID \
+  --expected-head-sha 40_CHARACTER_SHA --correlation-id m24-host-smoke
+```
+
+Migration 021 is forward-only. It preserves existing Architect DESIGN and
+SPECIFICATION_DRAFT audit history while adding exact-SHA reviews, findings, and
+review-rework tasks. A `CHANGES_REQUIRED` verdict atomically queues one durable
+Codex-class `CODEX_REVIEW_REWORK` job for the existing milestone worktree and PR;
+the scheduler dispatches that job through the normal bounded Codex capacity.
+Rollback requires restoring a pre-migration backup.

@@ -13,6 +13,8 @@ from syntra_build.application.architect import ArchitectError, ArchitectFailureK
 from syntra_build.domain import (
     ArchitectDesignRequest,
     ArchitectDesignResponse,
+    ArchitectReview,
+    ArchitectReviewRequest,
     SpecificationDraft,
     SpecificationDraftRequest,
 )
@@ -96,6 +98,64 @@ SPECIFICATION_DRAFT_SCHEMA: dict[str, object] = {
                 "properties": {
                     "code": {"type": "string", "minLength": 1},
                     "title": {"type": "string", "minLength": 1},
+                },
+            },
+        },
+    },
+}
+REVIEW_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "interface_version",
+        "correlation_id",
+        "project_id",
+        "milestone_id",
+        "pull_request_number",
+        "reviewed_sha",
+        "verdict",
+        "summary",
+        "findings",
+    ],
+    "properties": {
+        "interface_version": {"type": "string", "const": "1.0"},
+        "correlation_id": {"type": "string", "minLength": 1},
+        "project_id": {"type": "string", "minLength": 1},
+        "milestone_id": {"type": "string", "minLength": 1},
+        "pull_request_number": {"type": "integer", "minimum": 1},
+        "reviewed_sha": {"type": "string", "minLength": 40, "maxLength": 40},
+        "verdict": {
+            "type": "string",
+            "enum": [
+                "APPROVE",
+                "CHANGES_REQUIRED",
+                "HUMAN_TEST_REQUIRED",
+                "HUMAN_DECISION_REQUIRED",
+                "BLOCKED",
+            ],
+        },
+        "summary": {"type": "string", "minLength": 1},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "finding_id",
+                    "severity",
+                    "requirement_ref",
+                    "description",
+                    "recommended_action",
+                ],
+                "properties": {
+                    "finding_id": {"type": "string", "minLength": 1},
+                    "severity": {
+                        "type": "string",
+                        "enum": ["info", "minor", "major", "critical"],
+                    },
+                    "requirement_ref": {"type": "string", "minLength": 1},
+                    "description": {"type": "string", "minLength": 1},
+                    "recommended_action": {"type": "string", "minLength": 1},
                 },
             },
         },
@@ -263,6 +323,42 @@ class OpenAIArchitectProvider:
                 ArchitectFailureKind.MALFORMED_RESPONSE,
                 "Architect changed required repository visibility",
             )
+        self._capture_usage(raw)
+        return response
+
+    def review(self, request: ArchitectReviewRequest) -> ArchitectReview:
+        """Review supplied evidence only; the provider receives no GitHub capability."""
+        payload: dict[str, object] = {
+            "model": self.model,
+            "reasoning": {"effort": self._reasoning_effort},
+            "instructions": (
+                "Act only as an advisory code reviewer. Review the supplied exact PR revision "
+                "against its supplied approved SPEC.md, AGENTS.md, milestone requirements and "
+                "acceptance criteria. Do not execute tools or Git/GitHub operations; do not push, "
+                "create or merge a PR; do not mutate workflow state. Never accept stale evidence. "
+                "Return only the strict structured verdict."
+            ),
+            "input": json.dumps(
+                request.to_dict(), sort_keys=True, separators=(",", ":")
+            ),
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "architect_review",
+                    "strict": True,
+                    "schema": REVIEW_SCHEMA,
+                }
+            },
+            "store": False,
+        }
+        raw = self._send(payload)
+        try:
+            response = ArchitectReview.from_dict(self._output(raw))
+        except (DomainValidationError, TypeError, ValueError) as error:
+            raise ArchitectError(
+                ArchitectFailureKind.MALFORMED_RESPONSE,
+                "Architect provider returned malformed review output",
+            ) from error
         self._capture_usage(raw)
         return response
 

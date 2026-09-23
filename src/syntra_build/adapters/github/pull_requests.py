@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """Authenticated GitHub REST boundary for pull requests."""
 
 from __future__ import annotations
@@ -136,6 +137,44 @@ class GitHubPullRequestAdapter:
                 PullRequestFailure.TRANSIENT, "pull request lookup was inconclusive"
             )
         return self._normalize(payload, repository_full_name, project_id, milestone_id)
+
+    def diff(
+        self,
+        repository_full_name: str,
+        pull_request_number: int,
+        expected_head_sha: str,
+    ) -> str:
+        """Return bounded review material; caller independently verifies head identity."""
+        path = f"{self._repo_path(repository_full_name)}/pulls/{pull_request_number}"
+        request = Request(
+            f"{_API_ROOT}{path}",
+            method="GET",
+            headers={
+                "Accept": "application/vnd.github.diff",
+                "Authorization": f"Bearer {self._token}",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "syntra-build",
+            },
+        )
+        try:
+            response = self._transport(request, self._timeout)
+            diff = response.body.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            raise PullRequestError(
+                PullRequestFailure.TRANSIENT, "pull request diff lookup failed"
+            ) from error
+        if response.status != 200 or not diff.strip():
+            raise PullRequestError(
+                PullRequestFailure.TRANSIENT, "pull request diff was unavailable"
+            )
+        # SHA is intentionally accepted only as a binding assertion for the trusted
+        # caller's before/after PR reads; it is never interpolated into a request.
+        if len(expected_head_sha) != 40:
+            raise PullRequestError(
+                PullRequestFailure.REPOSITORY_IDENTITY_MISMATCH,
+                "expected review head SHA is invalid",
+            )
+        return diff
 
     def create(
         self, repository_full_name: str, request: PullRequestCreateRequest
