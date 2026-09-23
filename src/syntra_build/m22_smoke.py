@@ -10,9 +10,26 @@ from syntra_build.adapters.github.pull_requests import GitHubPullRequestAdapter
 from syntra_build.application.pull_requests import PullRequestLifecycleService
 from syntra_build.application.workspaces import WorkspaceService
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
+from syntra_build.infrastructure.config import ApplicationConfig
 from syntra_build.infrastructure.git_workspace import TrustedGit
 from syntra_build.infrastructure.persistence.connection import open_database
 from syntra_build.m18_smoke import load_m18_host_config
+
+
+def trusted_git_from_host_config(
+    config: ApplicationConfig, supplied_data_root: Path
+) -> TrustedGit:
+    """Build the authenticated Git seam only for the configured workspace root."""
+    configured_root = config.filesystem.data_root.resolve()
+    if supplied_data_root.resolve() != configured_root:
+        raise ValueError("--data-root must match the configured filesystem data root")
+    assert config.github.owner is not None
+    assert config.secrets.github_token is not None
+    return TrustedGit(
+        configured_root / "authentication",
+        username=config.github.owner,
+        token=config.secrets.github_token,
+    )
 
 
 def main() -> int:
@@ -28,12 +45,12 @@ def main() -> int:
     parser.add_argument("--correlation-id", required=True)
     args = parser.parse_args()
     config = load_m18_host_config()
+    trusted_git = trusted_git_from_host_config(config, args.data_root)
+    data_root = config.filesystem.data_root
     with open_database(args.database) as connection:
         result = PullRequestLifecycleService(
             connection,
-            WorkspaceService(
-                connection, TrustedGit(args.data_root / "git-auth"), args.data_root
-            ),
+            WorkspaceService(connection, trusted_git, data_root),
             GitHubPullRequestAdapter(config),
         ).establish_for_commit(
             ProjectId.from_string(args.project_id),
