@@ -875,6 +875,46 @@ MIGRATIONS: tuple[Migration, ...] = (
                 SELECT RAISE(ABORT,'commit validation evidence is immutable'); END""",
         ),
     ),
+    Migration(
+        version=18,
+        name="018_pull_request_lifecycle",
+        statements=(
+            "ALTER TABLE milestones ADD COLUMN active_pull_request_id TEXT REFERENCES pull_requests(id)",
+            """CREATE TABLE pull_request_creation_intents (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT NOT NULL UNIQUE REFERENCES milestones(id),
+                github_repository_id TEXT NOT NULL REFERENCES github_repositories(id),
+                correlation_id TEXT NOT NULL, head_branch TEXT NOT NULL,
+                base_branch TEXT NOT NULL, head_sha TEXT NOT NULL CHECK(length(head_sha)=40),
+                title TEXT NOT NULL, body_hash TEXT NOT NULL CHECK(length(body_hash)=64),
+                status TEXT NOT NULL CHECK(status IN ('RECONCILING','AMBIGUOUS','VERIFIED','BLOCKED')),
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id,milestone_id) REFERENCES milestones(project_id,id)
+            ) STRICT""",
+            """CREATE TABLE pull_requests (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT NOT NULL REFERENCES milestones(id),
+                github_repository_id TEXT NOT NULL REFERENCES github_repositories(id),
+                external_pr_number INTEGER NOT NULL CHECK(external_pr_number>0),
+                state TEXT NOT NULL CHECK(state IN ('OPEN','MERGED','CLOSED')),
+                head_branch TEXT NOT NULL, base_branch TEXT NOT NULL,
+                head_sha TEXT NOT NULL CHECK(length(head_sha)=40), web_url TEXT NOT NULL,
+                title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                merged_at TEXT, merge_commit_sha TEXT, closed_at TEXT,
+                last_reconciled_at TEXT NOT NULL,
+                UNIQUE(github_repository_id,external_pr_number),
+                FOREIGN KEY(project_id,milestone_id) REFERENCES milestones(project_id,id)
+            ) STRICT""",
+            "CREATE UNIQUE INDEX one_open_pr_per_milestone ON pull_requests(milestone_id) WHERE state='OPEN'",
+            "CREATE INDEX pull_requests_project_state ON pull_requests(project_id,state)",
+            """CREATE TRIGGER pull_requests_identity_immutable BEFORE UPDATE OF
+                id,project_id,milestone_id,github_repository_id,external_pr_number,
+                head_branch,base_branch,created_at ON pull_requests BEGIN
+                SELECT RAISE(ABORT,'pull request identity is immutable'); END""",
+            """CREATE TRIGGER pull_requests_no_delete BEFORE DELETE ON pull_requests BEGIN
+                SELECT RAISE(ABORT,'pull requests are preservation-oriented'); END""",
+        ),
+    ),
 )
 
 
