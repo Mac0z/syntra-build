@@ -8,8 +8,13 @@ import pytest
 
 from syntra_build.adapters.github.pull_requests import GitHubPullRequestAdapter
 from syntra_build.adapters.github.repository_names import GitHubHTTPResponse
-from syntra_build.application.pull_requests import PullRequestError, PullRequestFailure
+from syntra_build.application.pull_requests import (
+    PullRequestCreateConflict,
+    PullRequestError,
+    PullRequestFailure,
+)
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
+from syntra_build.domain.pull_requests import PullRequestCreateRequest
 from syntra_build.infrastructure.config import (
     ApplicationConfig,
     SecretInputs,
@@ -82,3 +87,27 @@ def test_adapter_rejects_malformed_and_normalizes_authentication(
         adapter.get("owner/repo", 12, project, milestone)
     assert auth.value.failure is PullRequestFailure.AUTHENTICATION
     assert "token" not in str(auth.value)
+
+
+def test_create_422_is_a_body_independent_reconciliation_signal(tmp_path: Path) -> None:
+    adapter = GitHubPullRequestAdapter(
+        _config(tmp_path),
+        transport=lambda r, t: GitHubHTTPResponse(
+            422, b'{"message":"synthetic secret must not become evidence"}'
+        ),
+    )
+    request = PullRequestCreateRequest(
+        "1.0",
+        "c",
+        ProjectId.generate(),
+        MilestoneId.generate(),
+        77,
+        "syntra/m22",
+        "main",
+        "a" * 40,
+        "title",
+        "body",
+    )
+    with pytest.raises(PullRequestCreateConflict) as conflict:
+        adapter.create("owner/repo", request)
+    assert "synthetic secret" not in str(conflict.value)

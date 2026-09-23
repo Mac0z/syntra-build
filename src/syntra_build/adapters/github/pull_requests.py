@@ -13,7 +13,11 @@ from syntra_build.adapters.github.repository_names import (
     _stdlib_transport,
 )
 from syntra_build.application.provisioning import AmbiguousGitHubResult
-from syntra_build.application.pull_requests import PullRequestError, PullRequestFailure
+from syntra_build.application.pull_requests import (
+    PullRequestCreateConflict,
+    PullRequestError,
+    PullRequestFailure,
+)
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
 from syntra_build.domain.pull_requests import (
     PULL_REQUEST_INTERFACE_VERSION,
@@ -146,6 +150,12 @@ class GitHubPullRequestAdapter:
                 "base": request.base_branch,
             },
         )
+        if status == 422:
+            # The response body is not identity evidence. The lifecycle must
+            # reconcile through a fresh, normalized list/get observation.
+            raise PullRequestCreateConflict(
+                "GitHub reported a pull request creation conflict"
+            )
         if status != 201 or not isinstance(payload, Mapping):
             raise PullRequestError(
                 PullRequestFailure.PROVIDER_REJECTION,

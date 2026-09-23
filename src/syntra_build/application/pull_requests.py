@@ -51,6 +51,10 @@ class PullRequestError(RuntimeError):
         super().__init__(message)
 
 
+class PullRequestCreateConflict(RuntimeError):
+    """Creation may conflict with an already-existing provider PR."""
+
+
 class GitHubPullRequestGateway(Protocol):
     def find_open(
         self,
@@ -315,6 +319,14 @@ class PullRequestLifecycleService:
             )
         try:
             return self.github.create(full_name, request)
+        except PullRequestCreateConflict:
+            matched = self._reconcile_after_conflict(full_name, request)
+            if matched is not None:
+                return matched
+            raise PullRequestError(
+                PullRequestFailure.PROVIDER_REJECTION,
+                "pull request creation conflicted without matching evidence",
+            ) from None
         except AmbiguousGitHubResult:
             with transaction(self.connection):
                 self.records.mark_intent(request.milestone_id, "AMBIGUOUS", now)
@@ -345,11 +357,51 @@ class PullRequestLifecycleService:
             # A confirmed absence permits exactly one bounded retry.
             try:
                 return self.github.create(full_name, request)
+            except PullRequestCreateConflict:
+                matched = self._reconcile_after_conflict(full_name, request)
+                if matched is not None:
+                    return matched
+                raise PullRequestError(
+                    PullRequestFailure.PROVIDER_REJECTION,
+                    "pull request creation conflicted without matching evidence",
+                ) from None
             except AmbiguousGitHubResult as error:
                 raise PullRequestError(
                     PullRequestFailure.AMBIGUOUS,
                     "bounded pull request creation retry remained ambiguous",
                 ) from error
+
+    def _reconcile_after_conflict(
+        self, full_name: str, request: PullRequestCreateRequest
+    ) -> PullRequestDescriptor | None:
+        observed = list(
+            self.github.find_open(
+                full_name,
+                request.head_branch,
+                request.project_id,
+                request.milestone_id,
+            )
+        )
+        matches = [
+            item
+            for item in observed
+            if item.repository_id == request.repository_id
+            and item.head_branch == request.head_branch
+            and item.base_branch == request.base_branch
+        ]
+        if len(matches) > 1:
+            raise PullRequestError(
+                PullRequestFailure.PR_COLLISION,
+                "create conflict found multiple matching pull requests",
+            )
+        if len(matches) == 1 and len(observed) == 1:
+            return matches[0]
+        if observed:
+            raise PullRequestError(
+                PullRequestFailure.PR_IDENTITY_MISMATCH,
+                "create conflict found incompatible pull request evidence",
+            )
+        return None
 
     @staticmethod
     def _verify(

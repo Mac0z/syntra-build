@@ -12,6 +12,7 @@ import pytest
 from syntra_build.application.provisioning import AmbiguousGitHubResult
 from syntra_build.application.pull_requests import (
     GitHubPullRequestGateway,
+    PullRequestCreateConflict,
     PullRequestError,
     PullRequestFailure,
     PullRequestLifecycleService,
@@ -52,6 +53,7 @@ class FakeWorkspace:
         self.commit_calls = 0
         self.push_calls = 0
         self.remote_mismatch = False
+        self.github: FakeGitHub | None = None
 
     def commit(
         self,
@@ -65,6 +67,13 @@ class FakeWorkspace:
         expected_diff_hash: str | None = None,
     ) -> TrustedCommit:
         self.commit_calls += 1
+        commit_sha = chr(ord("a") + self.commit_calls) * 40
+        evidence = self.connection.execute(
+            """SELECT id FROM change_sets WHERE worktree_id=? AND diff_hash=?
+            AND head_sha_before_commit=? AND decision='ACCEPT'""",
+            (self.workspace_id, expected_diff_hash, expected_head),
+        ).fetchone()
+        assert evidence is not None
         identifier = str(uuid4())
         self.connection.execute(
             """INSERT INTO commits
@@ -76,23 +85,23 @@ class FakeWorkspace:
                 str(project_id),
                 str(milestone_id),
                 self.workspace_id,
-                COMMIT,
+                commit_sha,
                 expected_head,
                 "syntra/m22",
                 message,
                 now.isoformat(),
-                CHANGE_SET,
+                evidence["id"],
                 expected_diff_hash,
             ),
         )
         self.connection.execute(
             "UPDATE git_workspaces SET current_head_sha=? WHERE id=?",
-            (COMMIT, self.workspace_id),
+            (commit_sha, self.workspace_id),
         )
         return TrustedCommit(
             identifier,
             self.workspace_id,
-            COMMIT,
+            commit_sha,
             expected_head,
             "syntra/m22",
             message,
@@ -138,6 +147,31 @@ class FakeWorkspace:
     ) -> TrustedPushResult:
         self.push_calls += 1
         remote = "c" * 40 if self.remote_mismatch else expected_commit_sha
+        persisted_pr = self.connection.execute(
+            "SELECT 1 FROM pull_requests WHERE milestone_id=?",
+            (str(milestone_id),),
+        ).fetchone()
+        if (
+            not self.remote_mismatch
+            and persisted_pr is not None
+            and self.github is not None
+            and self.github.remote
+        ):
+            live = self.github.remote[0]
+            self.github.remote = [
+                PullRequestDescriptor(
+                    live.interface_version,
+                    live.project_id,
+                    live.milestone_id,
+                    live.repository_id,
+                    live.pull_request_number,
+                    live.state,
+                    live.head_branch,
+                    live.base_branch,
+                    expected_commit_sha,
+                    live.web_url,
+                )
+            ]
         return TrustedPushResult("syntra/m22", expected_commit_sha, remote)
 
 
@@ -150,6 +184,8 @@ class FakeGitHub:
         self.create_calls = 0
         self.get_calls = 0
         self.ambiguous_creates = 0
+        self.conflict_creates = 0
+        self.conflict_observation: list[PullRequestDescriptor] = []
         self.intent_seen = False
 
     def find_open(
@@ -175,6 +211,10 @@ class FakeGitHub:
         if self.ambiguous_creates:
             self.ambiguous_creates -= 1
             raise AmbiguousGitHubResult("ambiguous")
+        if self.conflict_creates:
+            self.conflict_creates -= 1
+            self.remote = list(self.conflict_observation)
+            raise PullRequestCreateConflict("conflict")
         descriptor = descriptor_for(request, 12)
         self.remote = [descriptor]
         return descriptor
@@ -286,6 +326,7 @@ def service(
     project, milestone, workspace_id = setup(connection)
     workspaces = FakeWorkspace(connection, project, milestone, workspace_id)
     github = FakeGitHub(connection, project, milestone)
+    workspaces.github = github
     lifecycle = PullRequestLifecycleService(
         connection,
         cast(WorkspaceService, workspaces),
@@ -341,6 +382,76 @@ def test_second_ambiguous_create_stops_after_bounded_retry(tmp_path: Path) -> No
         )
 
 
+def test_ambiguous_then_create_conflict_reconciles_without_third_post(
+    tmp_path: Path,
+) -> None:
+    with open_database(tmp_path / "db") as connection:
+        apply_migrations(connection)
+        lifecycle, _, github, project, milestone = service(connection)
+        request = PullRequestCreateRequest(
+            "1.0",
+            "c",
+            project,
+            milestone,
+            77,
+            "syntra/m22",
+            "main",
+            COMMIT,
+            "title",
+            "body",
+        )
+        github.ambiguous_creates = 1
+        github.conflict_creates = 1
+        github.conflict_observation = [descriptor_for(request, 12)]
+        result = lifecycle.establish(project, milestone, CHANGE_SET, "c", now=NOW)
+        assert result.external_pr_number == 12
+        assert github.create_calls == 2 and github.get_calls == 1
+
+
+def test_create_conflict_without_observation_fails_without_third_post(
+    tmp_path: Path,
+) -> None:
+    with open_database(tmp_path / "db") as connection:
+        apply_migrations(connection)
+        lifecycle, _, github, project, milestone = service(connection)
+        github.ambiguous_creates = 1
+        github.conflict_creates = 1
+        with pytest.raises(PullRequestError) as raised:
+            lifecycle.establish(project, milestone, CHANGE_SET, "c", now=NOW)
+        assert raised.value.failure is PullRequestFailure.PROVIDER_REJECTION
+        assert github.create_calls == 2
+
+
+def test_create_conflict_with_multiple_observations_fails_closed(
+    tmp_path: Path,
+) -> None:
+    with open_database(tmp_path / "db") as connection:
+        apply_migrations(connection)
+        lifecycle, _, github, project, milestone = service(connection)
+        request = PullRequestCreateRequest(
+            "1.0",
+            "c",
+            project,
+            milestone,
+            77,
+            "syntra/m22",
+            "main",
+            COMMIT,
+            "title",
+            "body",
+        )
+        github.ambiguous_creates = 1
+        github.conflict_creates = 1
+        github.conflict_observation = [
+            descriptor_for(request, 11),
+            descriptor_for(request, 12),
+        ]
+        with pytest.raises(PullRequestError) as raised:
+            lifecycle.establish(project, milestone, CHANGE_SET, "c", now=NOW)
+        assert raised.value.failure is PullRequestFailure.PR_COLLISION
+        assert github.create_calls == 2
+
+
 def test_collision_and_remote_mismatch_fail_before_create(tmp_path: Path) -> None:
     with open_database(tmp_path / "db") as connection:
         apply_migrations(connection)
@@ -379,6 +490,60 @@ def test_multiple_or_conflicting_remote_prs_fail_closed(tmp_path: Path) -> None:
             ).fetchone()[0]
             == "BLOCKED"
         )
+
+
+def test_rework_reuses_same_pr_and_advances_intent_and_live_head(
+    tmp_path: Path,
+) -> None:
+    with open_database(tmp_path / "db") as connection:
+        apply_migrations(connection)
+        lifecycle, workspaces, github, project, milestone = service(connection)
+        first = lifecycle.establish(project, milestone, CHANGE_SET, "first", now=NOW)
+        original_intent = connection.execute(
+            "SELECT * FROM pull_request_creation_intents"
+        ).fetchone()
+        second_change_set = "00000000-0000-0000-0000-000000000023"
+        second_diff = "sha256:" + "2" * 64
+        workspace_id = connection.execute(
+            "SELECT id FROM git_workspaces WHERE milestone_id=?", (str(milestone),)
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO change_sets VALUES
+            (?,'1.0',?,?,?,?,?,?,?,0,?,'ACCEPT','rework','scanner','policy',?)""",
+            (
+                second_change_set,
+                str(project),
+                str(milestone),
+                workspace_id,
+                "syntra/m22",
+                PARENT,
+                COMMIT,
+                second_diff,
+                json.dumps([{"path": "file.txt"}]),
+                NOW.isoformat(),
+            ),
+        )
+        second = lifecycle.establish(
+            project, milestone, second_change_set, "rework", now=NOW
+        )
+        updated_intent = connection.execute(
+            "SELECT * FROM pull_request_creation_intents"
+        ).fetchone()
+        assert second.id == first.id
+        assert second.external_pr_number == first.external_pr_number == 12
+        assert second.head_sha == "c" * 40 == github.remote[0].head_sha
+        assert workspaces.commit_calls == 2 and workspaces.push_calls == 2
+        assert github.create_calls == 1
+        for field in (
+            "project_id",
+            "milestone_id",
+            "github_repository_id",
+            "head_branch",
+            "base_branch",
+        ):
+            assert updated_intent[field] == original_intent[field]
+        assert original_intent["head_sha"] == COMMIT
+        assert updated_intent["head_sha"] == "c" * 40
 
 
 @pytest.mark.parametrize(
