@@ -26,6 +26,14 @@ URLs and obvious secret assignments. Findings persist only the rule, safe line
 location and a truncated non-reversible SHA-256 fingerprint—never matching
 secret text. Binary content is exact-byte hash-bound and reported as unscanned.
 
+Regular text is read once by `ChangeCollector`. The exact byte object used for
+its content hash is retained in a process-local scan snapshot and passed to the
+secret scanner; validation never re-reads the mutable path. Snapshot bytes are
+neither persisted nor logged and live only for one validation call. Retention is
+bounded to 2 MiB per file and 8 MiB per validation. A text file outside that
+policy produces an explicit blocking `TEXT_SCAN_LIMIT_EXCEEDED` finding rather
+than being silently skipped.
+
 Trusted commit requires an accepted persisted change set and recomputes the
 canonical hash against the current persisted trusted HEAD immediately before
 staging. ACCEPT evidence must match the workspace, trusted HEAD, and diff hash;

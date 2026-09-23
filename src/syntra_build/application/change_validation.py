@@ -192,6 +192,14 @@ class ChangeValidationService:
                     "Remove the unsafe path and use repository-relative files only.",
                     path=path,
                 )
+            for path in collected.scan_omissions:
+                finding(
+                    FindingCode.TEXT_SCAN_LIMIT_EXCEEDED,
+                    FindingSeverity.HIGH,
+                    "Changed text content exceeded the bounded scan snapshot policy.",
+                    "Reduce or split the file so its exact content can be scanned.",
+                    path=path,
+                )
         if not files and not identity_problem:
             finding(
                 FindingCode.EMPTY_CHANGE_SET,
@@ -218,8 +226,7 @@ class ChangeValidationService:
                 )
             if item.status == "DELETED" or item.content_hash is None:
                 continue
-            candidate = actual_path / item.path
-            if candidate.is_symlink():
+            if item.file_kind == "symlink":
                 continue
             if item.binary:
                 finding(
@@ -231,7 +238,10 @@ class ChangeValidationService:
                     blocking=False,
                 )
                 continue
-            for match in self.scanner.scan(candidate.read_bytes()):
+            if collected is None or item.path not in collected.scan_payloads:
+                # A blocking omission finding was already produced by the collector.
+                continue
+            for match in self.scanner.scan(collected.scan_payloads[item.path]):
                 finding(
                     FindingCode.SECRET_DETECTED,
                     FindingSeverity.HIGH,

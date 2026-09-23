@@ -7,8 +7,10 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 
 from syntra_build.domain.change_validation import ChangedFile
 from syntra_build.domain.workspaces import WorkspaceError
@@ -20,6 +22,12 @@ class CollectedChanges:
     canonical_hash: str
     unsafe_paths: tuple[str, ...]
     escaping_symlinks: tuple[str, ...]
+    scan_payloads: Mapping[str, bytes]
+    scan_omissions: tuple[str, ...]
+
+
+_MAX_SCAN_FILE_BYTES = 2 * 1024 * 1024
+_MAX_SCAN_TOTAL_BYTES = 8 * 1024 * 1024
 
 
 class ChangeCollector:
@@ -80,6 +88,9 @@ class ChangeCollector:
         escapes: list[str] = []
         files: list[ChangedFile] = []
         canonical: list[dict[str, object]] = []
+        scan_payloads: dict[str, bytes] = {}
+        scan_omissions: list[str] = []
+        retained_scan_bytes = 0
         for name in sorted(set(base) | current, key=os.fsencode):
             if not self._safe(name):
                 unsafe.append(name)
@@ -146,6 +157,17 @@ class ChangeCollector:
                 name, status, name in staged, binary, digest, kind, git_mode
             )
             files.append(item)
+            if kind == "file" and not binary and status != "DELETED":
+                if (
+                    len(payload) > _MAX_SCAN_FILE_BYTES
+                    or retained_scan_bytes + len(payload) > _MAX_SCAN_TOTAL_BYTES
+                ):
+                    scan_omissions.append(name)
+                else:
+                    # This is the exact object used for content hashing above.
+                    # It is retained only for this validation call.
+                    scan_payloads[name] = payload
+                    retained_scan_bytes += len(payload)
             canonical.append(
                 {
                     "path": name,
@@ -168,6 +190,8 @@ class ChangeCollector:
             f"sha256:{hashlib.sha256(encoded).hexdigest()}",
             tuple(unsafe),
             tuple(escapes),
+            MappingProxyType(scan_payloads),
+            tuple(scan_omissions),
         )
 
 

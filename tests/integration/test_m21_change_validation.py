@@ -22,7 +22,10 @@ from syntra_build.domain.workspaces import (
     WorkspaceError,
     WorkspaceState,
 )
-from syntra_build.infrastructure.change_validation import ChangeCollector
+from syntra_build.infrastructure.change_validation import (
+    ChangeCollector,
+    CollectedChanges,
+)
 from syntra_build.infrastructure.git_workspace import TrustedGit
 from syntra_build.infrastructure.persistence import apply_migrations, open_database
 from syntra_build.infrastructure.persistence.change_validation import (
@@ -59,6 +62,17 @@ class MutateAfterStageGit(TrustedGit):
     def stage(self, worktree: Path, paths: Iterable[str]) -> None:
         super().stage(worktree, paths)
         (worktree / "race.txt").write_text("content B\n")
+
+
+class MutateAfterCollection(ChangeCollector):
+    def __init__(self, path: Path, replacement: str) -> None:
+        self.path = path
+        self.replacement = replacement
+
+    def collect(self, worktree: Path, base_sha: str) -> CollectedChanges:
+        collected = super().collect(worktree, base_sha)
+        self.path.write_text(self.replacement)
+        return collected
 
 
 def git(path: Path, *args: str, env: dict[str, str] | None = None) -> str:
@@ -379,6 +393,83 @@ def test_validation_from_earlier_trusted_head_cannot_be_reused(
             "must not use A evidence",
             expected_diff_hash=current.canonical_hash,
         )
+
+
+def test_secret_scan_uses_exact_bytes_captured_for_change_hash(
+    validation_workspace: tuple[
+        sqlite3.Connection, Path, TrustedGit, ChangeValidationService
+    ],
+) -> None:
+    db, worktree, trusted, _validation = validation_workspace
+    synthetic_secret = "token=ghp_SYNTHETIC0123456789ABCDE\n"
+    candidate = worktree / "race.env"
+    candidate.write_text(synthetic_secret)
+    collector = MutateAfterCollection(candidate, "token=benign-placeholder\n")
+    validation = ChangeValidationService(
+        db, trusted, worktree.parents[2], collector=collector
+    )
+
+    result = validation.validate(PID, MID, "scan-snapshot-secret")
+
+    assert result.decision is ValidationDecision.REWORK_REQUIRED
+    assert any(item.code is FindingCode.SECRET_DETECTED for item in result.findings)
+    assert candidate.read_text() == "token=benign-placeholder\n"
+    persisted = " ".join(
+        str(value)
+        for row in db.execute("SELECT * FROM validation_findings")
+        for value in row
+    )
+    assert synthetic_secret.strip() not in persisted
+
+
+def test_benign_scan_snapshot_cannot_authorise_later_secret_bytes(
+    validation_workspace: tuple[
+        sqlite3.Connection, Path, TrustedGit, ChangeValidationService
+    ],
+) -> None:
+    db, worktree, trusted, _validation = validation_workspace
+    candidate = worktree / "race.env"
+    candidate.write_text("token=benign-placeholder\n")
+    synthetic_secret = "token=ghp_SYNTHETIC0123456789ABCDE\n"
+    collector = MutateAfterCollection(candidate, synthetic_secret)
+    validation = ChangeValidationService(
+        db, trusted, worktree.parents[2], collector=collector
+    )
+    accepted = validation.validate(PID, MID, "scan-snapshot-benign")
+    assert accepted.decision is ValidationDecision.ACCEPT
+    assert not any(
+        item.code is FindingCode.SECRET_DETECTED for item in accepted.findings
+    )
+
+    with pytest.raises(WorkspaceError, match="changed after validation"):
+        WorkspaceService(db, trusted, worktree.parents[2]).commit(
+            PID,
+            MID,
+            accepted.trusted_head_sha,
+            ["race.env"],
+            "must reject changed bytes",
+            expected_diff_hash=accepted.diff_hash,
+        )
+    assert db.execute("SELECT count(*) FROM commits").fetchone()[0] == 0
+
+
+def test_oversized_text_snapshot_produces_explicit_blocking_finding(
+    validation_workspace: tuple[
+        sqlite3.Connection, Path, TrustedGit, ChangeValidationService
+    ],
+) -> None:
+    _db, worktree, _trusted, validation = validation_workspace
+    (worktree / "large.txt").write_bytes(b"x" * (2 * 1024 * 1024 + 1))
+
+    result = validation.validate(PID, MID, "scan-size-limit")
+
+    assert result.decision is ValidationDecision.REWORK_REQUIRED
+    assert any(
+        item.code is FindingCode.TEXT_SCAN_LIMIT_EXCEEDED
+        and item.path == "large.txt"
+        and item.blocking
+        for item in result.findings
+    )
 
 
 @pytest.mark.parametrize(

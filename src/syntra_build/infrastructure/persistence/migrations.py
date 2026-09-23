@@ -847,7 +847,7 @@ MIGRATIONS: tuple[Migration, ...] = (
                     ('SECRET_DETECTED','WORKSPACE_ESCAPE_ATTEMPT',
                      'PROTECTED_PATH_CHANGE','REPOSITORY_IDENTITY_MISMATCH',
                      'UNEXPECTED_GIT_HISTORY_CHANGE','EMPTY_CHANGE_SET',
-                     'BINARY_NOT_SCANNED')),
+                     'BINARY_NOT_SCANNED','TEXT_SCAN_LIMIT_EXCEEDED')),
                 severity TEXT NOT NULL CHECK(severity IN ('INFO','WARNING','HIGH','CRITICAL')),
                 file_path TEXT,
                 safe_location TEXT,
