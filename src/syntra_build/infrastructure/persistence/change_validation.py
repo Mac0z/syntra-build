@@ -4,8 +4,18 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 
 from syntra_build.domain.change_validation import ChangeSet
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedChangeSetEvidence:
+    id: str
+    workspace_id: str
+    trusted_head_sha: str
+    diff_hash: str
+    files_json: str
 
 
 class SQLiteValidationRepository:
@@ -68,12 +78,23 @@ class SQLiteValidationRepository:
                 ),
             )
 
-    def accepted_hash(self, workspace_id: str, diff_hash: str) -> bool:
-        return (
-            self.connection.execute(
-                """SELECT 1 FROM change_sets WHERE worktree_id=? AND diff_hash=?
-            AND decision='ACCEPT' ORDER BY created_at DESC LIMIT 1""",
-                (workspace_id, diff_hash),
-            ).fetchone()
-            is not None
+    def accepted_evidence(
+        self, workspace_id: str, trusted_head_sha: str, diff_hash: str
+    ) -> AcceptedChangeSetEvidence | None:
+        """Return ACCEPT evidence bound to one workspace, HEAD, and exact diff."""
+        row = self.connection.execute(
+            """SELECT id,worktree_id,head_sha_before_commit,diff_hash,files_json
+            FROM change_sets WHERE worktree_id=? AND head_sha_before_commit=?
+            AND diff_hash=? AND decision='ACCEPT'
+            ORDER BY created_at DESC LIMIT 1""",
+            (workspace_id, trusted_head_sha, diff_hash),
+        ).fetchone()
+        if row is None:
+            return None
+        return AcceptedChangeSetEvidence(
+            row["id"],
+            row["worktree_id"],
+            row["head_sha_before_commit"],
+            row["diff_hash"],
+            row["files_json"],
         )

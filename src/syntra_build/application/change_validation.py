@@ -128,6 +128,7 @@ class ChangeValidationService:
         workspace = self.workspaces.workspace_for_milestone(milestone_id)
         if managed is None or workspace is None or workspace.project_id != project_id:
             raise WorkspaceError("managed workspace does not exist")
+        trusted_head = workspace.current_head_sha or workspace.base_sha
         expected_path = (
             self.workspace_root / str(project_id) / str(milestone_id)
         ).resolve(strict=False)
@@ -147,13 +148,12 @@ class ChangeValidationService:
             )
             branch = self.git.branch(actual_path)
             head = self.git.head(actual_path)
-            expected_head = workspace.current_head_sha or workspace.base_sha
-            history_problem = branch != workspace.branch_name or head != expected_head
+            history_problem = branch != workspace.branch_name or head != trusted_head
         except OSError, WorkspaceError:
             actual_path = workspace.path
             branch, head = (
                 workspace.branch_name,
-                workspace.current_head_sha or workspace.base_sha,
+                trusted_head,
             )
             identity_problem = True
         if identity_problem:
@@ -172,10 +172,10 @@ class ChangeValidationService:
             )
 
         try:
-            collected = self.collector.collect(actual_path, workspace.base_sha)
+            collected = self.collector.collect(actual_path, trusted_head)
         except WorkspaceError:
             collected = (
-                self.collector.collect(workspace.path, workspace.base_sha)
+                self.collector.collect(workspace.path, trusted_head)
                 if not identity_problem
                 else None
             )
@@ -261,7 +261,7 @@ class ChangeValidationService:
             workspace.id,
             workspace.branch_name,
             workspace.base_sha,
-            workspace.current_head_sha or workspace.base_sha,
+            trusted_head,
             files,
             diff_hash,
             not files,

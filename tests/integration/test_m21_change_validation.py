@@ -5,9 +5,10 @@ import os
 import sqlite3
 import subprocess
 from collections.abc import Generator
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -21,8 +22,12 @@ from syntra_build.domain.workspaces import (
     WorkspaceError,
     WorkspaceState,
 )
+from syntra_build.infrastructure.change_validation import ChangeCollector
 from syntra_build.infrastructure.git_workspace import TrustedGit
 from syntra_build.infrastructure.persistence import apply_migrations, open_database
+from syntra_build.infrastructure.persistence.change_validation import (
+    SQLiteValidationRepository,
+)
 from syntra_build.infrastructure.persistence.workspaces import SQLiteWorkspaceRepository
 
 NOW = datetime(2026, 9, 23, tzinfo=UTC)
@@ -251,6 +256,103 @@ def test_validation_hash_is_bound_to_trusted_commit_and_untracked_bytes(
         ).fetchone()[0]
         == final.diff_hash
     )
+
+
+def test_rework_validation_is_relative_to_latest_trusted_head(
+    validation_workspace: tuple[
+        sqlite3.Connection, Path, TrustedGit, ChangeValidationService
+    ],
+) -> None:
+    db, worktree, trusted, validation = validation_workspace
+    workspace_service = WorkspaceService(db, trusted, worktree.parents[2])
+    original_base = trusted.head(worktree)
+    (worktree / "file-one.txt").write_text("first cycle\n")
+
+    first = validation.validate(PID, MID, "first-cycle")
+    assert first.base_sha == original_base
+    assert first.trusted_head_sha == original_base
+    commit_b = workspace_service.commit(
+        PID,
+        MID,
+        first.trusted_head_sha,
+        ["file-one.txt"],
+        "first trusted commit",
+        expected_diff_hash=first.diff_hash,
+    )
+    persisted = SQLiteWorkspaceRepository(db).workspace_for_milestone(MID)
+    assert persisted is not None
+    assert persisted.base_sha == original_base
+    assert persisted.current_head_sha == commit_b.commit_sha
+
+    (worktree / "file-two.txt").write_text("second cycle\n")
+    second = validation.validate(PID, MID, "second-cycle")
+    assert second.base_sha == original_base
+    assert second.trusted_head_sha == commit_b.commit_sha
+    assert second.added_files == ("file-two.txt",)
+    assert "file-one.txt" not in {item.path for item in second.files}
+    commit_c = workspace_service.commit(
+        PID,
+        MID,
+        second.trusted_head_sha,
+        ["file-two.txt"],
+        "second trusted commit",
+        expected_diff_hash=second.diff_hash,
+    )
+    assert commit_c.parent_sha == commit_b.commit_sha
+
+    for column, value in (
+        ("change_set_id", first.id),
+        ("validated_diff_hash", first.diff_hash),
+    ):
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            db.execute(
+                f"UPDATE commits SET {column}=? WHERE id=?", (value, commit_c.id)
+            )
+        db.rollback()
+
+
+def test_validation_from_earlier_trusted_head_cannot_be_reused(
+    validation_workspace: tuple[
+        sqlite3.Connection, Path, TrustedGit, ChangeValidationService
+    ],
+) -> None:
+    db, worktree, trusted, validation = validation_workspace
+    workspace_service = WorkspaceService(db, trusted, worktree.parents[2])
+    (worktree / "file-one.txt").write_text("first\n")
+    first = validation.validate(PID, MID, "head-a")
+    commit_b = workspace_service.commit(
+        PID,
+        MID,
+        first.trusted_head_sha,
+        ["file-one.txt"],
+        "advance to B",
+        expected_diff_hash=first.diff_hash,
+    )
+
+    (worktree / "file-two.txt").write_text("same-looking later diff\n")
+    current = ChangeCollector().collect(worktree, commit_b.commit_sha)
+    # Persist otherwise matching ACCEPT evidence deliberately anchored to A.
+    stale = replace(
+        first,
+        id=str(uuid4()),
+        trusted_head_sha=first.trusted_head_sha,
+        files=current.files,
+        diff_hash=current.canonical_hash,
+        findings=(),
+        correlation_id="stale-head-evidence",
+    )
+    SQLiteValidationRepository(db).save(stale)
+    db.commit()
+
+    with pytest.raises(WorkspaceError, match="for trusted HEAD"):
+        workspace_service.commit(
+            PID,
+            MID,
+            commit_b.commit_sha,
+            ["file-two.txt"],
+            "must not use A evidence",
+            expected_diff_hash=current.canonical_hash,
+        )
 
 
 def test_wrong_remote_branch_and_unexpected_commit_are_blocked(

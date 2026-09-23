@@ -870,6 +870,9 @@ MIGRATIONS: tuple[Migration, ...] = (
                 SELECT RAISE(ABORT,'validation findings are preservation-oriented'); END""",
             "ALTER TABLE commits ADD COLUMN change_set_id TEXT REFERENCES change_sets(id)",
             "ALTER TABLE commits ADD COLUMN validated_diff_hash TEXT",
+            """CREATE TRIGGER commits_validation_evidence_immutable BEFORE UPDATE OF
+                change_set_id,validated_diff_hash ON commits BEGIN
+                SELECT RAISE(ABORT,'commit validation evidence is immutable'); END""",
         ),
     ),
 )

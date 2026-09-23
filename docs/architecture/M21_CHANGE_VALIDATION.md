@@ -7,6 +7,13 @@ file kind, mode and exact content SHA-256. Symlink values are hashed without
 following them. The resulting `sha256:` value binds append-only validation
 evidence to the exact effective tree and staging state.
 
+`base_sha` remains the immutable original milestone branch point. In contrast,
+`trusted_head_sha` is the latest Syntra-authoritative commit on that branch and
+is the comparison tree for collection and hashing. They are equal for the first
+implementation cycle; after a trusted commit, later rework is collected only
+relative to the new `trusted_head_sha`, so already committed unchanged files do
+not reappear.
+
 Validation independently checks the persisted repository, workspace path,
 worktree registration, common Git directory, remote, branch and trusted HEAD.
 Identity, history and workspace-escape findings block. Empty changes,
@@ -20,7 +27,9 @@ location and a truncated non-reversible SHA-256 fingerprint—never matching
 secret text. Binary content is exact-byte hash-bound and reported as unscanned.
 
 Trusted commit requires an accepted persisted change set and recomputes the
-canonical hash immediately before staging. A mismatch refuses the commit,
+canonical hash against the current persisted trusted HEAD immediately before
+staging. ACCEPT evidence must match the workspace, trusted HEAD, and diff hash;
+the resulting commit immutably records that exact change-set ID and hash. A mismatch refuses the commit,
 including modification or removal of an untracked file. Validation performs no
 commit, push, pull-request, CI or review operation and preserves rejected
 workspaces for diagnosis and rework.

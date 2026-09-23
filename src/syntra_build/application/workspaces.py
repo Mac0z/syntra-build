@@ -289,22 +289,22 @@ class WorkspaceService:
             raise WorkspaceError("workspace HEAD or branch changed before commit")
         if expected_diff_hash is None:
             raise WorkspaceError("an accepted validated diff hash is required")
-        current = ChangeCollector().collect(workspace.path, workspace.base_sha)
+        trusted_head = workspace.current_head_sha or workspace.base_sha
+        current = ChangeCollector().collect(workspace.path, trusted_head)
         validations = SQLiteValidationRepository(self.connection)
         if current.canonical_hash != expected_diff_hash:
             raise WorkspaceError("workspace diff changed after validation")
-        if not validations.accepted_hash(workspace.id, expected_diff_hash):
-            raise WorkspaceError("diff hash has no accepted validation evidence")
-        row = self.connection.execute(
-            """SELECT id,files_json FROM change_sets WHERE worktree_id=? AND diff_hash=?
-            AND decision='ACCEPT' ORDER BY created_at DESC LIMIT 1""",
-            (workspace.id, expected_diff_hash),
-        ).fetchone()
-        assert row is not None
+        evidence = validations.accepted_evidence(
+            workspace.id, trusted_head, expected_diff_hash
+        )
+        if evidence is None:
+            raise WorkspaceError(
+                "diff hash has no accepted validation evidence for trusted HEAD"
+            )
         selected_paths = tuple(paths)
         validated_paths = {
             item["path"]
-            for item in cast(list[dict[str, object]], json.loads(row["files_json"]))
+            for item in cast(list[dict[str, object]], json.loads(evidence.files_json))
         }
         if set(selected_paths) != validated_paths or len(selected_paths) != len(
             validated_paths
@@ -316,7 +316,7 @@ class WorkspaceService:
         )
         with transaction(self.connection):
             self.records.save_commit(
-                commit, project_id, milestone_id, row["id"], expected_diff_hash
+                commit, project_id, milestone_id, evidence.id, expected_diff_hash
             )
             self.records.update_workspace(workspace.id, WorkspaceState.READY, sha, now)
         return commit
