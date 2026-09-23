@@ -126,9 +126,14 @@ class SQLiteWorkspaceRepository:
         commit: TrustedCommit,
         project_id: ProjectId,
         milestone_id: MilestoneId,
+        change_set_id: str | None = None,
+        diff_hash: str | None = None,
     ) -> None:
         self.connection.execute(
-            """INSERT INTO commits VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)""",
+            """INSERT INTO commits
+            (id,project_id,milestone_id,worktree_id,commit_sha,parent_sha,branch_name,
+             message,author_name,author_email,created_at,pushed_at,change_set_id,
+             validated_diff_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)""",
             (
                 commit.id,
                 str(project_id),
@@ -141,6 +146,8 @@ class SQLiteWorkspaceRepository:
                 "Syntra Build",
                 "syntra@localhost",
                 commit.created_at.isoformat(),
+                change_set_id,
+                diff_hash,
             ),
         )
 

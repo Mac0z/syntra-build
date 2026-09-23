@@ -817,6 +817,61 @@ MIGRATIONS: tuple[Migration, ...] = (
                 SELECT RAISE(ABORT,'Codex test reports are preservation-oriented'); END""",
         ),
     ),
+    Migration(
+        version=17,
+        name="017_change_validation",
+        statements=(
+            """CREATE TABLE change_sets (
+                id TEXT PRIMARY KEY,
+                interface_version TEXT NOT NULL CHECK(interface_version='1.0'),
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT NOT NULL REFERENCES milestones(id),
+                worktree_id TEXT NOT NULL REFERENCES git_workspaces(id),
+                branch_name TEXT NOT NULL,
+                base_sha TEXT NOT NULL CHECK(length(base_sha)=40),
+                head_sha_before_commit TEXT NOT NULL CHECK(length(head_sha_before_commit)=40),
+                diff_hash TEXT NOT NULL CHECK(length(diff_hash)=71 AND diff_hash LIKE 'sha256:%'),
+                is_empty INTEGER NOT NULL CHECK(is_empty IN (0,1)),
+                files_json TEXT NOT NULL CHECK(json_valid(files_json)),
+                decision TEXT NOT NULL CHECK(decision IN ('ACCEPT','REWORK_REQUIRED','BLOCKED')),
+                correlation_id TEXT NOT NULL,
+                scanner_version TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id,milestone_id) REFERENCES milestones(project_id,id)
+            ) STRICT""",
+            """CREATE TABLE validation_findings (
+                id TEXT PRIMARY KEY,
+                change_set_id TEXT NOT NULL REFERENCES change_sets(id),
+                finding_code TEXT NOT NULL CHECK(finding_code IN
+                    ('SECRET_DETECTED','WORKSPACE_ESCAPE_ATTEMPT',
+                     'PROTECTED_PATH_CHANGE','REPOSITORY_IDENTITY_MISMATCH',
+                     'UNEXPECTED_GIT_HISTORY_CHANGE','EMPTY_CHANGE_SET',
+                     'BINARY_NOT_SCANNED')),
+                severity TEXT NOT NULL CHECK(severity IN ('INFO','WARNING','HIGH','CRITICAL')),
+                file_path TEXT,
+                safe_location TEXT,
+                fingerprint TEXT,
+                message TEXT NOT NULL,
+                remediation TEXT NOT NULL,
+                blocking INTEGER NOT NULL CHECK(blocking IN (0,1)),
+                created_at TEXT NOT NULL,
+                correlation_id TEXT NOT NULL
+            ) STRICT""",
+            "CREATE INDEX change_sets_workspace_created ON change_sets(worktree_id,created_at)",
+            "CREATE INDEX validation_findings_change_set ON validation_findings(change_set_id)",
+            """CREATE TRIGGER change_sets_no_update BEFORE UPDATE ON change_sets BEGIN
+                SELECT RAISE(ABORT,'change sets are preservation-oriented'); END""",
+            """CREATE TRIGGER change_sets_no_delete BEFORE DELETE ON change_sets BEGIN
+                SELECT RAISE(ABORT,'change sets are preservation-oriented'); END""",
+            """CREATE TRIGGER validation_findings_no_update BEFORE UPDATE ON validation_findings BEGIN
+                SELECT RAISE(ABORT,'validation findings are preservation-oriented'); END""",
+            """CREATE TRIGGER validation_findings_no_delete BEFORE DELETE ON validation_findings BEGIN
+                SELECT RAISE(ABORT,'validation findings are preservation-oriented'); END""",
+            "ALTER TABLE commits ADD COLUMN change_set_id TEXT REFERENCES change_sets(id)",
+            "ALTER TABLE commits ADD COLUMN validated_diff_hash TEXT",
+        ),
+    ),
 )
 
 

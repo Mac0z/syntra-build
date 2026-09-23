@@ -128,6 +128,13 @@ class TrustedGit:
     def head(self, worktree: Path) -> str:
         return self._run(worktree, ["rev-parse", "HEAD"])
 
+    def common_dir(self, worktree: Path) -> Path:
+        value = self._run(worktree, ["rev-parse", "--git-common-dir"])
+        return (worktree / value).resolve(strict=True)
+
+    def is_bare(self, repository: Path) -> bool:
+        return self._run(repository, ["rev-parse", "--is-bare-repository"]) == "true"
+
     def changes(
         self, worktree: Path
     ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
