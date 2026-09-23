@@ -313,10 +313,47 @@ def test_approve_exact_head_and_toctou_staleness(tmp_path: Path) -> None:
             SQLiteMilestoneRepository(db, lambda: str(uuid4()))
             .get(milestone, project)
             .state
-            is MilestoneState.ARCHITECT_REVIEW
+            is MilestoneState.BLOCKED
         )
         assert not ArchitectApprovalFreshness(db).is_current(
             project, milestone, pr_id, SHA_B
+        )
+        assert not ArchitectApprovalFreshness(db).is_current(
+            project, milestone, pr_id, SHA_A
+        )
+        review = db.execute(
+            "SELECT reviewed_sha,superseded_at FROM architect_reviews WHERE id=?",
+            (result.id,),
+        ).fetchone()
+        assert review["reviewed_sha"] == SHA_A and review["superseded_at"] is not None
+        transition = db.execute(
+            """SELECT reason,metadata_json FROM state_transitions
+            WHERE milestone_id=? AND new_state='BLOCKED' ORDER BY rowid DESC LIMIT 1""",
+            (str(milestone),),
+        ).fetchone()
+        metadata = json.loads(transition["metadata_json"])
+        assert transition["reason"] == (
+            "PR head changed unexpectedly during Architect review"
+        )
+        assert metadata == {
+            "newly_observed_sha": SHA_B,
+            "pull_request_id": pr_id,
+            "review_id": result.id,
+            "stale_reviewed_sha": SHA_A,
+        }
+        assert (
+            db.execute(
+                "SELECT count(*) FROM jobs WHERE job_type='CI_RECONCILE'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute(
+                """SELECT count(*) FROM state_transitions
+                WHERE milestone_id=? AND new_state='MERGE_READY'""",
+                (str(milestone),),
+            ).fetchone()[0]
+            == 0
         )
 
 

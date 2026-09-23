@@ -176,12 +176,25 @@ class ArchitectReviewService:
                 superseded=stale,
             )
             if stale:
-                # The authoritative state machine has no ARCHITECT_REVIEW ->
-                # CI_RUNNING edge. Preserve the historical interaction and updated
-                # head, but do not invent a transition or accept stale evidence.
-                # The existing PR/CI reconciliation path must observe passing CI
-                # for this new persisted head before a subsequent review can start.
-                pass
+                self.milestones.apply_transition(
+                    MilestoneTransitionRequest(
+                        milestone_id,
+                        project_id,
+                        MilestoneState.ARCHITECT_REVIEW,
+                        MilestoneState.BLOCKED,
+                        "PR head changed unexpectedly during Architect review",
+                        "SYSTEM",
+                        "architect-review",
+                        correlation_id,
+                        completed,
+                        metadata={
+                            "stale_reviewed_sha": request.head_sha,
+                            "newly_observed_sha": final_live.head_sha,
+                            "review_id": record.id,
+                            "pull_request_id": pr_id,
+                        },
+                    )
+                )
             elif response.verdict is ArchitectReviewVerdict.APPROVE:
                 # A later explicit APPROVE is the persisted resolution evidence; code
                 # movement alone never closes a finding.
