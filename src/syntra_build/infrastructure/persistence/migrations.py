@@ -965,9 +965,6 @@ MIGRATIONS: tuple[Migration, ...] = (
             ) STRICT""",
             "CREATE INDEX ci_runs_milestone_checked ON ci_runs(milestone_id,last_checked_at)",
             "CREATE INDEX ci_checks_run_status ON ci_checks(ci_run_id,status)",
-            """CREATE UNIQUE INDEX one_active_ci_reconcile_per_milestone
-                ON jobs(milestone_id,job_type) WHERE job_type='CI_RECONCILE'
-                AND state IN ('QUEUED','DISPATCHED','RUNNING','WAITING_EXTERNAL','RETRY_WAIT')""",
             """CREATE TRIGGER ci_runs_identity_immutable BEFORE UPDATE OF
                 id,project_id,milestone_id,pull_request_id,head_sha,started_at
                 ON ci_runs BEGIN SELECT RAISE(ABORT,'CI run identity is immutable'); END""",
@@ -978,6 +975,15 @@ MIGRATIONS: tuple[Migration, ...] = (
                 SELECT RAISE(ABORT,'CI check identity is immutable'); END""",
             """CREATE TRIGGER ci_checks_no_delete BEFORE DELETE ON ci_checks BEGIN
                 SELECT RAISE(ABORT,'CI checks are preservation-oriented'); END""",
+        ),
+    ),
+    Migration(
+        version=20,
+        name="020_ci_reconcile_job_uniqueness",
+        statements=(
+            """CREATE UNIQUE INDEX one_active_ci_reconcile_per_milestone
+                ON jobs(milestone_id,job_type) WHERE job_type='CI_RECONCILE'
+                AND state IN ('QUEUED','DISPATCHED','RUNNING','WAITING_EXTERNAL','RETRY_WAIT')""",
         ),
     ),
 )

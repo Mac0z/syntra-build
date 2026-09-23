@@ -34,6 +34,7 @@ from syntra_build.infrastructure.persistence.connection import (
     open_database,
     transaction,
 )
+from syntra_build.infrastructure.persistence.errors import PersistenceError
 from syntra_build.infrastructure.persistence.jobs import SQLiteJobRepository
 from syntra_build.infrastructure.persistence.migrations import (
     MIGRATIONS,
@@ -107,12 +108,74 @@ def _seed(
     return project, milestone, repository, pr.id
 
 
-def test_migration_019_is_contiguous_and_upgrades_018(tmp_path: Path) -> None:
-    assert MIGRATIONS[-1].version == 19 and MIGRATIONS[-1].name == "019_ci_monitoring"
-    with open_database(tmp_path / "db") as connection:
-        apply_migrations(connection, MIGRATIONS[:-1])
+def test_migrations_019_and_020_are_contiguous_and_upgrade_018(tmp_path: Path) -> None:
+    assert MIGRATIONS[-2].version == 19
+    assert MIGRATIONS[-2].name == "019_ci_monitoring"
+    assert MIGRATIONS[-1].version == 20
+    assert MIGRATIONS[-1].name == "020_ci_reconcile_job_uniqueness"
+    with open_database(tmp_path / "clean.db") as connection:
         apply_migrations(connection)
+        assert current_schema_version(connection) == 20
+    with open_database(tmp_path / "from-018.db") as connection:
+        apply_migrations(connection, MIGRATIONS[:-2])
+        apply_migrations(connection)
+        assert current_schema_version(connection) == 20
+
+
+def test_old_019_upgrades_to_020_and_rejects_duplicate_active_ci_jobs(
+    tmp_path: Path,
+) -> None:
+    with open_database(tmp_path / "from-old-019.db") as connection:
+        apply_migrations(connection, MIGRATIONS[:-1])
         assert current_schema_version(connection) == 19
+        assert (
+            connection.execute(
+                """SELECT count(*) FROM sqlite_master WHERE type='index'
+            AND name='one_active_ci_reconcile_per_milestone'"""
+            ).fetchone()[0]
+            == 0
+        )
+        project, milestone, _, _ = _seed(connection)
+        now = datetime.now(UTC)
+        jobs = SQLiteJobRepository(connection, lambda: str(uuid4()))
+        jobs.add(
+            Job(
+                JobId.generate(),
+                project,
+                "CI_RECONCILE",
+                JobState.QUEUED,
+                0,
+                now,
+                now,
+                milestone,
+                correlation_id="first",
+                worker_class=WorkerClass.CI,
+            )
+        )
+        apply_migrations(connection)
+        assert current_schema_version(connection) == 20
+        assert (
+            connection.execute(
+                """SELECT count(*) FROM sqlite_master WHERE type='index'
+            AND name='one_active_ci_reconcile_per_milestone'"""
+            ).fetchone()[0]
+            == 1
+        )
+        with pytest.raises(PersistenceError):
+            jobs.add(
+                Job(
+                    JobId.generate(),
+                    project,
+                    "CI_RECONCILE",
+                    JobState.QUEUED,
+                    0,
+                    now,
+                    now,
+                    milestone,
+                    correlation_id="duplicate",
+                    worker_class=WorkerClass.CI,
+                )
+            )
 
 
 def test_ci_runs_are_exact_sha_historical_and_checks_are_idempotent(
