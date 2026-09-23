@@ -36,6 +36,32 @@ class CIJobCoordinator:
         self.id_factory = id_factory
         self.jobs = SQLiteJobRepository(connection, id_factory)
 
+    def bootstrap(
+        self,
+        project_id: ProjectId,
+        milestone_id: MilestoneId,
+        correlation_id: str,
+        now: datetime,
+    ) -> bool:
+        """Queue the first reconciliation once, before any ``ci_runs`` exist."""
+        evidence = self.connection.execute(
+            """SELECT 1 FROM ci_runs r JOIN pull_requests p ON p.id=r.pull_request_id
+            WHERE r.project_id=? AND r.milestone_id=? AND r.head_sha=p.head_sha
+            LIMIT 1""",
+            (str(project_id), str(milestone_id)),
+        ).fetchone()
+        active = self.connection.execute(
+            """SELECT 1 FROM jobs WHERE project_id=? AND milestone_id=?
+            AND job_type=? AND state IN
+                ('QUEUED','DISPATCHED','RUNNING','WAITING_EXTERNAL','RETRY_WAIT')
+            LIMIT 1""",
+            (str(project_id), str(milestone_id), CI_RECONCILE_JOB),
+        ).fetchone()
+        if evidence is not None or active is not None:
+            return False
+        self._add_job(project_id, milestone_id, correlation_id, now)
+        return True
+
     def enqueue_due(self, now: datetime) -> int:
         rows = self.connection.execute(
             """SELECT r.project_id,r.milestone_id
@@ -51,24 +77,37 @@ class CIJobCoordinator:
             (now.isoformat(), CI_RECONCILE_JOB),
         ).fetchall()
         for row in rows:
-            identifier = self.id_factory()
-            self.jobs.add(
-                Job(
-                    JobId.from_string(identifier),
-                    ProjectId.from_string(row["project_id"]),
-                    CI_RECONCILE_JOB,
-                    JobState.QUEUED,
-                    0,
-                    now,
-                    now,
-                    MilestoneId.from_string(row["milestone_id"]),
-                    correlation_id=identifier,
-                    max_attempts=1,
-                    scheduled_at=now,
-                    worker_class=WorkerClass.CI,
-                )
+            self._add_job(
+                ProjectId.from_string(row["project_id"]),
+                MilestoneId.from_string(row["milestone_id"]),
+                self.id_factory(),
+                now,
             )
         return len(rows)
+
+    def _add_job(
+        self,
+        project_id: ProjectId,
+        milestone_id: MilestoneId,
+        correlation_id: str,
+        now: datetime,
+    ) -> None:
+        self.jobs.add(
+            Job(
+                JobId.from_string(self.id_factory()),
+                project_id,
+                CI_RECONCILE_JOB,
+                JobState.QUEUED,
+                0,
+                now,
+                now,
+                milestone_id,
+                correlation_id=correlation_id,
+                max_attempts=1,
+                scheduled_at=now,
+                worker_class=WorkerClass.CI,
+            )
+        )
 
 
 class CIReconciliationExecutor:

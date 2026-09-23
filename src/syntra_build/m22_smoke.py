@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from syntra_build.adapters.github.pull_requests import GitHubPullRequestAdapter
+from syntra_build.application.ci_handoff import PullRequestCIHandoff
 from syntra_build.application.pull_requests import PullRequestLifecycleService
 from syntra_build.application.workspaces import WorkspaceService
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
@@ -48,16 +49,20 @@ def main() -> int:
     trusted_git = trusted_git_from_host_config(config, args.data_root)
     data_root = config.filesystem.data_root
     with open_database(args.database) as connection:
-        result = PullRequestLifecycleService(
+        lifecycle = PullRequestLifecycleService(
             connection,
             WorkspaceService(connection, trusted_git, data_root),
             GitHubPullRequestAdapter(config),
-        ).establish_for_commit(
+        )
+        result = lifecycle.establish_for_commit(
             ProjectId.from_string(args.project_id),
             MilestoneId.from_string(args.milestone_id),
             args.commit_sha,
             args.change_set_id,
             args.correlation_id,
+        )
+        PullRequestCIHandoff(connection, lifecycle).accept_verified(
+            result, args.correlation_id
         )
     print(
         json.dumps(

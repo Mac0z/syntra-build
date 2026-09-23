@@ -9,6 +9,12 @@ from uuid import uuid4
 
 import pytest
 
+from syntra_build.application.ci_handoff import PullRequestCIHandoff
+from syntra_build.application.ci_monitor import CIMonitor
+from syntra_build.application.ci_scheduler import (
+    CIJobCoordinator,
+    CIReconciliationExecutor,
+)
 from syntra_build.application.provisioning import AmbiguousGitHubResult
 from syntra_build.application.pull_requests import (
     GitHubPullRequestGateway,
@@ -17,8 +23,13 @@ from syntra_build.application.pull_requests import (
     PullRequestFailure,
     PullRequestLifecycleService,
 )
+from syntra_build.application.scheduler import Scheduler, WorkerCapacity
 from syntra_build.application.workspaces import WorkspaceService
+from syntra_build.domain.ci import CICheck, CICheckStatus, CIObservation
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
+from syntra_build.domain.jobs import WorkerClass
+from syntra_build.domain.milestone_state_machine import MilestoneTransitionRequest
+from syntra_build.domain.milestones import MilestoneState
 from syntra_build.domain.pull_requests import (
     PullRequestCreateRequest,
     PullRequestDescriptor,
@@ -31,8 +42,12 @@ from syntra_build.domain.workspaces import (
     WorkspaceInspection,
     WorkspaceState,
 )
+from syntra_build.infrastructure.config import SchedulerConfig
+from syntra_build.infrastructure.persistence.ci import SQLiteCIRepository
 from syntra_build.infrastructure.persistence.connection import open_database
+from syntra_build.infrastructure.persistence.jobs import SQLiteJobRepository
 from syntra_build.infrastructure.persistence.migrations import apply_migrations
+from syntra_build.infrastructure.persistence.milestones import SQLiteMilestoneRepository
 
 NOW = datetime(2026, 1, 2, tzinfo=UTC)
 PARENT = "a" * 40
@@ -352,6 +367,108 @@ def test_initial_lifecycle_persists_intent_before_create_and_recovers_commit(
         assert workspaces.commit_calls == 1 and github.create_calls == 1
 
 
+def test_verified_pr_handoff_bootstraps_and_schedules_real_ci_reconciliation(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "handoff.db"
+    with open_database(database_path) as connection:
+        apply_migrations(connection)
+        lifecycle, _, github, project, milestone = service(connection)
+        workflow = PullRequestCIHandoff(connection, lifecycle)
+        record = workflow.establish(project, milestone, CHANGE_SET, "handoff", now=NOW)
+        # Recovery repeats converge without another transition or active job.
+        workflow.accept_verified(record, "handoff-recovery", NOW)
+        assert (
+            connection.execute(
+                "SELECT state FROM milestones WHERE id=?", (str(milestone),)
+            ).fetchone()[0]
+            == "CI_RUNNING"
+        )
+        assert (
+            connection.execute(
+                """SELECT count(*) FROM state_transitions WHERE milestone_id=?
+            AND previous_state='PR_CREATING' AND new_state='CI_RUNNING'""",
+                (str(milestone),),
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                """SELECT count(*) FROM jobs WHERE milestone_id=?
+                AND job_type='CI_RECONCILE' AND state IN
+                ('QUEUED','DISPATCHED','RUNNING','WAITING_EXTERNAL','RETRY_WAIT')""",
+                (str(milestone),),
+            ).fetchone()[0]
+            == 1
+        )
+
+        live = github.remote[0]
+
+        class WorkerPullRequests:
+            def get(
+                self,
+                repository_full_name: str,
+                number: int,
+                project_id: ProjectId,
+                milestone_id: MilestoneId,
+            ) -> PullRequestDescriptor:
+                return live
+
+            def find_open(self, *args: object) -> tuple[PullRequestDescriptor, ...]:
+                return (live,)
+
+            def create(self, *args: object) -> PullRequestDescriptor:
+                raise AssertionError("CI monitoring is read-only")
+
+        class RunningActions:
+            def observe(
+                self,
+                repository_full_name: str,
+                pull_request_number: int,
+                head_sha: str,
+            ) -> CIObservation:
+                return CIObservation(
+                    (CICheck("validate", "job", CICheckStatus.RUNNING),),
+                    ("run",),
+                )
+
+            def rerun(self, repository_full_name: str, workflow_run_id: str) -> None:
+                raise AssertionError("no rerun expected")
+
+        jobs = SQLiteJobRepository(connection, lambda: str(uuid4()))
+        capacity = WorkerCapacity(SchedulerConfig().worker_class_limits())
+        executor = CIReconciliationExecutor(
+            database_path,
+            lambda worker_connection: CIMonitor(
+                worker_connection, WorkerPullRequests(), RunningActions()
+            ),
+        )
+        scheduler = Scheduler(
+            jobs,
+            capacity,
+            {WorkerClass.CI: executor},
+            clock=lambda: datetime.now(UTC),
+        )
+        try:
+            assert scheduler.run_once().dispatched == 1
+            scheduler.wait_for_wake(2)
+            assert scheduler.run_once().completed == 1
+            completed = connection.execute(
+                """SELECT state FROM jobs WHERE milestone_id=?
+                AND job_type='CI_RECONCILE'""",
+                (str(milestone),),
+            ).fetchone()[0]
+            assert completed == "SUCCEEDED"
+            run = SQLiteCIRepository(connection).latest_for_head(
+                record.id, record.head_sha
+            )
+            assert run is not None and run.next_check_at is not None
+            assert CIJobCoordinator(connection).enqueue_due(run.next_check_at) == 1
+            assert capacity.in_use(WorkerClass.CODEX) == 0
+        finally:
+            scheduler.close()
+
+
 def test_ambiguous_create_reconciles_and_bounded_retry(tmp_path: Path) -> None:
     with open_database(tmp_path / "db") as connection:
         apply_migrations(connection)
@@ -523,7 +640,31 @@ def test_rework_reuses_same_pr_and_advances_intent_and_live_head(
                 NOW.isoformat(),
             ),
         )
-        second = lifecycle.establish(
+        milestones = SQLiteMilestoneRepository(connection, lambda: str(uuid4()))
+        state = MilestoneState.PR_CREATING
+        for target in (
+            MilestoneState.CI_RUNNING,
+            MilestoneState.CI_REWORK,
+            MilestoneState.CODING,
+            MilestoneState.VALIDATING_CHANGES,
+            MilestoneState.COMMITTING,
+            MilestoneState.PUSHING,
+        ):
+            milestones.apply_transition(
+                MilestoneTransitionRequest(
+                    milestone,
+                    project,
+                    state,
+                    target,
+                    "test rework path",
+                    "SYSTEM",
+                    "test",
+                    "rework-path",
+                    NOW,
+                )
+            )
+            state = target
+        second = PullRequestCIHandoff(connection, lifecycle).establish(
             project, milestone, second_change_set, "rework", now=NOW
         )
         updated_intent = connection.execute(
@@ -534,6 +675,15 @@ def test_rework_reuses_same_pr_and_advances_intent_and_live_head(
         assert second.head_sha == "c" * 40 == github.remote[0].head_sha
         assert workspaces.commit_calls == 2 and workspaces.push_calls == 2
         assert github.create_calls == 1
+        assert milestones.get(milestone, project).state is MilestoneState.CI_RUNNING
+        assert (
+            connection.execute(
+                """SELECT count(*) FROM jobs WHERE milestone_id=?
+                AND job_type='CI_RECONCILE' AND state='QUEUED'""",
+                (str(milestone),),
+            ).fetchone()[0]
+            == 1
+        )
         for field in (
             "project_id",
             "milestone_id",
