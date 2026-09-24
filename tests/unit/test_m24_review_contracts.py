@@ -68,3 +68,39 @@ def test_review_contract_rejects_extra_fields() -> None:
     payload["merge_now"] = True
     with pytest.raises(DomainValidationError, match="malformed"):
         ArchitectReview.from_dict(payload)
+
+
+@pytest.mark.parametrize("kind", ["PRODUCT", "TECHNICAL"])
+def test_human_decision_contract_strictly_parses_decision_kind(kind: str) -> None:
+    payload = _payload()
+    payload.update(
+        verdict="HUMAN_DECISION_REQUIRED",
+        findings=[],
+        human_gate={
+            "prompt": "Choose an approach",
+            "resume_milestone_state": "ARCHITECT_REVIEW",
+            "options": ["A", "B"],
+            "test_instructions": None,
+            "artifact_reference": None,
+            "decision_kind": kind,
+        },
+    )
+    assert ArchitectReview.from_dict(payload).human_gate is not None
+
+
+def test_human_test_rejects_decision_kind_and_non_review_resume() -> None:
+    payload = _payload()
+    payload.update(
+        verdict="HUMAN_TEST_REQUIRED",
+        findings=[],
+        human_gate={
+            "prompt": "Test it",
+            "resume_milestone_state": "MERGE_READY",
+            "options": [],
+            "test_instructions": "Exercise the build",
+            "artifact_reference": "artifact://build",
+            "decision_kind": "PRODUCT",
+        },
+    )
+    with pytest.raises(DomainValidationError, match="ARCHITECT_REVIEW"):
+        ArchitectReview.from_dict(payload)

@@ -1,13 +1,17 @@
 # ruff: noqa: E501
 from __future__ import annotations
 
+import json
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
+from syntra_build.adapters.telegram.application import route_authorized_message
+from syntra_build.adapters.telegram.models import TelegramInboundMessage
 from syntra_build.application.architect_review import ArchitectReviewService
 from syntra_build.application.commands.models import Command, CommandType
 from syntra_build.application.human_intervention import (
@@ -18,13 +22,16 @@ from syntra_build.application.human_intervention import (
 from syntra_build.domain.design import ARCHITECT_INTERFACE_VERSION
 from syntra_build.domain.gates import GateState
 from syntra_build.domain.identifiers import GateId, MilestoneId, ProjectId
+from syntra_build.domain.milestone_state_machine import MilestoneTransitionRequest
 from syntra_build.domain.milestones import MilestoneState
 from syntra_build.domain.pull_requests import PullRequestDescriptor, PullRequestState
 from syntra_build.domain.reviews import (
     ArchitectHumanGateRequest,
     ArchitectReview,
     ArchitectReviewVerdict,
+    HumanDecisionKind,
 )
+from syntra_build.infrastructure.config import SecretInputs, SecretValue, load_config
 from syntra_build.infrastructure.persistence.connection import (
     open_database,
     transaction,
@@ -35,16 +42,25 @@ from syntra_build.infrastructure.persistence.migrations import (
     apply_migrations,
     current_schema_version,
 )
+from syntra_build.infrastructure.persistence.milestones import SQLiteMilestoneRepository
 from syntra_build.infrastructure.persistence.pull_requests import (
     SQLitePullRequestRepository,
 )
+from syntra_build.smoke import build_host_router
 
 NOW = datetime(2026, 9, 23, tzinfo=UTC)
 SHA_A, SHA_B = "a" * 40, "b" * 40
 
 
 class Notifier:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls = 0
+
     def send(self, text: str) -> str:
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("telegram unavailable")
         return "telegram-message"
 
 
@@ -56,6 +72,30 @@ def fixture(
     project, milestone = ProjectId.generate(), MilestoneId.generate()
     repo, pr_id, request_id, response_id, review_id, ci_id = (
         str(uuid4()) for _ in range(6)
+    )
+    detail = ArchitectHumanGateRequest(
+        "Choose implementation",
+        MilestoneState.ARCHITECT_REVIEW,
+        ("A", "B") if verdict is ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED else (),
+        None
+        if verdict is ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED
+        else "Exercise feature and report",
+        "artifact://build-25",
+        HumanDecisionKind.TECHNICAL
+        if verdict is ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED
+        else None,
+    )
+    review = ArchitectReview(
+        ARCHITECT_INTERFACE_VERSION,
+        "corr",
+        project,
+        milestone,
+        25,
+        SHA_A,
+        verdict,
+        "human needed",
+        (),
+        detail,
     )
     stamp = NOW.isoformat()
     db.execute(
@@ -95,12 +135,19 @@ def fixture(
         (ci_id, str(project), str(milestone), pr.id, SHA_A, stamp, stamp, stamp),
     )
     db.execute(
-        "INSERT INTO architect_requests (id,project_id,milestone_id,request_type,provider,model,reasoning_level,request_schema_version,request_payload_json,correlation_id,started_at,completed_at,status) VALUES (?,?,?,'REVIEW','fake','model','high','1.0','{}','corr',?,?,'SUCCEEDED')",
-        (request_id, str(project), str(milestone), stamp, stamp),
+        "INSERT INTO architect_requests (id,project_id,milestone_id,request_type,provider,model,reasoning_level,request_schema_version,request_payload_json,correlation_id,started_at,completed_at,status) VALUES (?,?,?,'REVIEW','fake','model','high','1.0',?,'corr',?,?,'SUCCEEDED')",
+        (
+            request_id,
+            str(project),
+            str(milestone),
+            json.dumps({"ci_result": {"run_id": ci_id}}),
+            stamp,
+            stamp,
+        ),
     )
     db.execute(
-        "INSERT INTO architect_responses (id,architect_request_id,response_type,response_schema_version,normalised_payload_json,status,created_at,validation_status,provider,model) VALUES (?,?,'REVIEW','1.0','{}','ACCEPTED',?,'VALID','fake','model')",
-        (response_id, request_id, stamp),
+        "INSERT INTO architect_responses (id,architect_request_id,response_type,response_schema_version,normalised_payload_json,status,created_at,validation_status,provider,model) VALUES (?,?,'REVIEW','1.0',?,'ACCEPTED',?,'VALID','fake','model')",
+        (response_id, request_id, json.dumps(review.to_dict()), stamp),
     )
     db.execute(
         "INSERT INTO architect_reviews VALUES (?,?,?,?,?,?,?,'reviewed',?,NULL)",
@@ -118,29 +165,6 @@ def fixture(
     db.execute(
         "INSERT INTO project_documents (id,project_id,document_type,revision,status,content,content_hash,created_at,created_by,approved_at,approved_by) VALUES (?,?, 'AGENTS',1,'APPROVED','# agents',?,?,'human',?,'human')",
         (str(uuid4()), str(project), "f" * 64, stamp, stamp),
-    )
-    detail = ArchitectHumanGateRequest(
-        "Choose implementation",
-        MilestoneState.ARCHITECT_REVIEW
-        if verdict is ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED
-        else MilestoneState.MERGE_READY,
-        ("A", "B") if verdict is ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED else (),
-        None
-        if verdict is ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED
-        else "Exercise feature and report",
-        "artifact://build-25",
-    )
-    review = ArchitectReview(
-        ARCHITECT_INTERFACE_VERSION,
-        "corr",
-        project,
-        milestone,
-        25,
-        SHA_A,
-        verdict,
-        "human needed",
-        (),
-        detail,
     )
     service = HumanInterventionService(
         db,
@@ -193,15 +217,55 @@ class HumanTestArchitect:
             (),
             ArchitectHumanGateRequest(
                 "test",
-                MilestoneState.MERGE_READY,
+                MilestoneState.ARCHITECT_REVIEW,
                 (),
                 "Exercise the build",
                 "artifact://cross-component",
+                None,
             ),
         )
 
     def telemetry(self) -> dict[str, int | str | None]:
         return {"provider_response_id": "m25-response"}
+
+
+class ApprovalArchitect:
+    provider_name = "fake"
+    model = "test"
+
+    def __init__(self) -> None:
+        self.request: object | None = None
+
+    def review(self, request: object) -> ArchitectReview:
+        from syntra_build.domain.reviews import ArchitectReviewRequest
+
+        assert isinstance(request, ArchitectReviewRequest)
+        self.request = request
+        return ArchitectReview(
+            ARCHITECT_INTERFACE_VERSION,
+            request.correlation_id,
+            request.project_id,
+            request.milestone_id,
+            request.pull_request_number,
+            request.head_sha,
+            ArchitectReviewVerdict.APPROVE,
+            "approved after decision",
+            (),
+        )
+
+    def telemetry(self) -> dict[str, int | str | None]:
+        return {}
+
+
+class MustNotRunArchitect:
+    provider_name = "fake"
+    model = "test"
+
+    def review(self, request: object) -> ArchitectReview:
+        raise AssertionError("completed Architect review must not be rerun")
+
+    def telemetry(self) -> dict[str, int | str | None]:
+        return {}
 
 
 def command(
@@ -255,7 +319,15 @@ def test_ci_architect_human_test_pass_cross_component(tmp_path: Path) -> None:
     )
     assert gate.state is GateState.NOTIFIED
     interventions.respond(command(str(gate.id), "PASS"), gate)
-    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "MERGE_READY"
+    assert (
+        db.execute("SELECT state FROM milestones").fetchone()[0] == "ARCHITECT_REVIEW"
+    )
+    assert (
+        db.execute(
+            "SELECT count(*) FROM architect_reviews WHERE verdict='APPROVE'"
+        ).fetchone()[0]
+        == 0
+    )
     assert HumanTestFreshness(db).is_current(
         review.project_id, review.milestone_id, pr_id, SHA_A
     )
@@ -312,6 +384,58 @@ def test_human_test_gate_exact_binding_pass_and_staleness(tmp_path: Path) -> Non
     assert db.execute("SELECT outcome FROM human_test_results").fetchone()[0] == "PASS"
 
 
+def test_persisted_review_handoff_retry_and_notification_reconciliation(
+    tmp_path: Path,
+) -> None:
+    db, service, review, _, _ = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_TEST_REQUIRED
+    )
+    review_id = db.execute("SELECT id FROM architect_reviews").fetchone()[0]
+    notifier = Notifier(fail=True)
+    service.notifier = notifier
+    gateway = ReviewGateway(
+        PullRequestDescriptor(
+            "1.0",
+            review.project_id,
+            review.milestone_id,
+            77,
+            25,
+            PullRequestState.OPEN,
+            "syntra/m25",
+            "main",
+            SHA_A,
+            "https://example/pr/25",
+        )
+    )
+    review_service = ArchitectReviewService(
+        db,
+        gateway,
+        gateway,
+        MustNotRunArchitect(),
+        clock=lambda: NOW,
+        human_interventions=service,
+    )
+    with pytest.raises(RuntimeError, match="telegram unavailable"):
+        review_service.review(review.project_id, review.milestone_id, "corr")
+    assert db.execute("SELECT count(*) FROM human_gates").fetchone()[0] == 1
+    gate = service.gate_repository.outstanding()[0]
+    assert gate.state is GateState.PENDING
+
+    notifier.fail = False
+    notified_record = review_service.review(
+        review.project_id, review.milestone_id, "corr"
+    )
+    assert notified_record.id == review_id
+    notified = service.gate_repository.get(gate.id)
+    assert notified.id == gate.id
+    assert notified.state is GateState.NOTIFIED
+    assert notifier.calls == 2
+    again = review_service.review(review.project_id, review.milestone_id, "corr")
+    assert again.id == review_id
+    assert notifier.calls == 2
+    assert db.execute("SELECT count(*) FROM human_gates").fetchone()[0] == 1
+
+
 def test_stale_unauthorised_and_unrelated_responses_are_rejected(
     tmp_path: Path,
 ) -> None:
@@ -334,6 +458,36 @@ def test_stale_unauthorised_and_unrelated_responses_are_rejected(
     assert db.execute("SELECT count(*) FROM human_gate_responses").fetchone()[0] == 0
 
 
+def test_real_telegram_router_composition_handles_only_authorised_gate_response(
+    tmp_path: Path,
+) -> None:
+    db, service, review, pr_id, ci_id = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_TEST_REQUIRED
+    )
+    review_id = db.execute("SELECT id FROM architect_reviews").fetchone()[0]
+    gate = service.create_from_review(
+        review_id, review, pr_id, ci_id, causation_id="request", occurred_at=NOW
+    )
+    config = load_config(
+        {"telegram": {"enabled": True, "authorised_user_ids": [42]}},
+        environ={},
+        secrets=SecretInputs(telegram_bot_token=SecretValue("synthetic-token")),
+    )
+    router = build_host_router(config, db)
+    rejected = route_authorized_message(
+        TelegramInboundMessage(1, 10, 5, 99, f"gate {gate.id} PASS", NOW),
+        router,
+    )
+    assert "not authorised" in rejected.text
+    assert service.gate_repository.get(gate.id).state is GateState.NOTIFIED
+    accepted = route_authorized_message(
+        TelegramInboundMessage(2, 11, 5, 42, f"gate {gate.id} PASS", NOW),
+        router,
+    )
+    assert "resolved as PASS" in accepted.text
+    assert service.gate_repository.get(gate.id).state is GateState.RESOLVED
+
+
 def test_decision_uses_persisted_resume_target(tmp_path: Path) -> None:
     db, service, review, pr_id, ci_id = fixture(
         tmp_path, ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED
@@ -351,6 +505,62 @@ def test_decision_uses_persisted_resume_target(tmp_path: Path) -> None:
         "SELECT selected_option,response_text FROM human_gate_responses"
     ).fetchone()
     assert tuple(response) == ("A", "human evidence")
+    descriptor = PullRequestDescriptor(
+        "1.0",
+        review.project_id,
+        review.milestone_id,
+        77,
+        25,
+        PullRequestState.OPEN,
+        "syntra/m25",
+        "main",
+        SHA_A,
+        "https://example/pr/25",
+    )
+    architect = ApprovalArchitect()
+    gateway = ReviewGateway(descriptor)
+    ArchitectReviewService(db, gateway, gateway, architect, clock=lambda: NOW).review(
+        review.project_id, review.milestone_id, "after-decision"
+    )
+    from syntra_build.domain.reviews import ArchitectReviewRequest
+
+    assert isinstance(architect.request, ArchitectReviewRequest)
+    assert architect.request.human_decisions == (
+        {
+            "gate_id": str(gate.id),
+            "prompt": "Choose implementation",
+            "selected_option": "A",
+            "human_feedback": "human evidence",
+            "decision_type": "TECHNICAL_DECISION",
+            "originating_architect_review_id": review_id,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        (HumanDecisionKind.PRODUCT, "PRODUCT_DECISION"),
+        (HumanDecisionKind.TECHNICAL, "TECHNICAL_DECISION"),
+    ],
+)
+def test_decision_kind_maps_to_gate_type(
+    tmp_path: Path, kind: HumanDecisionKind, expected: str
+) -> None:
+    db, service, review, pr_id, ci_id = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED
+    )
+    assert review.human_gate is not None
+    review = replace(review, human_gate=replace(review.human_gate, decision_kind=kind))
+    gate = service.create_from_review(
+        db.execute("SELECT id FROM architect_reviews").fetchone()[0],
+        review,
+        pr_id,
+        ci_id,
+        causation_id="request",
+        occurred_at=NOW,
+    )
+    assert gate.gate_type.value == expected
 
 
 def test_fail_queues_same_pr_rework_and_blocked_is_distinct(tmp_path: Path) -> None:
@@ -393,6 +603,92 @@ def test_fail_queues_same_pr_rework_and_blocked_is_distinct(tmp_path: Path) -> N
     assert db2.execute("SELECT state FROM projects").fetchone()[0] == "BLOCKED"
 
 
+def test_fail_rework_same_pr_sha_b_gets_fresh_human_test_gate(tmp_path: Path) -> None:
+    db, service, review, pr_id, ci_a = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_TEST_REQUIRED
+    )
+    review_id = db.execute("SELECT id FROM architect_reviews").fetchone()[0]
+    gate_a = service.create_from_review(
+        review_id, review, pr_id, ci_a, causation_id="request-a", occurred_at=NOW
+    )
+    service.respond(command(str(gate_a.id), "FAIL"), gate_a)
+    milestones = SQLiteMilestoneRepository(db, lambda: str(uuid4()))
+    state = MilestoneState.CODING
+    for target in (
+        MilestoneState.VALIDATING_CHANGES,
+        MilestoneState.COMMITTING,
+        MilestoneState.PUSHING,
+        MilestoneState.CI_RUNNING,
+        MilestoneState.ARCHITECT_REVIEW,
+    ):
+        milestones.apply_transition(
+            MilestoneTransitionRequest(
+                review.milestone_id,
+                review.project_id,
+                state,
+                target,
+                "test rework progression",
+                "SYSTEM",
+                "test",
+                "sha-b",
+                NOW,
+            )
+        )
+        state = target
+    db.execute(
+        "UPDATE pull_requests SET head_sha=?,updated_at=?,last_reconciled_at=? WHERE id=?",
+        (SHA_B, NOW.isoformat(), NOW.isoformat(), pr_id),
+    )
+    ci_b = str(uuid4())
+    db.execute(
+        "INSERT INTO ci_runs (id,project_id,milestone_id,pull_request_id,head_sha,attempt_number,overall_status,started_at,completed_at,last_checked_at,summary_json,retry_count) VALUES (?,?,?,?,?,2,'PASSED',?,?,?,'{}',0)",
+        (
+            ci_b,
+            str(review.project_id),
+            str(review.milestone_id),
+            pr_id,
+            SHA_B,
+            NOW.isoformat(),
+            NOW.isoformat(),
+            NOW.isoformat(),
+        ),
+    )
+    descriptor = PullRequestDescriptor(
+        "1.0",
+        review.project_id,
+        review.milestone_id,
+        77,
+        25,
+        PullRequestState.OPEN,
+        "syntra/m25",
+        "main",
+        SHA_B,
+        "https://example/pr/25",
+    )
+    gateway = ReviewGateway(descriptor)
+    record_b = ArchitectReviewService(
+        db,
+        gateway,
+        gateway,
+        HumanTestArchitect(),
+        clock=lambda: NOW,
+        human_interventions=service,
+    ).review(review.project_id, review.milestone_id, "review-b")
+    binding_b = db.execute(
+        "SELECT * FROM human_test_bindings WHERE architect_review_id=?", (record_b.id,)
+    ).fetchone()
+    assert binding_b["pull_request_id"] == pr_id
+    assert binding_b["tested_head_sha"] == SHA_B
+    assert binding_b["ci_run_id"] == ci_b
+    assert tuple(
+        db.execute(
+            "SELECT tested_head_sha,outcome FROM human_test_results WHERE gate_id=?",
+            (str(gate_a.id),),
+        ).fetchone()
+    ) == (SHA_A, "FAIL")
+    assert db.execute("SELECT count(*) FROM human_test_bindings").fetchone()[0] == 2
+
+
 def test_migration_021_to_022_preserves_gate_response_and_review(
     tmp_path: Path,
 ) -> None:
@@ -400,10 +696,107 @@ def test_migration_021_to_022_preserves_gate_response_and_review(
     with open_database(path) as db:
         apply_migrations(db, MIGRATIONS[:21])
         assert current_schema_version(db) == 21
-        # Existing M24 migration coverage supplies full populated-history preservation;
-        # Verify the forward migration itself and referential integrity.
+        ids = {
+            name: str(uuid4())
+            for name in (
+                "project",
+                "milestone",
+                "repo",
+                "pr",
+                "request",
+                "response",
+                "review",
+                "finding",
+                "gate",
+                "gate_response",
+            )
+        }
+        stamp = NOW.isoformat()
+        db.execute(
+            "INSERT INTO projects (id,name,state,created_at,updated_at,last_state_change_at,canonical_name,repository_visibility) VALUES (?,?,'BUILDING',?,?,?,?, 'public')",
+            (ids["project"], "history", stamp, stamp, stamp, "history"),
+        )
+        db.execute(
+            "INSERT INTO milestones (id,project_id,sequence_number,code,title,state,created_at,updated_at,definition_json,automated_acceptance_json) VALUES (?,?,25,'M25','History','ARCHITECT_REVIEW',?,?,'{}','[]')",
+            (ids["milestone"], ids["project"], stamp, stamp),
+        )
+        db.execute(
+            "INSERT INTO github_repositories VALUES (?,?, 'github','owner','repo','owner/repo',77,'public','main','VERIFIED',?,?,?)",
+            (ids["repo"], ids["project"], stamp, stamp, stamp),
+        )
+        db.execute(
+            "INSERT INTO pull_requests (id,project_id,milestone_id,github_repository_id,external_pr_number,state,head_branch,base_branch,head_sha,web_url,title,created_at,updated_at,last_reconciled_at) VALUES (?,?,?,?,25,'OPEN','branch','main',?,?,?,?,?,?)",
+            (
+                ids["pr"],
+                ids["project"],
+                ids["milestone"],
+                ids["repo"],
+                SHA_A,
+                "https://example/pr/25",
+                "title",
+                stamp,
+                stamp,
+                stamp,
+            ),
+        )
+        db.execute(
+            "INSERT INTO architect_requests (id,project_id,milestone_id,request_type,provider,model,reasoning_level,request_schema_version,request_payload_json,correlation_id,started_at,completed_at,status) VALUES (?,?,?,'REVIEW','fake','model','high','1.0','{}','history',?,?,'SUCCEEDED')",
+            (ids["request"], ids["project"], ids["milestone"], stamp, stamp),
+        )
+        db.execute(
+            "INSERT INTO architect_responses (id,architect_request_id,response_type,response_schema_version,normalised_payload_json,status,created_at,validation_status,provider,model) VALUES (?,?,'REVIEW','1.0','{}','ACCEPTED',?,'VALID','fake','model')",
+            (ids["response"], ids["request"], stamp),
+        )
+        db.execute(
+            "INSERT INTO architect_reviews VALUES (?,?,?,?,?,?,'CHANGES_REQUIRED','history review',?,NULL)",
+            (
+                ids["review"],
+                ids["project"],
+                ids["milestone"],
+                ids["request"],
+                ids["pr"],
+                SHA_A,
+                stamp,
+            ),
+        )
+        db.execute(
+            "INSERT INTO architect_review_findings VALUES (?,?, 'finding-code','major','M25','description','action','OPEN',NULL,?)",
+            (ids["finding"], ids["review"], stamp),
+        )
+        db.execute(
+            "INSERT INTO human_gates (id,project_id,milestone_id,gate_type,state,title,prompt,expected_response_type,options_json,resume_milestone_state,created_at,notified_at,responded_at,resolved_at,created_by,correlation_id) VALUES (?,?,?,'TECHNICAL_DECISION','RESOLVED','Decision','Choose','OPTION','[\"A\",\"B\"]','ARCHITECT_REVIEW',?,?,?,?, 'SYSTEM','history')",
+            (ids["gate"], ids["project"], ids["milestone"], stamp, stamp, stamp, stamp),
+        )
+        db.execute(
+            "INSERT INTO human_gate_responses VALUES (?,?, 'telegram-message','A','feedback','A','[]','42',?,1,'valid')",
+            (ids["gate_response"], ids["gate"], stamp),
+        )
         apply_migrations(db)
         assert current_schema_version(db) == 22
+        assert tuple(
+            db.execute(
+                "SELECT id,prompt,state FROM human_gates WHERE id=?", (ids["gate"],)
+            ).fetchone()
+        ) == (ids["gate"], "Choose", "RESOLVED")
+        assert tuple(
+            db.execute(
+                "SELECT id,response_code,response_text FROM human_gate_responses WHERE id=?",
+                (ids["gate_response"],),
+            ).fetchone()
+        ) == (ids["gate_response"], "A", "feedback")
+        assert tuple(
+            db.execute(
+                "SELECT id,verdict,summary FROM architect_reviews WHERE id=?",
+                (ids["review"],),
+            ).fetchone()
+        ) == (ids["review"], "CHANGES_REQUIRED", "history review")
+        assert (
+            db.execute(
+                "SELECT finding_code FROM architect_review_findings WHERE id=?",
+                (ids["finding"],),
+            ).fetchone()[0]
+            == "finding-code"
+        )
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
     with open_database(tmp_path / "clean.db") as db:
         apply_migrations(db)

@@ -36,6 +36,7 @@ from syntra_build.application.commands.services import (
     ResolutionOutcome,
 )
 from syntra_build.application.gates import HumanGateCommandHandler, HumanGateService
+from syntra_build.application.human_intervention import HumanInterventionService
 from syntra_build.application.projects import (
     ProjectCreationService,
     SQLiteProjectQueryService,
@@ -161,6 +162,7 @@ def build_host_router(
         DesignPackageDecisionHandler(
             SQLiteDesignPackageRepository(connection), authorised
         ),
+        HumanInterventionService(connection, authorised_responder_ids=authorised),
     )
     return CommandRouter(
         project_queries=SQLiteProjectQueryService(projects),

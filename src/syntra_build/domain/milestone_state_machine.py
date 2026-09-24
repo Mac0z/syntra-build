@@ -94,6 +94,7 @@ VALID_MILESTONE_TRANSITIONS: dict[MilestoneState, frozenset[MilestoneState]] = {
     ),
     MilestoneState.HUMAN_TEST: _states(
         MilestoneState.MERGE_READY,
+        MilestoneState.ARCHITECT_REVIEW,
         MilestoneState.REVIEW_REWORK,
         MilestoneState.HUMAN_DECISION,
         MilestoneState.BLOCKED,

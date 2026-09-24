@@ -452,11 +452,14 @@ def test_project_state_is_revalidated_at_claim_boundary(
 
 
 def test_waiting_human_blocks_codex_but_allows_control_work(tmp_path: Path) -> None:
-    connection, _, jobs, project_id = database(
+    connection, projects, jobs, project_id = database(
         tmp_path / "waiting-human.db", ProjectState.WAITING_HUMAN
     )
     codex_id = add_job(jobs, project_id)
     message_id = add_job(jobs, project_id, worker_class=WorkerClass.MESSAGING)
+    other_project = ProjectId.generate()
+    projects.add(Project(other_project, "other", ProjectState.BUILDING, NOW, NOW))
+    other_codex_id = add_job(jobs, other_project)
     executor = RecordingExecutor()
     scheduler = Scheduler(
         jobs,
@@ -468,9 +471,10 @@ def test_waiting_human_blocks_codex_but_allows_control_work(tmp_path: Path) -> N
     result = scheduler.run_once()
     harvest(scheduler, executor)
 
-    assert result.skipped_project_state == 1 and result.dispatched == 1
+    assert result.skipped_project_state == 1 and result.dispatched == 2
     assert jobs.get(codex_id, project_id).state is JobState.QUEUED
     assert jobs.get(message_id, project_id).state is JobState.SUCCEEDED
+    assert jobs.get(other_codex_id, other_project).state is JobState.SUCCEEDED
     scheduler.close()
     connection.close()
 

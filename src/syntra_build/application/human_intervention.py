@@ -31,7 +31,11 @@ from syntra_build.domain.milestone_state_machine import MilestoneTransitionReque
 from syntra_build.domain.milestones import MilestoneState
 from syntra_build.domain.project_state_machine import ProjectTransitionRequest
 from syntra_build.domain.projects import ProjectState
-from syntra_build.domain.reviews import ArchitectReview, ArchitectReviewVerdict
+from syntra_build.domain.reviews import (
+    ArchitectReview,
+    ArchitectReviewVerdict,
+    HumanDecisionKind,
+)
 from syntra_build.infrastructure.persistence.connection import transaction
 from syntra_build.infrastructure.persistence.errors import (
     ClosedGateError,
@@ -90,7 +94,10 @@ class HumanInterventionService:
             "SELECT id FROM human_gates WHERE architect_review_id=?", (review_id,)
         ).fetchone()
         if existing is not None:
-            return self.gate_repository.get(GateId.from_string(existing["id"]))
+            return self._ensure_notified(
+                self.gate_repository.get(GateId.from_string(existing["id"])),
+                occurred_at or self.clock(),
+            )
         detail = review.human_gate
         if detail is None or review.verdict not in {
             ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED,
@@ -102,7 +109,12 @@ class HumanInterventionService:
         prompt = detail.test_instructions if is_test else detail.prompt
         if prompt is None:
             raise HumanInterventionError("human test instructions are required")
-        gate_type = GateType.HUMAN_TEST if is_test else GateType.TECHNICAL_DECISION
+        if is_test:
+            gate_type = GateType.HUMAN_TEST
+        elif detail.decision_kind is HumanDecisionKind.PRODUCT:
+            gate_type = GateType.PRODUCT_DECISION
+        else:
+            gate_type = GateType.TECHNICAL_DECISION
         ci = self.connection.execute(
             """SELECT id,head_sha,overall_status FROM ci_runs
             WHERE id=? AND pull_request_id=? AND head_sha=?""",
@@ -126,7 +138,11 @@ class HumanInterventionService:
                     review.milestone_id,
                     detail.options,
                     review.summary,
-                    resume_milestone_state=detail.resume_milestone_state,
+                    resume_milestone_state=(
+                        MilestoneState.ARCHITECT_REVIEW
+                        if is_test
+                        else detail.resume_milestone_state
+                    ),
                     artifact_reference=detail.artifact_reference,
                     architect_review_id=review_id,
                     causation_id=causation_id,
@@ -182,9 +198,41 @@ class HumanInterventionService:
                         now,
                     )
                 )
-        if self.notifier is not None:
-            gate = self.gates.notify(gate.id, self.notifier, occurred_at=now)
-        return gate
+        return self._ensure_notified(gate, now)
+
+    def reconcile_review(
+        self, review_id: str, *, occurred_at: datetime | None = None
+    ) -> HumanGate:
+        """Replay only the deterministic persisted-review-to-gate handoff."""
+        row = self.connection.execute(
+            """SELECT r.pull_request_id,r.architect_request_id,
+            s.normalised_payload_json,q.request_payload_json
+            FROM architect_reviews r
+            JOIN architect_requests q ON q.id=r.architect_request_id
+            JOIN architect_responses s ON s.architect_request_id=q.id
+            WHERE r.id=?""",
+            (review_id,),
+        ).fetchone()
+        if row is None:
+            raise HumanInterventionError("persisted Architect review is unavailable")
+        review = ArchitectReview.from_dict(json.loads(row["normalised_payload_json"]))
+        request = json.loads(row["request_payload_json"])
+        ci = request.get("ci_result")
+        if not isinstance(ci, dict) or not isinstance(ci.get("run_id"), str):
+            raise HumanInterventionError("persisted review lacks CI identity")
+        return self.create_from_review(
+            review_id,
+            review,
+            row["pull_request_id"],
+            ci["run_id"],
+            causation_id=row["architect_request_id"],
+            occurred_at=occurred_at,
+        )
+
+    def _ensure_notified(self, gate: HumanGate, occurred_at: datetime) -> HumanGate:
+        if gate.state is not GateState.PENDING or self.notifier is None:
+            return gate
+        return self.gates.notify(gate.id, self.notifier, occurred_at=occurred_at)
 
     def respond(self, command: Command, gate: HumanGate) -> str:
         """Authenticated Telegram command handler for M25 gates."""
@@ -223,6 +271,8 @@ class HumanInterventionService:
                 target = MilestoneState.REVIEW_REWORK
             elif code == HumanTestResponse.BLOCKED:
                 target = MilestoneState.BLOCKED
+            else:
+                target = MilestoneState.ARCHITECT_REVIEW
         with transaction(self.connection):
             responded = self.gate_repository.record_response(
                 self._gate_transition(

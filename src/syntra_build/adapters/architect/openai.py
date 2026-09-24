@@ -172,6 +172,7 @@ REVIEW_SCHEMA: dict[str, object] = {
                         "options",
                         "test_instructions",
                         "artifact_reference",
+                        "decision_kind",
                     ],
                     "properties": {
                         "prompt": {"type": "string", "minLength": 1},
@@ -200,6 +201,12 @@ REVIEW_SCHEMA: dict[str, object] = {
                         "artifact_reference": {
                             "anyOf": [
                                 {"type": "string", "minLength": 1},
+                                {"type": "null"},
+                            ]
+                        },
+                        "decision_kind": {
+                            "anyOf": [
+                                {"type": "string", "enum": ["PRODUCT", "TECHNICAL"]},
                                 {"type": "null"},
                             ]
                         },

@@ -77,6 +77,10 @@ class ReviewHumanInterventions(Protocol):
         occurred_at: datetime | None = None,
     ) -> object: ...
 
+    def reconcile_review(
+        self, review_id: str, *, occurred_at: datetime | None = None
+    ) -> object: ...
+
 
 class ArchitectReviewError(RuntimeError):
     pass
@@ -130,6 +134,17 @@ class ArchitectReviewService:
             str(project_id), str(milestone_id), correlation_id
         )
         if completed_review is not None:
+            if completed_review.verdict in {
+                ArchitectReviewVerdict.HUMAN_TEST_REQUIRED,
+                ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED,
+            }:
+                if self.human_interventions is None:
+                    raise ArchitectReviewError(
+                        "human verdict requires the M25 intervention service"
+                    )
+                self.human_interventions.reconcile_review(
+                    completed_review.id, occurred_at=self.clock()
+                )
             return completed_review
         now = self.clock()
         request, pr_id, repository_full_name, persisted = self._build_request(
@@ -387,6 +402,25 @@ class ArchitectReviewService:
                 str(project_id), str(milestone_id), persisted.id
             )
         )
+        decisions = tuple(
+            {
+                "gate_id": row["gate_id"],
+                "prompt": row["prompt"],
+                "selected_option": row["selected_option"],
+                "human_feedback": row["response_text"],
+                "decision_type": row["gate_type"],
+                "originating_architect_review_id": row["architect_review_id"],
+            }
+            for row in self.connection.execute(
+                """SELECT g.id AS gate_id,g.prompt,g.gate_type,g.architect_review_id,
+                r.selected_option,r.response_text
+                FROM human_gates g JOIN human_gate_responses r ON r.gate_id=g.id
+                WHERE g.project_id=? AND g.milestone_id=? AND g.state='RESOLVED'
+                  AND g.gate_type IN ('PRODUCT_DECISION','TECHNICAL_DECISION')
+                ORDER BY g.resolved_at,g.id""",
+                (str(project_id), str(milestone_id)),
+            ).fetchall()
+        )
         definition = {
             "code": milestone.code,
             "title": milestone.title,
@@ -421,6 +455,7 @@ class ArchitectReviewService:
                 "external_workflow_run_id": ci["external_workflow_run_id"],
             },
             prior,
+            decisions,
         )
         return request, persisted.id, repo["full_name"], persisted
 

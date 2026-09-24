@@ -104,6 +104,7 @@ from syntra_build.domain.reviews import (
     ArchitectReviewRequest,
     ArchitectReviewVerdict,
     ArchitectReworkTask,
+    HumanDecisionKind,
     ReviewFinding,
     ReviewFindingSeverity,
 )
@@ -137,6 +138,7 @@ __all__ = [
     "ArchitectReviewRequest",
     "ArchitectReviewVerdict",
     "ArchitectReworkTask",
+    "HumanDecisionKind",
     "ReviewFinding",
     "ReviewFindingSeverity",
     "ArchitectProposedDecision",

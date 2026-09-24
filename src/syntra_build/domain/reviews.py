@@ -20,6 +20,11 @@ class ArchitectReviewVerdict(StrEnum):
     BLOCKED = "BLOCKED"
 
 
+class HumanDecisionKind(StrEnum):
+    PRODUCT = "PRODUCT"
+    TECHNICAL = "TECHNICAL"
+
+
 class ReviewFindingSeverity(StrEnum):
     INFO = "info"
     MINOR = "minor"
@@ -36,6 +41,7 @@ class ArchitectHumanGateRequest:
     options: tuple[str, ...] = ()
     test_instructions: str | None = None
     artifact_reference: str | None = None
+    decision_kind: HumanDecisionKind | None = None
 
     def __post_init__(self) -> None:
         require_text(self.prompt, "human_gate.prompt")
@@ -49,6 +55,10 @@ class ArchitectHumanGateRequest:
             require_text(self.test_instructions, "human_gate.test_instructions")
         if self.artifact_reference is not None:
             require_text(self.artifact_reference, "human_gate.artifact_reference")
+        if self.decision_kind is not None and not isinstance(
+            self.decision_kind, HumanDecisionKind
+        ):
+            raise DomainValidationError("invalid human decision kind")
 
     @classmethod
     def from_dict(cls, value: object) -> ArchitectHumanGateRequest:
@@ -58,6 +68,7 @@ class ArchitectHumanGateRequest:
             "options",
             "test_instructions",
             "artifact_reference",
+            "decision_kind",
         }
         if (
             not isinstance(value, dict)
@@ -76,6 +87,9 @@ class ArchitectHumanGateRequest:
                 str(value["artifact_reference"])
                 if value["artifact_reference"] is not None
                 else None,
+                HumanDecisionKind(str(value["decision_kind"]))
+                if value["decision_kind"] is not None
+                else None,
             )
         except (TypeError, ValueError) as error:
             raise DomainValidationError(
@@ -89,6 +103,7 @@ class ArchitectHumanGateRequest:
             "options": list(self.options),
             "test_instructions": self.test_instructions,
             "artifact_reference": self.artifact_reference,
+            "decision_kind": self.decision_kind.value if self.decision_kind else None,
         }
 
 
@@ -159,6 +174,7 @@ class ArchitectReviewRequest:
     diff: str
     ci_result: dict[str, object]
     previous_findings: tuple[ReviewFinding, ...] = ()
+    human_decisions: tuple[dict[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         if self.interface_version != ARCHITECT_INTERFACE_VERSION:
@@ -185,6 +201,8 @@ class ArchitectReviewRequest:
                 raise DomainValidationError(f"{name} must be a non-empty object")
         if any(not isinstance(item, ReviewFinding) for item in self.previous_findings):
             raise DomainValidationError("previous_findings must be typed findings")
+        if any(not isinstance(item, dict) for item in self.human_decisions):
+            raise DomainValidationError("human_decisions must contain objects")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -200,6 +218,7 @@ class ArchitectReviewRequest:
             "diff": self.diff,
             "ci_result": self.ci_result,
             "previous_findings": [item.to_dict() for item in self.previous_findings],
+            "human_decisions": list(self.human_decisions),
         }
 
 
@@ -256,9 +275,19 @@ class ArchitectReview:
                     raise DomainValidationError(
                         "human decisions require allowed options"
                     )
-            elif self.human_gate.options or self.human_gate.test_instructions is None:
+                if self.human_gate.decision_kind is None:
+                    raise DomainValidationError(
+                        "human decisions require a decision kind"
+                    )
+            elif (
+                self.human_gate.options
+                or self.human_gate.test_instructions is None
+                or self.human_gate.decision_kind is not None
+                or self.human_gate.resume_milestone_state
+                is not MilestoneState.ARCHITECT_REVIEW
+            ):
                 raise DomainValidationError(
-                    "human tests require instructions, not options"
+                    "human tests require instructions and ARCHITECT_REVIEW resume"
                 )
 
     @classmethod
