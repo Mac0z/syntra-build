@@ -5,7 +5,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Event, Lock
+from threading import Condition, Event
 
 import pytest
 
@@ -59,20 +59,32 @@ class RecordingExecutor:
     calls: list[Job] = field(default_factory=list)
     active: int = 0
     maximum_active: int = 0
-    lock: Lock = field(default_factory=Lock)
+    condition: Condition = field(default_factory=Condition)
 
     def execute(self, job: Job) -> JobExecutionResult:
-        with self.lock:
+        with self.condition:
             self.calls.append(job)
             self.active += 1
             self.maximum_active = max(self.maximum_active, self.active)
+            self.condition.notify_all()
         self.started.set()
         if self.release is not None:
             self.release.wait()
-        with self.lock:
+        with self.condition:
             self.active -= 1
+            self.condition.notify_all()
         self.finished.set()
         return self.result
+
+    def wait_for_calls(self, count: int, timeout: float = 2) -> bool:
+        """Wait until the requested workers have genuinely entered execute()."""
+        with self.condition:
+            return self.condition.wait_for(lambda: len(self.calls) >= count, timeout)
+
+    def wait_for_idle(self, timeout: float = 2) -> bool:
+        """Wait until every executor call that entered has left execute()."""
+        with self.condition:
+            return self.condition.wait_for(lambda: self.active == 0, timeout)
 
 
 class RaisingExecutor:
@@ -230,11 +242,21 @@ def test_codex_limit_and_independent_architect_capacity(tmp_path: Path) -> None:
         == 1
     )
     assert jobs.get(architect_id, project_id).state is JobState.RUNNING
+    assert codex.wait_for_calls(2)
+    assert architect.wait_for_calls(1)
     release.set()
-    assert codex.finished.wait(2) and architect.finished.wait(2)
+    assert codex.wait_for_idle() and architect.wait_for_idle()
     scheduler.wait_for_wake(2)
     scheduler.run_once()
     assert codex.maximum_active == 2
+    assert capacity.in_use(WorkerClass.ARCHITECT) == 0
+    # The harvest above admits the third queued Codex job. Let that job finish,
+    # harvest it separately, and prove every lease is ultimately released.
+    assert codex.wait_for_calls(3)
+    assert codex.wait_for_idle()
+    scheduler.wait_for_wake(2)
+    scheduler.run_once()
+    assert capacity.in_use(WorkerClass.CODEX) == 0
     scheduler.close()
     connection.close()
 
