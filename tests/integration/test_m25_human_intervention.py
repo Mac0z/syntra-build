@@ -501,6 +501,12 @@ def test_decision_uses_persisted_resume_target(tmp_path: Path) -> None:
     assert (
         db.execute("SELECT state FROM milestones").fetchone()[0] == "ARCHITECT_REVIEW"
     )
+    assert (
+        db.execute(
+            "SELECT count(*) FROM architect_reviews WHERE verdict='APPROVE'"
+        ).fetchone()[0]
+        == 0
+    )
     response = db.execute(
         "SELECT selected_option,response_text FROM human_gate_responses"
     ).fetchone()

@@ -279,6 +279,13 @@ class ArchitectReview:
                     raise DomainValidationError(
                         "human decisions require a decision kind"
                     )
+                if (
+                    self.human_gate.resume_milestone_state
+                    is not MilestoneState.ARCHITECT_REVIEW
+                ):
+                    raise DomainValidationError(
+                        "human decisions require ARCHITECT_REVIEW resume"
+                    )
             elif (
                 self.human_gate.options
                 or self.human_gate.test_instructions is None

@@ -273,6 +273,15 @@ class HumanInterventionService:
                 target = MilestoneState.BLOCKED
             else:
                 target = MilestoneState.ARCHITECT_REVIEW
+        elif (
+            gate.gate_type
+            in {
+                GateType.PRODUCT_DECISION,
+                GateType.TECHNICAL_DECISION,
+            }
+            and gate.architect_review_id is not None
+        ):
+            target = MilestoneState.ARCHITECT_REVIEW
         with transaction(self.connection):
             responded = self.gate_repository.record_response(
                 self._gate_transition(

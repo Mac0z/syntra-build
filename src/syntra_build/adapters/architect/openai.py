@@ -178,14 +178,7 @@ REVIEW_SCHEMA: dict[str, object] = {
                         "prompt": {"type": "string", "minLength": 1},
                         "resume_milestone_state": {
                             "type": "string",
-                            "enum": [
-                                "PREPARING_TASK",
-                                "CODING",
-                                "ARCHITECT_REVIEW",
-                                "MERGE_READY",
-                                "REVIEW_REWORK",
-                                "BLOCKED",
-                            ],
+                            "const": "ARCHITECT_REVIEW",
                         },
                         "options": {
                             "type": "array",
