@@ -26,6 +26,9 @@ from syntra_build.adapters.telegram import (
 )
 from syntra_build.adapters.telegram.application import route_authorized_message
 from syntra_build.adapters.telegram.design_approval import TelegramDesignApprovalHandler
+from syntra_build.adapters.telegram.human_intervention import (
+    TelegramHumanInterventionHandler,
+)
 from syntra_build.application.commands.models import Command, InboundMessage
 from syntra_build.application.commands.router import CommandRouter
 from syntra_build.application.commands.services import (
@@ -239,6 +242,7 @@ def run_telegram_once(
     router: CommandRouter,
     cursors: ProviderCursorStore,
     design_approvals: TelegramDesignApprovalHandler | None = None,
+    human_interventions: TelegramHumanInterventionHandler | None = None,
 ) -> int:
     """Poll from the durable offset and acknowledge each safely handled update."""
     _LOGGER.info("Telegram smoke started", extra={"event": "telegram_smoke_started"})
@@ -251,9 +255,15 @@ def run_telegram_once(
             cursors.advance("telegram", update.update_id)
             continue
         if update.callback is not None:
-            if design_approvals is None:
+            if update.callback.callback_data.startswith("gate:"):
+                if human_interventions is None:
+                    raise RuntimeError("M25 Telegram callback routing is unavailable")
+                if not human_interventions.handle_callback(update.callback):
+                    raise RuntimeError("unsupported M25 Telegram callback")
+            elif design_approvals is None:
                 raise RuntimeError("Telegram callback routing is unavailable")
-            design_approvals.handle_callback(update.callback)
+            else:
+                design_approvals.handle_callback(update.callback)
         else:
             message = update.message
             assert message is not None
@@ -371,6 +381,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                         telegram,
                         frozenset(
                             str(item) for item in config.telegram.authorised_user_ids
+                        ),
+                    ),
+                    TelegramHumanInterventionHandler(
+                        connection,
+                        telegram,
+                        frozenset(
+                            str(item) for item in config.telegram.authorised_user_ids
+                        ),
+                        HumanInterventionService(
+                            connection,
+                            authorised_responder_ids=frozenset(
+                                str(item)
+                                for item in config.telegram.authorised_user_ids
+                            ),
                         ),
                     ),
                 )

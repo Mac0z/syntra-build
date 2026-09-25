@@ -6,12 +6,23 @@ import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import pytest
 
 from syntra_build.adapters.telegram.application import route_authorized_message
-from syntra_build.adapters.telegram.models import TelegramInboundMessage
+from syntra_build.adapters.telegram.client import TelegramClient
+from syntra_build.adapters.telegram.gates import TelegramGateNotifier
+from syntra_build.adapters.telegram.human_intervention import (
+    TelegramHumanInterventionHandler,
+    human_gate_callback_data,
+)
+from syntra_build.adapters.telegram.models import (
+    TelegramCallbackQuery,
+    TelegramInboundMessage,
+    TelegramSentMessage,
+)
 from syntra_build.application.architect_review import ArchitectReviewService
 from syntra_build.application.commands.models import Command, CommandType
 from syntra_build.application.human_intervention import (
@@ -46,6 +57,9 @@ from syntra_build.infrastructure.persistence.milestones import SQLiteMilestoneRe
 from syntra_build.infrastructure.persistence.pull_requests import (
     SQLitePullRequestRepository,
 )
+from syntra_build.infrastructure.persistence.telegram_interactions import (
+    SQLiteTelegramGateNotificationRepository,
+)
 from syntra_build.smoke import build_host_router
 
 NOW = datetime(2026, 9, 23, tzinfo=UTC)
@@ -62,6 +76,56 @@ class Notifier:
         if self.fail:
             raise RuntimeError("telegram unavailable")
         return "telegram-message"
+
+
+class FakeTelegram:
+    def __init__(self) -> None:
+        self.sent: list[dict[str, object]] = []
+        self.acknowledged: list[str] = []
+        self.next_message_id = 201
+
+    def send_text(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        thread_id: int | None = None,
+        reply_to_message_id: int | None = None,
+        reply_markup: dict[str, object] | None = None,
+    ) -> TelegramSentMessage:
+        self.sent.append(
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "thread_id": thread_id,
+                "reply_to_message_id": reply_to_message_id,
+                "reply_markup": reply_markup,
+            }
+        )
+        return TelegramSentMessage(self.next_message_id, chat_id, thread_id)
+
+    def answer_callback(self, callback_query_id: str, text: str | None = None) -> None:
+        self.acknowledged.append(callback_query_id)
+
+
+def callback(
+    gate_id: GateId, data: str, *, user: int = 42, chat: int = 300, message: int = 201
+) -> TelegramCallbackQuery:
+    return TelegramCallbackQuery(900, "callback-1", user, chat, message, data, NOW, 7)
+
+
+def callback_handler(
+    db: sqlite3.Connection,
+    service: HumanInterventionService,
+    fake: FakeTelegram,
+) -> TelegramHumanInterventionHandler:
+    return TelegramHumanInterventionHandler(
+        db, cast(TelegramClient, fake), frozenset({"42"}), service
+    )
+
+
+def bind_notification(db: sqlite3.Connection, gate_id: GateId) -> None:
+    SQLiteTelegramGateNotificationRepository(db).add(gate_id, "300", "7", "201", NOW)
 
 
 def fixture(
@@ -693,6 +757,199 @@ def test_fail_rework_same_pr_sha_b_gets_fresh_human_test_gate(tmp_path: Path) ->
         ).fetchone()
     ) == (SHA_A, "FAIL")
     assert db.execute("SELECT count(*) FROM human_test_bindings").fetchone()[0] == 2
+
+
+def test_human_test_notification_renders_bounded_inline_actions(tmp_path: Path) -> None:
+    db, service, review, pr_id, ci_id = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_TEST_REQUIRED
+    )
+    gate = service.create_from_review(
+        db.execute("SELECT id FROM architect_reviews").fetchone()[0],
+        review,
+        pr_id,
+        ci_id,
+        causation_id="buttons",
+        occurred_at=NOW,
+    )
+    fake = FakeTelegram()
+    notifier = TelegramGateNotifier(
+        cast(TelegramClient, fake),
+        300,
+        7,
+        notifications=SQLiteTelegramGateNotificationRepository(db),
+        clock=lambda: NOW,
+    )
+    notifier.send(f"Human test\nGate: {gate.id}")
+    notifier.send(f"Human test\nGate: {gate.id}")
+    assert len(fake.sent) == 1
+    keyboard = fake.sent[0]["reply_markup"]["inline_keyboard"]  # type: ignore[index]
+    buttons = [row[0] for row in keyboard]
+    assert [button["text"] for button in buttons] == ["PASS", "FAIL", "BLOCKED"]
+    assert all(len(button["callback_data"].encode()) <= 64 for button in buttons)
+
+
+@pytest.mark.parametrize(
+    ("action", "outcome", "milestone_state"),
+    [("pass", "PASS", "ARCHITECT_REVIEW"), ("blocked", "BLOCKED", "BLOCKED")],
+)
+def test_human_test_inline_callback_resolves_intended_gate(
+    tmp_path: Path, action: str, outcome: str, milestone_state: str
+) -> None:
+    db, service, review, pr_id, ci_id = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_TEST_REQUIRED
+    )
+    gate = service.create_from_review(
+        db.execute("SELECT id FROM architect_reviews").fetchone()[0],
+        review,
+        pr_id,
+        ci_id,
+        causation_id="callback",
+        occurred_at=NOW,
+    )
+    bind_notification(db, gate.id)
+    fake = FakeTelegram()
+    handled = callback_handler(db, service, fake).handle_callback(
+        callback(gate.id, human_gate_callback_data(action, gate.id))
+    )
+    assert handled and fake.acknowledged == ["callback-1"]
+    assert service.gate_repository.get(gate.id).state is GateState.RESOLVED
+    assert db.execute("SELECT outcome FROM human_test_results").fetchone()[0] == outcome
+    assert db.execute("SELECT state FROM milestones").fetchone()[0] == milestone_state
+
+
+def test_fail_inline_callback_uses_same_pr_rework(tmp_path: Path) -> None:
+    db, service, review, pr_id, ci_id = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_TEST_REQUIRED
+    )
+    gate = service.create_from_review(
+        db.execute("SELECT id FROM architect_reviews").fetchone()[0],
+        review,
+        pr_id,
+        ci_id,
+        causation_id="fail-button",
+        occurred_at=NOW,
+    )
+    bind_notification(db, gate.id)
+    fake = FakeTelegram()
+    callback_handler(db, service, fake).handle_callback(
+        callback(gate.id, human_gate_callback_data("fail", gate.id))
+    )
+    assert db.execute("SELECT outcome FROM human_test_results").fetchone()[0] == "FAIL"
+    assert (
+        db.execute("SELECT pull_request_id FROM architect_rework_tasks").fetchone()[0]
+        == pr_id
+    )
+    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "CODING"
+
+
+@pytest.mark.parametrize(
+    "kind", [HumanDecisionKind.PRODUCT, HumanDecisionKind.TECHNICAL]
+)
+def test_decision_inline_options_render_and_resolve_from_persisted_index(
+    tmp_path: Path, kind: HumanDecisionKind
+) -> None:
+    db, service, review, pr_id, ci_id = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED
+    )
+    assert review.human_gate is not None
+    review = replace(review, human_gate=replace(review.human_gate, decision_kind=kind))
+    gate = service.create_from_review(
+        db.execute("SELECT id FROM architect_reviews").fetchone()[0],
+        review,
+        pr_id,
+        ci_id,
+        causation_id="decision-button",
+        occurred_at=NOW,
+    )
+    fake = FakeTelegram()
+    notifier = TelegramGateNotifier(
+        cast(TelegramClient, fake),
+        300,
+        7,
+        notifications=SQLiteTelegramGateNotificationRepository(db),
+        clock=lambda: NOW,
+    )
+    notifier.send(f"Decision\nGate: {gate.id}")
+    keyboard = fake.sent[0]["reply_markup"]["inline_keyboard"]  # type: ignore[index]
+    assert [row[0]["text"] for row in keyboard] == ["A", "B"]
+    data = keyboard[1][0]["callback_data"]
+    assert len(data.encode()) <= 64
+    # Authority comes from persisted option index 1; the displayed label is irrelevant.
+    keyboard[1][0]["text"] = "tampered label"
+    callback_handler(db, service, fake).handle_callback(callback(gate.id, data))
+    response = db.execute(
+        "SELECT selected_option FROM human_gate_responses WHERE gate_id=?",
+        (str(gate.id),),
+    ).fetchone()
+    assert response[0] == "B"
+
+
+def test_inline_callback_rejects_foreign_unauthorised_duplicate_and_stale(
+    tmp_path: Path,
+) -> None:
+    db, service, review, pr_id, ci_id = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_TEST_REQUIRED
+    )
+    gate = service.create_from_review(
+        db.execute("SELECT id FROM architect_reviews").fetchone()[0],
+        review,
+        pr_id,
+        ci_id,
+        causation_id="negative-buttons",
+        occurred_at=NOW,
+    )
+    bind_notification(db, gate.id)
+    data = human_gate_callback_data("pass", gate.id)
+    fake = FakeTelegram()
+    handler = callback_handler(db, service, fake)
+    for invalid in (
+        callback(gate.id, data, chat=999),
+        callback(gate.id, data, message=999),
+    ):
+        assert handler.handle_callback(invalid)
+        assert service.gate_repository.get(gate.id).state is GateState.NOTIFIED
+    with pytest.raises(PermissionError):
+        handler.handle_callback(callback(gate.id, data, user=99))
+    db.execute(
+        "UPDATE pull_requests SET head_sha=?,updated_at=? WHERE id=?",
+        (SHA_B, NOW.isoformat(), pr_id),
+    )
+    assert handler.handle_callback(callback(gate.id, data))
+    assert service.gate_repository.get(gate.id).state is GateState.NOTIFIED
+    db.execute(
+        "UPDATE pull_requests SET head_sha=?,updated_at=? WHERE id=?",
+        (SHA_A, NOW.isoformat(), pr_id),
+    )
+    assert handler.handle_callback(callback(gate.id, data))
+    assert service.gate_repository.get(gate.id).state is GateState.RESOLVED
+    assert handler.handle_callback(callback(gate.id, data))
+    assert db.execute("SELECT count(*) FROM human_gate_responses").fetchone()[0] == 1
+
+
+def test_typed_gate_command_remains_available_after_inline_controls(
+    tmp_path: Path,
+) -> None:
+    db, service, review, pr_id, ci_id = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_TEST_REQUIRED
+    )
+    gate = service.create_from_review(
+        db.execute("SELECT id FROM architect_reviews").fetchone()[0],
+        review,
+        pr_id,
+        ci_id,
+        causation_id="typed-fallback",
+        occurred_at=NOW,
+    )
+    config = load_config(
+        {"telegram": {"enabled": True, "authorised_user_ids": [42]}},
+        environ={},
+        secrets=SecretInputs(telegram_bot_token=SecretValue("synthetic-token")),
+    )
+    result = route_authorized_message(
+        TelegramInboundMessage(99, 100, 300, 42, f"gate {gate.id} PASS", NOW),
+        build_host_router(config, db),
+    )
+    assert "resolved as PASS" in result.text
 
 
 def test_migration_021_to_022_preserves_gate_response_and_review(

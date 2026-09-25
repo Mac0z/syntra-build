@@ -10,7 +10,11 @@ from uuid import uuid4
 
 from syntra_build.adapters.telegram.client import TelegramClient
 from syntra_build.adapters.telegram.gates import TelegramGateNotifier
+from syntra_build.adapters.telegram.human_intervention import (
+    TelegramHumanInterventionHandler,
+)
 from syntra_build.application.gates import HumanGateService
+from syntra_build.application.human_intervention import HumanInterventionService
 from syntra_build.domain.gates import GateState, GateType
 from syntra_build.domain.identifiers import GateId
 from syntra_build.infrastructure.config import load_host_config
@@ -84,6 +88,14 @@ def main() -> int:
             client,
             build_host_router(config, connection),
             SQLiteProviderCursorRepository(connection),
+            human_interventions=TelegramHumanInterventionHandler(
+                connection,
+                client,
+                authorised,
+                HumanInterventionService(
+                    connection, authorised_responder_ids=authorised
+                ),
+            ),
         )
         gate = repository.get(gate.id)
     print(

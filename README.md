@@ -193,7 +193,7 @@ Rollback requires restoring a pre-migration backup.
 ### M25 human-intervention smoke check
 
 The host operator can notify one persisted M25 gate through the configured real
-Telegram bot and process exactly one bounded Telegram poll. The reply must come
+Telegram bot and process exactly one bounded Telegram poll. The tap must come
 from an ID in `telegram.authorised_user_ids` and is routed through the ordinary
 Telegram command router and human-gate handler:
 
@@ -203,9 +203,12 @@ python -m syntra_build.m25_smoke --gate-id GATE_ID --chat-id TELEGRAM_CHAT_ID \
   --token-file /etc/syntra-build/telegram-token
 ```
 
-Reply in Telegram with `gate GATE_ID PASS`, `FAIL`, `BLOCKED`, or an allowed
-decision option. The command prints only the gate identifier, gate state, and
-bounded processed-update count. Migration 022 is forward-only and adds
+Normal acceptance is: receive the Telegram gate, tap **PASS**, **FAIL**,
+**BLOCKED**, or one of the displayed decision options, then verify the printed
+gate state and durable database evidence. No UUID typing is required. The typed
+`gate GATE_ID RESPONSE` command remains available as an administrative fallback.
+The command prints only the gate identifier, gate state, and bounded
+processed-update count. Migration 022 is forward-only and adds
 immutable exact-PR/head/CI human-test bindings and results while preserving all
 existing human-gate, response, and Architect-review history. Rollback requires
 restoring a version-21 backup.
