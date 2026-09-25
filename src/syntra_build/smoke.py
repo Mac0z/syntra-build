@@ -272,6 +272,11 @@ def run_telegram_once(
                 and design_approvals.handle_feedback_reply(message)
             )
             if not consumed:
+                consumed = (
+                    human_interventions is not None
+                    and human_interventions.handle_feedback_reply(message)
+                )
+            if not consumed:
                 response = route_authorized_message(message, router)
                 client.send_text(
                     chat_id=message.chat_id,

@@ -27,6 +27,7 @@ from syntra_build.infrastructure.persistence.errors import (
     DuplicateGateResponseError,
     GateMilestoneProjectMismatchError,
     GateNotFoundError,
+    HumanFeedbackRequiredError,
     PersistenceError,
 )
 from syntra_build.infrastructure.persistence.gates import SQLiteHumanGateRepository
@@ -327,6 +328,11 @@ class HumanGateCommandHandler:
             return "This response message was already processed."
         except PermissionError:
             return "You are not authorised to answer this human gate."
+        except HumanFeedbackRequiredError:
+            return (
+                "FAIL and BLOCKED require feedback. Use the Telegram button and "
+                "reply to its prompt."
+            )
         except ValueError, PersistenceError:
             return "Human gate response was rejected."
         return f"Human gate {resolved.id} resolved as {command.gate_response}."

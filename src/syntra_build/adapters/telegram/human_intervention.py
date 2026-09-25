@@ -10,15 +10,21 @@ from typing import Final
 
 from syntra_build.adapters.telegram.client import TelegramClient
 from syntra_build.adapters.telegram.errors import TelegramAPIError, TelegramError
-from syntra_build.adapters.telegram.models import TelegramCallbackQuery
+from syntra_build.adapters.telegram.models import (
+    TelegramCallbackQuery,
+    TelegramInboundMessage,
+)
 from syntra_build.application.commands.models import Command, CommandType
 from syntra_build.application.human_intervention import HumanInterventionService
 from syntra_build.domain.gates import GateState, GateType
 from syntra_build.domain.identifiers import GateId
+from syntra_build.infrastructure.persistence.connection import transaction
 from syntra_build.infrastructure.persistence.errors import PersistenceError
 from syntra_build.infrastructure.persistence.gates import SQLiteHumanGateRepository
 from syntra_build.infrastructure.persistence.telegram_interactions import (
+    SQLiteM25TelegramFeedbackRepository,
     SQLiteTelegramGateNotificationRepository,
+    TelegramInteractionState,
 )
 
 _CALLBACK: Final = re.compile(
@@ -82,6 +88,38 @@ class TelegramHumanInterventionHandler:
                 if gate.gate_type is not GateType.HUMAN_TEST:
                     raise PersistenceError("test callback does not match gate type")
                 response = outcome.upper()
+                if response in {"FAIL", "BLOCKED"}:
+                    self.interventions.validate_test_gate(gate)
+                    interactions = SQLiteM25TelegramFeedbackRepository(self.connection)
+                    interaction = interactions.begin(
+                        gate.id,
+                        response,
+                        str(callback.chat_id),
+                        str(callback.user_id),
+                        str(callback.thread_id)
+                        if callback.thread_id is not None
+                        else None,
+                        callback.received_at,
+                    )
+                    if interaction.state is TelegramInteractionState.PROMPTING:
+                        prompt = (
+                            "What failed? Please describe what you expected to happen "
+                            "and what actually happened."
+                            if response == "FAIL"
+                            else (
+                                "What is blocking this test, and what is needed "
+                                "to continue?"
+                            )
+                        )
+                        sent = self.client.send_text(
+                            chat_id=callback.chat_id,
+                            text=prompt,
+                            thread_id=callback.thread_id,
+                            reply_to_message_id=callback.source_message_id,
+                            reply_markup={"force_reply": True, "selective": True},
+                        )
+                        interactions.activate(interaction.id, str(sent.message_id))
+                    return True
             else:
                 if gate.gate_type not in {
                     GateType.PRODUCT_DECISION,
@@ -123,6 +161,67 @@ class TelegramHumanInterventionHandler:
                 thread_id=callback.thread_id,
                 reply_to_message_id=callback.source_message_id,
             )
+        return True
+
+    def handle_feedback_reply(self, message: TelegramInboundMessage) -> bool:
+        """Complete one durable FAIL/BLOCKED interaction from its exact reply."""
+        if (
+            str(message.user_id) not in self.authorised_user_ids
+            or message.reply_to_message_id is None
+        ):
+            return False
+        interactions = SQLiteM25TelegramFeedbackRepository(self.connection)
+        interaction = interactions.for_reply(
+            str(message.chat_id),
+            str(message.user_id),
+            str(message.thread_id) if message.thread_id is not None else None,
+            str(message.reply_to_message_id),
+        )
+        if interaction is None:
+            return False
+        if not message.text.strip():
+            self.client.send_text(
+                chat_id=message.chat_id,
+                text="Feedback cannot be empty. Please describe the observed problem.",
+                thread_id=message.thread_id,
+                reply_to_message_id=message.message_id,
+            )
+            return True
+        gate = SQLiteHumanGateRepository(self.connection, lambda: "unused").get(
+            interaction.gate_id
+        )
+        command = Command(
+            CommandType.RESPOND_GATE,
+            str(message.user_id),
+            message.received_at,
+            "telegram",
+            str(message.update_id),
+            str(message.message_id),
+            f"telegram:{message.update_id}",
+            gate_reference=str(gate.id),
+            gate_response=interaction.outcome,
+            gate_feedback=message.text,
+            chat_id=str(message.chat_id),
+            thread_id=str(message.thread_id) if message.thread_id is not None else None,
+        )
+        try:
+            with transaction(self.connection):
+                result = self.interventions.respond(command, gate)
+                interactions.resolve(interaction.id, message.received_at)
+        except PersistenceError:
+            self.client.send_text(
+                chat_id=message.chat_id,
+                text="This test result is stale or no longer answerable.",
+                thread_id=message.thread_id,
+                reply_to_message_id=message.message_id,
+            )
+            return True
+        self.client.send_text(
+            chat_id=message.chat_id,
+            text=result,
+            thread_id=message.thread_id,
+            reply_to_message_id=message.message_id,
+        )
         return True
 
     def _acknowledge(self, callback_query_id: str, text: str | None = None) -> None:

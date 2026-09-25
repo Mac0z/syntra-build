@@ -36,9 +36,13 @@ from syntra_build.domain.reviews import (
     ArchitectReviewVerdict,
     HumanDecisionKind,
 )
-from syntra_build.infrastructure.persistence.connection import transaction
+from syntra_build.infrastructure.persistence.connection import (
+    transaction,
+    transaction_scope,
+)
 from syntra_build.infrastructure.persistence.errors import (
     ClosedGateError,
+    HumanFeedbackRequiredError,
     PersistenceError,
 )
 from syntra_build.infrastructure.persistence.gates import SQLiteHumanGateRepository
@@ -244,6 +248,14 @@ class HumanInterventionService:
         if gate.state is not GateState.NOTIFIED:
             raise ClosedGateError("gate is not answerable")
         code = validate_response(gate, command.gate_response or "")
+        if (
+            gate.gate_type is GateType.HUMAN_TEST
+            and code in {HumanTestResponse.FAIL, HumanTestResponse.BLOCKED}
+            and (command.gate_feedback is None or not command.gate_feedback.strip())
+        ):
+            raise HumanFeedbackRequiredError(
+                f"{code} requires human feedback describing the observed condition"
+            )
         now = command.requested_at
         response_id = self.id_factory()
         response = HumanGateResponse(
@@ -282,7 +294,7 @@ class HumanInterventionService:
             and gate.architect_review_id is not None
         ):
             target = MilestoneState.ARCHITECT_REVIEW
-        with transaction(self.connection):
+        with transaction_scope(self.connection):
             responded = self.gate_repository.record_response(
                 self._gate_transition(
                     gate, GateState.RESPONDED, now, command, "human response received"
@@ -421,6 +433,16 @@ class HumanInterventionService:
                 "human test CI evidence is stale or not passing"
             )
         return cast(sqlite3.Row, row)
+
+    def validate_test_gate(self, gate: HumanGate) -> None:
+        """Validate exact current test evidence without resolving the gate."""
+        gate = self.gate_repository.get(gate.id)
+        if (
+            gate.state is not GateState.NOTIFIED
+            or gate.gate_type is not GateType.HUMAN_TEST
+        ):
+            raise HumanInterventionError("human test gate is not eligible")
+        self._validated_test_binding(gate)
 
     def _gate_transition(
         self,

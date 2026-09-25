@@ -58,7 +58,9 @@ from syntra_build.infrastructure.persistence.pull_requests import (
     SQLitePullRequestRepository,
 )
 from syntra_build.infrastructure.persistence.telegram_interactions import (
+    SQLiteM25TelegramFeedbackRepository,
     SQLiteTelegramGateNotificationRepository,
+    TelegramInteractionState,
 )
 from syntra_build.smoke import build_host_router
 
@@ -788,12 +790,8 @@ def test_human_test_notification_renders_bounded_inline_actions(tmp_path: Path) 
     assert all(len(button["callback_data"].encode()) <= 64 for button in buttons)
 
 
-@pytest.mark.parametrize(
-    ("action", "outcome", "milestone_state"),
-    [("pass", "PASS", "ARCHITECT_REVIEW"), ("blocked", "BLOCKED", "BLOCKED")],
-)
-def test_human_test_inline_callback_resolves_intended_gate(
-    tmp_path: Path, action: str, outcome: str, milestone_state: str
+def test_pass_inline_callback_resolves_immediately_without_feedback(
+    tmp_path: Path,
 ) -> None:
     db, service, review, pr_id, ci_id = fixture(
         tmp_path, ArchitectReviewVerdict.HUMAN_TEST_REQUIRED
@@ -809,12 +807,17 @@ def test_human_test_inline_callback_resolves_intended_gate(
     bind_notification(db, gate.id)
     fake = FakeTelegram()
     handled = callback_handler(db, service, fake).handle_callback(
-        callback(gate.id, human_gate_callback_data(action, gate.id))
+        callback(gate.id, human_gate_callback_data("pass", gate.id))
     )
     assert handled and fake.acknowledged == ["callback-1"]
     assert service.gate_repository.get(gate.id).state is GateState.RESOLVED
-    assert db.execute("SELECT outcome FROM human_test_results").fetchone()[0] == outcome
-    assert db.execute("SELECT state FROM milestones").fetchone()[0] == milestone_state
+    assert db.execute("SELECT outcome FROM human_test_results").fetchone()[0] == "PASS"
+    assert (
+        db.execute("SELECT evidence_text FROM human_test_results").fetchone()[0] is None
+    )
+    assert (
+        db.execute("SELECT state FROM milestones").fetchone()[0] == "ARCHITECT_REVIEW"
+    )
 
 
 def test_fail_inline_callback_uses_same_pr_rework(tmp_path: Path) -> None:
@@ -831,15 +834,148 @@ def test_fail_inline_callback_uses_same_pr_rework(tmp_path: Path) -> None:
     )
     bind_notification(db, gate.id)
     fake = FakeTelegram()
-    callback_handler(db, service, fake).handle_callback(
+    fake.next_message_id = 501
+    handler = callback_handler(db, service, fake)
+    handler.handle_callback(
         callback(gate.id, human_gate_callback_data("fail", gate.id))
     )
-    assert db.execute("SELECT outcome FROM human_test_results").fetchone()[0] == "FAIL"
+    assert service.gate_repository.get(gate.id).state is GateState.NOTIFIED
+    assert db.execute("SELECT count(*) FROM human_test_results").fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+    interaction = SQLiteM25TelegramFeedbackRepository(db).active(gate.id)
+    assert interaction is not None
+    assert interaction.state is TelegramInteractionState.WAITING_FEEDBACK
+    assert interaction.prompt_message_id == "501"
+    assert fake.sent[-1]["reply_markup"] == {"force_reply": True, "selective": True}
+    evidence = "Expected save to succeed; the screen showed error E42."
+    assert handler.handle_feedback_reply(
+        TelegramInboundMessage(901, 502, 300, 42, evidence, NOW, 7, 501)
+    )
+    result = db.execute(
+        "SELECT outcome,evidence_text FROM human_test_results"
+    ).fetchone()
+    assert tuple(result) == ("FAIL", evidence)
     assert (
         db.execute("SELECT pull_request_id FROM architect_rework_tasks").fetchone()[0]
         == pr_id
     )
+    payload = db.execute(
+        "SELECT task_payload_json FROM architect_rework_tasks"
+    ).fetchone()[0]
+    assert json.loads(payload)["human_evidence"] == evidence
     assert db.execute("SELECT state FROM milestones").fetchone()[0] == "CODING"
+
+
+def test_fail_feedback_is_durable_correlated_and_duplicate_safe(tmp_path: Path) -> None:
+    db, service, review, pr_id, ci_id = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_TEST_REQUIRED
+    )
+    gate = service.create_from_review(
+        db.execute("SELECT id FROM architect_reviews").fetchone()[0],
+        review,
+        pr_id,
+        ci_id,
+        causation_id="durable-feedback",
+        occurred_at=NOW,
+    )
+    bind_notification(db, gate.id)
+    fake = FakeTelegram()
+    fake.next_message_id = 501
+    callback_handler(db, service, fake).handle_callback(
+        callback(gate.id, human_gate_callback_data("fail", gate.id))
+    )
+    # Reconstruct both repository and handler as a process restart would.
+    reconstructed = callback_handler(
+        db,
+        HumanInterventionService(db, authorised_responder_ids=frozenset({"42"})),
+        fake,
+    )
+    for unrelated in (
+        TelegramInboundMessage(910, 510, 300, 42, "unrelated", NOW, 7, None),
+        TelegramInboundMessage(911, 511, 300, 99, "wrong user", NOW, 7, 501),
+        TelegramInboundMessage(912, 512, 999, 42, "wrong chat", NOW, 7, 501),
+        TelegramInboundMessage(913, 513, 300, 42, "wrong thread", NOW, 8, 501),
+        TelegramInboundMessage(914, 514, 300, 42, "wrong message", NOW, 7, 999),
+    ):
+        assert not reconstructed.handle_feedback_reply(unrelated)
+    empty = TelegramInboundMessage(915, 515, 300, 42, "   ", NOW, 7, 501)
+    assert reconstructed.handle_feedback_reply(empty)
+    assert SQLiteM25TelegramFeedbackRepository(db).active(gate.id) is not None
+    assert service.gate_repository.get(gate.id).state is GateState.NOTIFIED
+    evidence = "The generated report omitted the final totals row."
+    reply = TelegramInboundMessage(916, 516, 300, 42, evidence, NOW, 7, 501)
+    assert reconstructed.handle_feedback_reply(reply)
+    assert not reconstructed.handle_feedback_reply(reply)
+    assert db.execute("SELECT count(*) FROM human_gate_responses").fetchone()[0] == 1
+    assert db.execute("SELECT count(*) FROM architect_rework_tasks").fetchone()[0] == 1
+    assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+
+
+def test_blocked_waits_for_reason_then_blocks_without_codex(tmp_path: Path) -> None:
+    db, service, review, pr_id, ci_id = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_TEST_REQUIRED
+    )
+    gate = service.create_from_review(
+        db.execute("SELECT id FROM architect_reviews").fetchone()[0],
+        review,
+        pr_id,
+        ci_id,
+        causation_id="blocked-feedback",
+        occurred_at=NOW,
+    )
+    bind_notification(db, gate.id)
+    fake = FakeTelegram()
+    fake.next_message_id = 601
+    handler = callback_handler(db, service, fake)
+    handler.handle_callback(
+        callback(gate.id, human_gate_callback_data("blocked", gate.id))
+    )
+    assert service.gate_repository.get(gate.id).state is GateState.NOTIFIED
+    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "HUMAN_TEST"
+    assert db.execute("SELECT state FROM projects").fetchone()[0] == "WAITING_HUMAN"
+    assert db.execute("SELECT count(*) FROM human_test_results").fetchone()[0] == 0
+    reason = "The required hardware sensor is unavailable until Monday."
+    assert handler.handle_feedback_reply(
+        TelegramInboundMessage(920, 602, 300, 42, reason, NOW, 7, 601)
+    )
+    assert tuple(
+        db.execute("SELECT outcome,evidence_text FROM human_test_results").fetchone()
+    ) == ("BLOCKED", reason)
+    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "BLOCKED"
+    assert db.execute("SELECT state FROM projects").fetchone()[0] == "BLOCKED"
+    assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_stale_sha_between_fail_button_and_feedback_is_rejected(tmp_path: Path) -> None:
+    db, service, review, pr_id, ci_id = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_TEST_REQUIRED
+    )
+    gate = service.create_from_review(
+        db.execute("SELECT id FROM architect_reviews").fetchone()[0],
+        review,
+        pr_id,
+        ci_id,
+        causation_id="stale-feedback",
+        occurred_at=NOW,
+    )
+    bind_notification(db, gate.id)
+    fake = FakeTelegram()
+    fake.next_message_id = 701
+    handler = callback_handler(db, service, fake)
+    handler.handle_callback(
+        callback(gate.id, human_gate_callback_data("fail", gate.id))
+    )
+    db.execute(
+        "UPDATE pull_requests SET head_sha=?,updated_at=? WHERE id=?",
+        (SHA_B, NOW.isoformat(), pr_id),
+    )
+    assert handler.handle_feedback_reply(
+        TelegramInboundMessage(930, 702, 300, 42, "Observed failure", NOW, 7, 701)
+    )
+    assert service.gate_repository.get(gate.id).state is GateState.NOTIFIED
+    assert SQLiteM25TelegramFeedbackRepository(db).active(gate.id) is not None
+    assert db.execute("SELECT count(*) FROM human_test_results").fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize(
@@ -950,6 +1086,35 @@ def test_typed_gate_command_remains_available_after_inline_controls(
         build_host_router(config, db),
     )
     assert "resolved as PASS" in result.text
+
+
+@pytest.mark.parametrize("outcome", ["FAIL", "BLOCKED"])
+def test_typed_fallback_rejects_evidenceless_negative_outcome(
+    tmp_path: Path, outcome: str
+) -> None:
+    db, service, review, pr_id, ci_id = fixture(
+        tmp_path, ArchitectReviewVerdict.HUMAN_TEST_REQUIRED
+    )
+    gate = service.create_from_review(
+        db.execute("SELECT id FROM architect_reviews").fetchone()[0],
+        review,
+        pr_id,
+        ci_id,
+        causation_id="typed-negative",
+        occurred_at=NOW,
+    )
+    config = load_config(
+        {"telegram": {"enabled": True, "authorised_user_ids": [42]}},
+        environ={},
+        secrets=SecretInputs(telegram_bot_token=SecretValue("synthetic-token")),
+    )
+    result = route_authorized_message(
+        TelegramInboundMessage(99, 100, 300, 42, f"gate {gate.id} {outcome}", NOW),
+        build_host_router(config, db),
+    )
+    assert "require feedback" in result.text
+    assert service.gate_repository.get(gate.id).state is GateState.NOTIFIED
+    assert db.execute("SELECT count(*) FROM human_test_results").fetchone()[0] == 0
 
 
 def test_migration_021_to_022_preserves_gate_response_and_review(

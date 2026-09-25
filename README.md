@@ -205,7 +205,10 @@ python -m syntra_build.m25_smoke --gate-id GATE_ID --chat-id TELEGRAM_CHAT_ID \
 
 Normal acceptance is: receive the Telegram gate, tap **PASS**, **FAIL**,
 **BLOCKED**, or one of the displayed decision options, then verify the printed
-gate state and durable database evidence. No UUID typing is required. The typed
+gate state and durable database evidence. **PASS** completes immediately.
+**FAIL** and **BLOCKED** open a force-reply prompt and complete only after the
+human supplies an actionable failure observation or blocking reason; the reply
+remains durably correlated across a service restart. No UUID typing is required. The typed
 `gate GATE_ID RESPONSE` command remains available as an administrative fallback.
 The command prints only the gate identifier, gate state, and bounded
 processed-update count. Migration 022 is forward-only and adds

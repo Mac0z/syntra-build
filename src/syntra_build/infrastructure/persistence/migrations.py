@@ -1073,6 +1073,28 @@ MIGRATIONS: tuple[Migration, ...] = (
                 evidence_text TEXT, tested_head_sha TEXT NOT NULL CHECK(length(tested_head_sha)=40),
                 ci_run_id TEXT NOT NULL REFERENCES ci_runs(id), recorded_at TEXT NOT NULL
             ) STRICT""",
+            """CREATE TABLE m25_telegram_feedback_interactions (
+                id TEXT PRIMARY KEY,
+                gate_id TEXT NOT NULL REFERENCES human_gates(id),
+                outcome TEXT NOT NULL CHECK(outcome IN ('FAIL','BLOCKED')),
+                chat_id TEXT NOT NULL, user_id TEXT NOT NULL, thread_id TEXT,
+                prompt_message_id TEXT,
+                state TEXT NOT NULL CHECK(state IN ('PROMPTING','WAITING_FEEDBACK','RESOLVED','CANCELLED')),
+                created_at TEXT NOT NULL, resolved_at TEXT,
+                CHECK((state='PROMPTING' AND prompt_message_id IS NULL AND resolved_at IS NULL)
+                   OR (state='WAITING_FEEDBACK' AND prompt_message_id IS NOT NULL AND resolved_at IS NULL)
+                   OR (state IN ('RESOLVED','CANCELLED') AND prompt_message_id IS NOT NULL AND resolved_at IS NOT NULL))
+            ) STRICT""",
+            """CREATE UNIQUE INDEX one_active_m25_feedback_per_gate
+                ON m25_telegram_feedback_interactions(gate_id)
+                WHERE state IN ('PROMPTING','WAITING_FEEDBACK')""",
+            """CREATE TRIGGER m25_feedback_identity_immutable BEFORE UPDATE OF
+                id,gate_id,outcome,chat_id,user_id,thread_id,created_at
+                ON m25_telegram_feedback_interactions
+                BEGIN SELECT RAISE(ABORT,'M25 feedback identity is immutable'); END""",
+            """CREATE TRIGGER m25_feedback_no_delete BEFORE DELETE
+                ON m25_telegram_feedback_interactions
+                BEGIN SELECT RAISE(ABORT,'M25 feedback interactions are preservation-oriented'); END""",
             """CREATE TRIGGER human_test_bindings_no_update BEFORE UPDATE ON human_test_bindings
                 BEGIN SELECT RAISE(ABORT,'human test bindings are immutable'); END""",
             """CREATE TRIGGER human_test_bindings_no_delete BEFORE DELETE ON human_test_bindings
