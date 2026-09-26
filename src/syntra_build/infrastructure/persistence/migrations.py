@@ -1073,6 +1073,20 @@ MIGRATIONS: tuple[Migration, ...] = (
                 evidence_text TEXT, tested_head_sha TEXT NOT NULL CHECK(length(tested_head_sha)=40),
                 ci_run_id TEXT NOT NULL REFERENCES ci_runs(id), recorded_at TEXT NOT NULL
             ) STRICT""",
+            """CREATE TRIGGER human_test_bindings_no_update BEFORE UPDATE ON human_test_bindings
+                BEGIN SELECT RAISE(ABORT,'human test bindings are immutable'); END""",
+            """CREATE TRIGGER human_test_bindings_no_delete BEFORE DELETE ON human_test_bindings
+                BEGIN SELECT RAISE(ABORT,'human test bindings are preservation-oriented'); END""",
+            """CREATE TRIGGER human_test_results_no_update BEFORE UPDATE ON human_test_results
+                BEGIN SELECT RAISE(ABORT,'human test results are immutable'); END""",
+            """CREATE TRIGGER human_test_results_no_delete BEFORE DELETE ON human_test_results
+                BEGIN SELECT RAISE(ABORT,'human test results are preservation-oriented'); END""",
+        ),
+    ),
+    Migration(
+        version=23,
+        name="023_m25_human_feedback",
+        statements=(
             """CREATE TABLE m25_telegram_feedback_interactions (
                 id TEXT PRIMARY KEY,
                 gate_id TEXT NOT NULL REFERENCES human_gates(id),
@@ -1095,14 +1109,6 @@ MIGRATIONS: tuple[Migration, ...] = (
             """CREATE TRIGGER m25_feedback_no_delete BEFORE DELETE
                 ON m25_telegram_feedback_interactions
                 BEGIN SELECT RAISE(ABORT,'M25 feedback interactions are preservation-oriented'); END""",
-            """CREATE TRIGGER human_test_bindings_no_update BEFORE UPDATE ON human_test_bindings
-                BEGIN SELECT RAISE(ABORT,'human test bindings are immutable'); END""",
-            """CREATE TRIGGER human_test_bindings_no_delete BEFORE DELETE ON human_test_bindings
-                BEGIN SELECT RAISE(ABORT,'human test bindings are preservation-oriented'); END""",
-            """CREATE TRIGGER human_test_results_no_update BEFORE UPDATE ON human_test_results
-                BEGIN SELECT RAISE(ABORT,'human test results are immutable'); END""",
-            """CREATE TRIGGER human_test_results_no_delete BEFORE DELETE ON human_test_results
-                BEGIN SELECT RAISE(ABORT,'human test results are preservation-oriented'); END""",
         ),
     ),
 )

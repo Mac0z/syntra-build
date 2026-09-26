@@ -211,7 +211,11 @@ human supplies an actionable failure observation or blocking reason; the reply
 remains durably correlated across a service restart. No UUID typing is required. The typed
 `gate GATE_ID RESPONSE` command remains available as an administrative fallback.
 The command prints only the gate identifier, gate state, and bounded
-processed-update count. Migration 022 is forward-only and adds
-immutable exact-PR/head/CI human-test bindings and results while preserving all
-existing human-gate, response, and Architect-review history. Rollback requires
-restoring a version-21 backup.
+processed-update count. Migration 022 is forward-only and adds immutable
+exact-PR/head/CI human-test bindings and results while preserving all existing
+human-gate, response, and Architect-review history. Migration 023 adds only the
+durable Telegram FAIL/BLOCKED feedback interaction table, its active-interaction
+index, and its immutability/preservation triggers. Upgrading an existing
+schema-22 database therefore creates the feedback structures without replaying
+the released migration. Rollback requires restoring the backup taken before the
+relevant migration.
