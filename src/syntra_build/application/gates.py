@@ -27,6 +27,7 @@ from syntra_build.infrastructure.persistence.errors import (
     DuplicateGateResponseError,
     GateMilestoneProjectMismatchError,
     GateNotFoundError,
+    HumanFeedbackRequiredError,
     PersistenceError,
 )
 from syntra_build.infrastructure.persistence.gates import SQLiteHumanGateRepository
@@ -56,6 +57,8 @@ class CreateGateRequest:
     resume_project_state: ProjectState | None = None
     resume_milestone_state: MilestoneState | None = None
     artifact_reference: str | None = None
+    architect_review_id: str | None = None
+    causation_id: str | None = None
 
 
 class HumanGateService:
@@ -109,6 +112,8 @@ class HumanGateService:
             created_by=request.created_by,
             correlation_id=request.correlation_id,
             artifact_reference=request.artifact_reference,
+            architect_review_id=request.architect_review_id,
+            causation_id=request.causation_id,
         )
         self._repository.add(gate)
         return gate
@@ -269,9 +274,11 @@ class HumanGateCommandHandler:
         self,
         gates: HumanGateService,
         design_decisions: DesignDecisionHandler | None = None,
+        human_interventions: DesignDecisionHandler | None = None,
     ):
         self._gates = gates
         self._design_decisions = design_decisions
+        self._human_interventions = human_interventions
 
     def waiting(self) -> str:
         return format_waiting(self._gates.outstanding())
@@ -288,6 +295,16 @@ class HumanGateCommandHandler:
                 if gate.state is not GateState.NOTIFIED:
                     raise ClosedGateError("gate is not answerable")
                 return self._design_decisions.respond(command, gate)
+            if (
+                gate.gate_type
+                in {
+                    GateType.HUMAN_TEST,
+                    GateType.PRODUCT_DECISION,
+                    GateType.TECHNICAL_DECISION,
+                }
+                and self._human_interventions
+            ):
+                return self._human_interventions.respond(command, gate)
             resolved = self._gates.respond(
                 gate_id,
                 project_id=gate.project_id,
@@ -311,6 +328,11 @@ class HumanGateCommandHandler:
             return "This response message was already processed."
         except PermissionError:
             return "You are not authorised to answer this human gate."
+        except HumanFeedbackRequiredError:
+            return (
+                "FAIL and BLOCKED require feedback. Use the Telegram button and "
+                "reply to its prompt."
+            )
         except ValueError, PersistenceError:
             return "Human gate response was rejected."
         return f"Human gate {resolved.id} resolved as {command.gate_response}."

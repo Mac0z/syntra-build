@@ -209,3 +209,139 @@ class SQLiteTelegramGateInteractionRepository:
             if row["resolved_at"]
             else None,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class M25TelegramFeedbackInteraction:
+    id: str
+    gate_id: GateId
+    outcome: str
+    chat_id: str
+    user_id: str
+    thread_id: str | None
+    prompt_message_id: str | None
+    state: TelegramInteractionState
+    created_at: datetime
+    resolved_at: datetime | None = None
+
+
+class SQLiteM25TelegramFeedbackRepository:
+    """Durable correlation for M25 FAIL/BLOCKED force-reply evidence."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+
+    def begin(
+        self,
+        gate_id: GateId,
+        outcome: str,
+        chat_id: str,
+        user_id: str,
+        thread_id: str | None,
+        created_at: datetime,
+    ) -> M25TelegramFeedbackInteraction:
+        existing = self.active(gate_id)
+        if existing is not None:
+            if (
+                existing.outcome != outcome
+                or existing.chat_id != chat_id
+                or existing.user_id != user_id
+                or existing.thread_id != thread_id
+            ):
+                raise PersistenceError("gate already has a different feedback request")
+            return existing
+        if outcome not in {"FAIL", "BLOCKED"}:
+            raise PersistenceError("feedback outcome is unsupported")
+        interaction_id = str(uuid4())
+        try:
+            self.connection.execute(
+                """INSERT INTO m25_telegram_feedback_interactions
+                (id,gate_id,outcome,chat_id,user_id,thread_id,state,created_at)
+                VALUES (?,?,?,?,?,?,'PROMPTING',?)""",
+                (
+                    interaction_id,
+                    str(gate_id),
+                    outcome,
+                    chat_id,
+                    user_id,
+                    thread_id,
+                    created_at.isoformat(timespec="microseconds"),
+                ),
+            )
+        except sqlite3.Error as error:
+            raise PersistenceError(
+                "M25 feedback interaction could not be stored"
+            ) from error
+        return self.get(interaction_id)
+
+    def activate(
+        self, interaction_id: str, prompt_message_id: str
+    ) -> M25TelegramFeedbackInteraction:
+        if (
+            self.connection.execute(
+                """UPDATE m25_telegram_feedback_interactions
+                SET state='WAITING_FEEDBACK',prompt_message_id=?
+                WHERE id=? AND state='PROMPTING'""",
+                (prompt_message_id, interaction_id),
+            ).rowcount
+            != 1
+        ):
+            raise PersistenceError("M25 feedback interaction is not promptable")
+        return self.get(interaction_id)
+
+    def for_reply(
+        self,
+        chat_id: str,
+        user_id: str,
+        thread_id: str | None,
+        prompt_message_id: str,
+    ) -> M25TelegramFeedbackInteraction | None:
+        row = self.connection.execute(
+            """SELECT id FROM m25_telegram_feedback_interactions
+            WHERE chat_id=? AND user_id=? AND thread_id IS ? AND prompt_message_id=?
+              AND state='WAITING_FEEDBACK'""",
+            (chat_id, user_id, thread_id, prompt_message_id),
+        ).fetchone()
+        return self.get(row["id"]) if row else None
+
+    def active(self, gate_id: GateId) -> M25TelegramFeedbackInteraction | None:
+        row = self.connection.execute(
+            """SELECT id FROM m25_telegram_feedback_interactions
+            WHERE gate_id=? AND state IN ('PROMPTING','WAITING_FEEDBACK')""",
+            (str(gate_id),),
+        ).fetchone()
+        return self.get(row["id"]) if row else None
+
+    def resolve(self, interaction_id: str, at: datetime) -> None:
+        if (
+            self.connection.execute(
+                """UPDATE m25_telegram_feedback_interactions
+                SET state='RESOLVED',resolved_at=?
+                WHERE id=? AND state='WAITING_FEEDBACK'""",
+                (at.isoformat(timespec="microseconds"), interaction_id),
+            ).rowcount
+            != 1
+        ):
+            raise PersistenceError("M25 feedback interaction was already resolved")
+
+    def get(self, interaction_id: str) -> M25TelegramFeedbackInteraction:
+        row = self.connection.execute(
+            "SELECT * FROM m25_telegram_feedback_interactions WHERE id=?",
+            (interaction_id,),
+        ).fetchone()
+        if row is None:
+            raise PersistenceError("M25 feedback interaction does not exist")
+        return M25TelegramFeedbackInteraction(
+            row["id"],
+            GateId.from_string(row["gate_id"]),
+            row["outcome"],
+            row["chat_id"],
+            row["user_id"],
+            row["thread_id"],
+            row["prompt_message_id"],
+            TelegramInteractionState(row["state"]),
+            datetime.fromisoformat(row["created_at"]).astimezone(UTC),
+            datetime.fromisoformat(row["resolved_at"]).astimezone(UTC)
+            if row["resolved_at"]
+            else None,
+        )

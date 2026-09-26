@@ -189,3 +189,33 @@ review-rework tasks. A `CHANGES_REQUIRED` verdict atomically queues one durable
 Codex-class `CODEX_REVIEW_REWORK` job for the existing milestone worktree and PR;
 the scheduler dispatches that job through the normal bounded Codex capacity.
 Rollback requires restoring a pre-migration backup.
+
+### M25 human-intervention smoke check
+
+The host operator can notify one persisted M25 gate through the configured real
+Telegram bot and process exactly one bounded Telegram poll. The tap must come
+from an ID in `telegram.authorised_user_ids` and is routed through the ordinary
+Telegram command router and human-gate handler:
+
+```bash
+python -m syntra_build.m25_smoke --gate-id GATE_ID --chat-id TELEGRAM_CHAT_ID \
+  --config /etc/syntra-build/config.json \
+  --token-file /etc/syntra-build/telegram-token
+```
+
+Normal acceptance is: receive the Telegram gate, tap **PASS**, **FAIL**,
+**BLOCKED**, or one of the displayed decision options, then verify the printed
+gate state and durable database evidence. **PASS** completes immediately.
+**FAIL** and **BLOCKED** open a force-reply prompt and complete only after the
+human supplies an actionable failure observation or blocking reason; the reply
+remains durably correlated across a service restart. No UUID typing is required. The typed
+`gate GATE_ID RESPONSE` command remains available as an administrative fallback.
+The command prints only the gate identifier, gate state, and bounded
+processed-update count. Migration 022 is forward-only and adds immutable
+exact-PR/head/CI human-test bindings and results while preserving all existing
+human-gate, response, and Architect-review history. Migration 023 adds only the
+durable Telegram FAIL/BLOCKED feedback interaction table, its active-interaction
+index, and its immutability/preservation triggers. Upgrading an existing
+schema-22 database therefore creates the feedback structures without replaying
+the released migration. Rollback requires restoring the backup taken before the
+relevant migration.

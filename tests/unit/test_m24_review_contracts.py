@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 
+from syntra_build.adapters.architect.openai import REVIEW_SCHEMA
 from syntra_build.domain.errors import DomainValidationError
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
 from syntra_build.domain.reviews import (
@@ -68,3 +71,70 @@ def test_review_contract_rejects_extra_fields() -> None:
     payload["merge_now"] = True
     with pytest.raises(DomainValidationError, match="malformed"):
         ArchitectReview.from_dict(payload)
+
+
+@pytest.mark.parametrize("kind", ["PRODUCT", "TECHNICAL"])
+def test_human_decision_contract_strictly_parses_decision_kind(kind: str) -> None:
+    payload = _payload()
+    payload.update(
+        verdict="HUMAN_DECISION_REQUIRED",
+        findings=[],
+        human_gate={
+            "prompt": "Choose an approach",
+            "resume_milestone_state": "ARCHITECT_REVIEW",
+            "options": ["A", "B"],
+            "test_instructions": None,
+            "artifact_reference": None,
+            "decision_kind": kind,
+        },
+    )
+    assert ArchitectReview.from_dict(payload).human_gate is not None
+
+
+@pytest.mark.parametrize(
+    "resume_target", ["MERGE_READY", "CODING", "PREPARING_TASK", "REVIEW_REWORK"]
+)
+def test_human_decision_rejects_unsupported_resume_targets(
+    resume_target: str,
+) -> None:
+    payload = _payload()
+    payload.update(
+        verdict="HUMAN_DECISION_REQUIRED",
+        findings=[],
+        human_gate={
+            "prompt": "Choose an approach",
+            "resume_milestone_state": resume_target,
+            "options": ["A", "B"],
+            "test_instructions": None,
+            "artifact_reference": None,
+            "decision_kind": "TECHNICAL",
+        },
+    )
+    with pytest.raises(DomainValidationError, match="ARCHITECT_REVIEW"):
+        ArchitectReview.from_dict(payload)
+
+
+def test_human_test_rejects_decision_kind_and_non_review_resume() -> None:
+    payload = _payload()
+    payload.update(
+        verdict="HUMAN_TEST_REQUIRED",
+        findings=[],
+        human_gate={
+            "prompt": "Test it",
+            "resume_milestone_state": "MERGE_READY",
+            "options": [],
+            "test_instructions": "Exercise the build",
+            "artifact_reference": "artifact://build",
+            "decision_kind": "PRODUCT",
+        },
+    )
+    with pytest.raises(DomainValidationError, match="ARCHITECT_REVIEW"):
+        ArchitectReview.from_dict(payload)
+
+
+def test_openai_review_schema_only_allows_architect_review_resume() -> None:
+    schema = cast(dict[str, Any], REVIEW_SCHEMA)
+    human_gate = schema["properties"]["human_gate"]
+    object_schema = human_gate["anyOf"][1]
+    resume = object_schema["properties"]["resume_milestone_state"]
+    assert resume == {"type": "string", "const": "ARCHITECT_REVIEW"}

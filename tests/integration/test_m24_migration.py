@@ -16,7 +16,7 @@ def test_migration_020_to_021_preserves_architect_history(tmp_path: Path) -> Non
     now = datetime.now(UTC).isoformat()
     project_id = str(uuid4())
     with open_database(tmp_path / "upgrade.db") as connection:
-        apply_migrations(connection, MIGRATIONS[:-1])
+        apply_migrations(connection, MIGRATIONS[:20])
         assert current_schema_version(connection) == 20
         connection.execute(
             """INSERT INTO projects
@@ -44,7 +44,7 @@ def test_migration_020_to_021_preserves_architect_history(tmp_path: Path) -> Non
                 (response_id, request_id, kind, now),
             )
         apply_migrations(connection)
-        assert current_schema_version(connection) == 21
+        assert current_schema_version(connection) == len(MIGRATIONS)
         for request_id, response_id, kind in identities:
             request = connection.execute(
                 "SELECT * FROM architect_requests WHERE id=?", (request_id,)
@@ -57,10 +57,10 @@ def test_migration_020_to_021_preserves_architect_history(tmp_path: Path) -> Non
         assert list(connection.execute("PRAGMA foreign_key_check")) == []
 
 
-def test_clean_database_reaches_migration_021(tmp_path: Path) -> None:
+def test_clean_database_includes_migration_021(tmp_path: Path) -> None:
     with open_database(tmp_path / "clean.db") as connection:
         apply_migrations(connection)
-        assert current_schema_version(connection) == 21
+        assert current_schema_version(connection) == len(MIGRATIONS)
         tables = {
             row[0]
             for row in connection.execute(

@@ -1044,6 +1044,73 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE TRIGGER architect_findings_no_delete BEFORE DELETE ON architect_review_findings BEGIN SELECT RAISE(ABORT,'Architect findings are preservation-oriented'); END",
         ),
     ),
+    Migration(
+        version=22,
+        name="022_human_interventions",
+        statements=(
+            "ALTER TABLE human_gates ADD COLUMN architect_review_id TEXT REFERENCES architect_reviews(id)",
+            "ALTER TABLE human_gates ADD COLUMN causation_id TEXT",
+            "CREATE UNIQUE INDEX one_gate_per_architect_review ON human_gates(architect_review_id) WHERE architect_review_id IS NOT NULL",
+            "CREATE UNIQUE INDEX ci_runs_gate_identity ON ci_runs(id,pull_request_id,head_sha)",
+            """CREATE TABLE human_test_bindings (
+                gate_id TEXT PRIMARY KEY REFERENCES human_gates(id),
+                project_id TEXT NOT NULL, milestone_id TEXT NOT NULL,
+                architect_review_id TEXT NOT NULL UNIQUE REFERENCES architect_reviews(id),
+                pull_request_id TEXT NOT NULL, pull_request_number INTEGER NOT NULL CHECK(pull_request_number>0),
+                tested_head_sha TEXT NOT NULL CHECK(length(tested_head_sha)=40),
+                ci_run_id TEXT NOT NULL REFERENCES ci_runs(id), artifact_reference TEXT,
+                test_instructions TEXT NOT NULL CHECK(length(trim(test_instructions))>0),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id,milestone_id,pull_request_id)
+                    REFERENCES pull_requests(project_id,milestone_id,id),
+                FOREIGN KEY(ci_run_id,pull_request_id,tested_head_sha)
+                    REFERENCES ci_runs(id,pull_request_id,head_sha)
+            ) STRICT""",
+            """CREATE TABLE human_test_results (
+                id TEXT PRIMARY KEY, gate_id TEXT NOT NULL UNIQUE REFERENCES human_test_bindings(gate_id),
+                response_id TEXT NOT NULL UNIQUE REFERENCES human_gate_responses(id),
+                outcome TEXT NOT NULL CHECK(outcome IN ('PASS','FAIL','BLOCKED')),
+                evidence_text TEXT, tested_head_sha TEXT NOT NULL CHECK(length(tested_head_sha)=40),
+                ci_run_id TEXT NOT NULL REFERENCES ci_runs(id), recorded_at TEXT NOT NULL
+            ) STRICT""",
+            """CREATE TRIGGER human_test_bindings_no_update BEFORE UPDATE ON human_test_bindings
+                BEGIN SELECT RAISE(ABORT,'human test bindings are immutable'); END""",
+            """CREATE TRIGGER human_test_bindings_no_delete BEFORE DELETE ON human_test_bindings
+                BEGIN SELECT RAISE(ABORT,'human test bindings are preservation-oriented'); END""",
+            """CREATE TRIGGER human_test_results_no_update BEFORE UPDATE ON human_test_results
+                BEGIN SELECT RAISE(ABORT,'human test results are immutable'); END""",
+            """CREATE TRIGGER human_test_results_no_delete BEFORE DELETE ON human_test_results
+                BEGIN SELECT RAISE(ABORT,'human test results are preservation-oriented'); END""",
+        ),
+    ),
+    Migration(
+        version=23,
+        name="023_m25_human_feedback",
+        statements=(
+            """CREATE TABLE m25_telegram_feedback_interactions (
+                id TEXT PRIMARY KEY,
+                gate_id TEXT NOT NULL REFERENCES human_gates(id),
+                outcome TEXT NOT NULL CHECK(outcome IN ('FAIL','BLOCKED')),
+                chat_id TEXT NOT NULL, user_id TEXT NOT NULL, thread_id TEXT,
+                prompt_message_id TEXT,
+                state TEXT NOT NULL CHECK(state IN ('PROMPTING','WAITING_FEEDBACK','RESOLVED','CANCELLED')),
+                created_at TEXT NOT NULL, resolved_at TEXT,
+                CHECK((state='PROMPTING' AND prompt_message_id IS NULL AND resolved_at IS NULL)
+                   OR (state='WAITING_FEEDBACK' AND prompt_message_id IS NOT NULL AND resolved_at IS NULL)
+                   OR (state IN ('RESOLVED','CANCELLED') AND prompt_message_id IS NOT NULL AND resolved_at IS NOT NULL))
+            ) STRICT""",
+            """CREATE UNIQUE INDEX one_active_m25_feedback_per_gate
+                ON m25_telegram_feedback_interactions(gate_id)
+                WHERE state IN ('PROMPTING','WAITING_FEEDBACK')""",
+            """CREATE TRIGGER m25_feedback_identity_immutable BEFORE UPDATE OF
+                id,gate_id,outcome,chat_id,user_id,thread_id,created_at
+                ON m25_telegram_feedback_interactions
+                BEGIN SELECT RAISE(ABORT,'M25 feedback identity is immutable'); END""",
+            """CREATE TRIGGER m25_feedback_no_delete BEFORE DELETE
+                ON m25_telegram_feedback_interactions
+                BEGIN SELECT RAISE(ABORT,'M25 feedback interactions are preservation-oriented'); END""",
+        ),
+    ),
 )
 
 

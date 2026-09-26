@@ -99,10 +99,12 @@ from syntra_build.domain.provisioning import (
     RepositoryProvisioningStatus,
 )
 from syntra_build.domain.reviews import (
+    ArchitectHumanGateRequest,
     ArchitectReview,
     ArchitectReviewRequest,
     ArchitectReviewVerdict,
     ArchitectReworkTask,
+    HumanDecisionKind,
     ReviewFinding,
     ReviewFindingSeverity,
 )
@@ -118,6 +120,7 @@ from syntra_build.domain.specification import (
 __all__ = [
     "ARCHITECT_INTERFACE_VERSION",
     "ArchitectDesignMode",
+    "ArchitectHumanGateRequest",
     "SPECIFICATION_DRAFT_INTERFACE_VERSION",
     "SpecificationDraftRequest",
     "SpecificationDraft",
@@ -135,6 +138,7 @@ __all__ = [
     "ArchitectReviewRequest",
     "ArchitectReviewVerdict",
     "ArchitectReworkTask",
+    "HumanDecisionKind",
     "ReviewFinding",
     "ReviewFindingSeverity",
     "ArchitectProposedDecision",

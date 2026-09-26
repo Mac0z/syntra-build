@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from syntra_build.adapters.telegram.client import TelegramClient
-from syntra_build.domain import GateId
+from syntra_build.adapters.telegram.human_intervention import human_gate_callback_data
+from syntra_build.domain import GateId, GateType
 from syntra_build.infrastructure.persistence import (
+    SQLiteHumanGateRepository,
     SQLiteTelegramGateNotificationRepository,
 )
 
@@ -26,7 +28,7 @@ class TelegramGateNotifier:
     def send(self, text: str) -> str:
         match = re.search(r"Gate: ([0-9a-f-]{36})", text)
         markup = None
-        if match and "design-package:" in text:
+        if match:
             gate = match.group(1)
             if self.notifications is not None:
                 existing = self.notifications.find(GateId.from_string(gate))
@@ -42,6 +44,8 @@ class TelegramGateNotifier:
                             "existing Telegram gate notification destination conflicts"
                         )
                     return existing.message_id
+        if match and "design-package:" in text:
+            gate = match.group(1)
             markup = {
                 "inline_keyboard": [
                     [
@@ -60,6 +64,46 @@ class TelegramGateNotifier:
                     ],
                 ]
             }
+        elif match and self.notifications is not None:
+            gate_id = GateId.from_string(match.group(1))
+            persisted = SQLiteHumanGateRepository(
+                self.notifications.connection, lambda: "unused"
+            ).get(gate_id)
+            if persisted.gate_type is GateType.HUMAN_TEST:
+                markup = {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": action.upper(),
+                                "callback_data": human_gate_callback_data(
+                                    action, gate_id
+                                ),
+                            }
+                        ]
+                        for action in ("pass", "fail", "blocked")
+                    ]
+                }
+            elif persisted.gate_type in {
+                GateType.PRODUCT_DECISION,
+                GateType.TECHNICAL_DECISION,
+            }:
+                if len(persisted.options) > 99 or any(
+                    len(option.encode("utf-8")) > 64 for option in persisted.options
+                ):
+                    raise ValueError("gate options do not safely fit Telegram controls")
+                markup = {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": option,
+                                "callback_data": human_gate_callback_data(
+                                    "option", gate_id, option_index=index
+                                ),
+                            }
+                        ]
+                        for index, option in enumerate(persisted.options)
+                    ]
+                }
         sent = self.client.send_text(
             chat_id=self.chat_id,
             text=text,

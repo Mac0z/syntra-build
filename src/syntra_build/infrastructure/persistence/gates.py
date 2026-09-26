@@ -55,8 +55,9 @@ class SQLiteHumanGateRepository:
                 """INSERT INTO human_gates
               (id,project_id,milestone_id,gate_type,state,title,prompt,expected_response_type,
                options_json,architect_recommendation,resume_project_state,resume_milestone_state,
-               created_at,notified_at,responded_at,resolved_at,created_by,correlation_id,artifact_reference)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               created_at,notified_at,responded_at,resolved_at,created_by,correlation_id,artifact_reference,
+               architect_review_id,causation_id)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     str(gate.id),
                     str(gate.project_id),
@@ -81,6 +82,8 @@ class SQLiteHumanGateRepository:
                     gate.created_by,
                     gate.correlation_id,
                     gate.artifact_reference,
+                    gate.architect_review_id,
+                    gate.causation_id,
                 ),
             )
         except sqlite3.IntegrityError as error:
@@ -123,6 +126,8 @@ class SQLiteHumanGateRepository:
             created_by=row["created_by"],
             correlation_id=row["correlation_id"],
             artifact_reference=row["artifact_reference"],
+            architect_review_id=row["architect_review_id"],
+            causation_id=row["causation_id"],
         )
 
     def apply_transition(self, request: GateTransitionRequest) -> HumanGate:

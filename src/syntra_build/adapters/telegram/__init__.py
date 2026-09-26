@@ -14,6 +14,10 @@ from syntra_build.adapters.telegram.errors import (
     TelegramTransportError,
 )
 from syntra_build.adapters.telegram.gates import TelegramGateNotifier
+from syntra_build.adapters.telegram.human_intervention import (
+    TelegramHumanInterventionHandler,
+    human_gate_callback_data,
+)
 from syntra_build.adapters.telegram.models import (
     TelegramCallbackQuery,
     TelegramInboundMessage,
@@ -32,6 +36,8 @@ __all__ = [
     "TelegramCallbackQuery",
     "TelegramPolledUpdate",
     "TelegramGateNotifier",
+    "TelegramHumanInterventionHandler",
+    "human_gate_callback_data",
     "TelegramDesignApprovalHandler",
     "design_callback_data",
     "markdown_pdf",

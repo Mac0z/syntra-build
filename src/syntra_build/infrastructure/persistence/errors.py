@@ -101,6 +101,10 @@ class DuplicateGateResponseError(PersistenceError):
     pass
 
 
+class HumanFeedbackRequiredError(PersistenceError):
+    """A negative human-test outcome lacks required actionable evidence."""
+
+
 class EventNotFoundError(PersistenceError):
     """The requested workflow event does not exist."""
 

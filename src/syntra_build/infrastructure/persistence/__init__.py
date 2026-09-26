@@ -80,6 +80,8 @@ from syntra_build.infrastructure.persistence.provisioning import (
     SQLiteProvisioningRepository,
 )
 from syntra_build.infrastructure.persistence.telegram_interactions import (
+    M25TelegramFeedbackInteraction,
+    SQLiteM25TelegramFeedbackRepository,
     SQLiteTelegramGateInteractionRepository,
     SQLiteTelegramGateNotificationRepository,
     TelegramGateInteraction,
@@ -143,9 +145,11 @@ __all__ = [
     "SQLiteHumanGateRepository",
     "SQLiteWorkflowEventRepository",
     "SQLiteTelegramGateInteractionRepository",
+    "SQLiteM25TelegramFeedbackRepository",
     "SQLiteTelegramGateNotificationRepository",
     "TelegramGateNotification",
     "TelegramGateInteraction",
+    "M25TelegramFeedbackInteraction",
     "TelegramInteractionState",
     "SQLiteProviderCursorRepository",
     "SQLiteArchitectInteractionRepository",

@@ -65,6 +65,23 @@ class ReviewArchitectProvider(Protocol):
     def telemetry(self) -> dict[str, int | str | None]: ...
 
 
+class ReviewHumanInterventions(Protocol):
+    def create_from_review(
+        self,
+        review_id: str,
+        review: ArchitectReview,
+        pull_request_id: str,
+        ci_run_id: str,
+        *,
+        causation_id: str,
+        occurred_at: datetime | None = None,
+    ) -> object: ...
+
+    def reconcile_review(
+        self, review_id: str, *, occurred_at: datetime | None = None
+    ) -> object: ...
+
+
 class ArchitectReviewError(RuntimeError):
     pass
 
@@ -83,6 +100,7 @@ class ArchitectReviewService:
         reasoning_effort: str = "high",
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         id_factory: Callable[[], str] = lambda: str(uuid4()),
+        human_interventions: ReviewHumanInterventions | None = None,
     ) -> None:
         self.connection, self.github_prs, self.review_context, self.provider = (
             connection,
@@ -97,6 +115,7 @@ class ArchitectReviewService:
             id_factory,
         )
         self.prs = SQLitePullRequestRepository(connection)
+        self.human_interventions = human_interventions
         self.milestones = SQLiteMilestoneRepository(connection, id_factory)
         self.reviews = SQLiteArchitectReviewRepository(connection)
         self.rework = ReviewReworkCoordinator(
@@ -115,6 +134,17 @@ class ArchitectReviewService:
             str(project_id), str(milestone_id), correlation_id
         )
         if completed_review is not None:
+            if completed_review.verdict in {
+                ArchitectReviewVerdict.HUMAN_TEST_REQUIRED,
+                ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED,
+            }:
+                if self.human_interventions is None:
+                    raise ArchitectReviewError(
+                        "human verdict requires the M25 intervention service"
+                    )
+                self.human_interventions.reconcile_review(
+                    completed_review.id, occurred_at=self.clock()
+                )
             return completed_review
         now = self.clock()
         request, pr_id, repository_full_name, persisted = self._build_request(
@@ -272,7 +302,30 @@ class ArchitectReviewService:
                         correlation_id,
                         completed,
                     )
-            # M25/M26 verdicts are durably represented but deliberately cause no transition.
+            elif (
+                response.verdict
+                in {
+                    ArchitectReviewVerdict.HUMAN_TEST_REQUIRED,
+                    ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED,
+                }
+                and self.human_interventions is None
+            ):
+                raise ArchitectReviewError(
+                    "human verdict requires the M25 intervention service"
+                )
+        if response.verdict in {
+            ArchitectReviewVerdict.HUMAN_TEST_REQUIRED,
+            ArchitectReviewVerdict.HUMAN_DECISION_REQUIRED,
+        }:
+            assert self.human_interventions is not None
+            self.human_interventions.create_from_review(
+                record.id,
+                response,
+                pr_id,
+                str(request.ci_result["run_id"]),
+                causation_id=request_id,
+                occurred_at=completed,
+            )
         return record
 
     def _build_request(
@@ -349,6 +402,25 @@ class ArchitectReviewService:
                 str(project_id), str(milestone_id), persisted.id
             )
         )
+        decisions = tuple(
+            {
+                "gate_id": row["gate_id"],
+                "prompt": row["prompt"],
+                "selected_option": row["selected_option"],
+                "human_feedback": row["response_text"],
+                "decision_type": row["gate_type"],
+                "originating_architect_review_id": row["architect_review_id"],
+            }
+            for row in self.connection.execute(
+                """SELECT g.id AS gate_id,g.prompt,g.gate_type,g.architect_review_id,
+                r.selected_option,r.response_text
+                FROM human_gates g JOIN human_gate_responses r ON r.gate_id=g.id
+                WHERE g.project_id=? AND g.milestone_id=? AND g.state='RESOLVED'
+                  AND g.gate_type IN ('PRODUCT_DECISION','TECHNICAL_DECISION')
+                ORDER BY g.resolved_at,g.id""",
+                (str(project_id), str(milestone_id)),
+            ).fetchall()
+        )
         definition = {
             "code": milestone.code,
             "title": milestone.title,
@@ -383,6 +455,7 @@ class ArchitectReviewService:
                 "external_workflow_run_id": ci["external_workflow_run_id"],
             },
             prior,
+            decisions,
         )
         return request, persisted.id, repo["full_name"], persisted
 
