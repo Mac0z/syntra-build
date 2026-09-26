@@ -1199,7 +1199,7 @@ def test_migration_021_to_022_preserves_gate_response_and_review(
             "INSERT INTO human_gate_responses VALUES (?,?, 'telegram-message','A','feedback','A','[]','42',?,1,'valid')",
             (ids["gate_response"], ids["gate"], stamp),
         )
-        apply_migrations(db)
+        apply_migrations(db, MIGRATIONS[:22])
         assert current_schema_version(db) == 22
         assert tuple(
             db.execute(
@@ -1226,7 +1226,162 @@ def test_migration_021_to_022_preserves_gate_response_and_review(
             == "finding-code"
         )
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_migration_022_to_023_preserves_m25_data_and_adds_feedback(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "schema-22.db"
+    with open_database(path) as db:
+        apply_migrations(db, MIGRATIONS[:22])
+        assert current_schema_version(db) == 22
+        ids = {
+            name: str(uuid4())
+            for name in (
+                "project",
+                "milestone",
+                "repo",
+                "pr",
+                "ci",
+                "request",
+                "response",
+                "review",
+                "gate",
+                "gate_response",
+                "test_result",
+            )
+        }
+        stamp = NOW.isoformat()
+        db.execute(
+            "INSERT INTO projects (id,name,state,created_at,updated_at,last_state_change_at,canonical_name,repository_visibility) VALUES (?,?,'WAITING_HUMAN',?,?,?,?, 'public')",
+            (ids["project"], "schema-22", stamp, stamp, stamp, "schema-22"),
+        )
+        db.execute(
+            "INSERT INTO milestones (id,project_id,sequence_number,code,title,state,created_at,updated_at,definition_json,automated_acceptance_json) VALUES (?,?,25,'M25','Human test','HUMAN_TEST',?,?,'{}','[]')",
+            (ids["milestone"], ids["project"], stamp, stamp),
+        )
+        db.execute(
+            "INSERT INTO github_repositories VALUES (?,?, 'github','owner','repo','owner/repo',77,'public','main','VERIFIED',?,?,?)",
+            (ids["repo"], ids["project"], stamp, stamp, stamp),
+        )
+        db.execute(
+            "INSERT INTO pull_requests (id,project_id,milestone_id,github_repository_id,external_pr_number,state,head_branch,base_branch,head_sha,web_url,title,created_at,updated_at,last_reconciled_at) VALUES (?,?,?,?,25,'OPEN','branch','main',?,?,?,?,?,?)",
+            (
+                ids["pr"],
+                ids["project"],
+                ids["milestone"],
+                ids["repo"],
+                SHA_A,
+                "https://example/pr/25",
+                "M25",
+                stamp,
+                stamp,
+                stamp,
+            ),
+        )
+        db.execute(
+            "INSERT INTO ci_runs (id,project_id,milestone_id,pull_request_id,head_sha,attempt_number,overall_status,started_at,completed_at,last_checked_at,summary_json,retry_count) VALUES (?,?,?,?,?,1,'PASSED',?,?,?,'{}',0)",
+            (
+                ids["ci"],
+                ids["project"],
+                ids["milestone"],
+                ids["pr"],
+                SHA_A,
+                stamp,
+                stamp,
+                stamp,
+            ),
+        )
+        db.execute(
+            "INSERT INTO architect_requests (id,project_id,milestone_id,request_type,provider,model,reasoning_level,request_schema_version,request_payload_json,correlation_id,started_at,completed_at,status) VALUES (?,?,?,'REVIEW','fake','model','high','1.0','{}','schema-22',?,?,'SUCCEEDED')",
+            (ids["request"], ids["project"], ids["milestone"], stamp, stamp),
+        )
+        db.execute(
+            "INSERT INTO architect_responses (id,architect_request_id,response_type,response_schema_version,normalised_payload_json,status,created_at,validation_status,provider,model) VALUES (?,?,'REVIEW','1.0','{}','ACCEPTED',?,'VALID','fake','model')",
+            (ids["response"], ids["request"], stamp),
+        )
+        db.execute(
+            "INSERT INTO architect_reviews VALUES (?,?,?,?,?,?,'HUMAN_TEST_REQUIRED','test required',?,NULL)",
+            (
+                ids["review"],
+                ids["project"],
+                ids["milestone"],
+                ids["request"],
+                ids["pr"],
+                SHA_A,
+                stamp,
+            ),
+        )
+        db.execute(
+            "INSERT INTO human_gates (id,project_id,milestone_id,gate_type,state,title,prompt,expected_response_type,options_json,resume_milestone_state,created_at,notified_at,responded_at,resolved_at,created_by,correlation_id,architect_review_id,causation_id) VALUES (?,?,?,'HUMAN_TEST','RESOLVED','Test','Exercise build','HUMAN_TEST','[\"PASS\",\"FAIL\",\"BLOCKED\"]','ARCHITECT_REVIEW',?,?,?,?, 'ARCHITECT','schema-22',?,'review-event')",
+            (
+                ids["gate"],
+                ids["project"],
+                ids["milestone"],
+                stamp,
+                stamp,
+                stamp,
+                stamp,
+                ids["review"],
+            ),
+        )
+        db.execute(
+            "INSERT INTO human_gate_responses VALUES (?,?, 'telegram-message','PASS','passed','PASS','[]','42',?,1,'valid')",
+            (ids["gate_response"], ids["gate"], stamp),
+        )
+        db.execute(
+            "INSERT INTO human_test_bindings VALUES (?,?,?,?,?,25,?,?, 'artifact://schema-22','Exercise build',?)",
+            (
+                ids["gate"],
+                ids["project"],
+                ids["milestone"],
+                ids["review"],
+                ids["pr"],
+                SHA_A,
+                ids["ci"],
+                stamp,
+            ),
+        )
+        db.execute(
+            "INSERT INTO human_test_results VALUES (?,?,?,'PASS','passed',?,?,?)",
+            (
+                ids["test_result"],
+                ids["gate"],
+                ids["gate_response"],
+                SHA_A,
+                ids["ci"],
+                stamp,
+            ),
+        )
+
+        apply_migrations(db)
+
+        assert current_schema_version(db) == 23
+        assert tuple(
+            db.execute(
+                "SELECT outcome,evidence_text,tested_head_sha,ci_run_id FROM human_test_results WHERE id=?",
+                (ids["test_result"],),
+            ).fetchone()
+        ) == ("PASS", "passed", SHA_A, ids["ci"])
+        objects = {
+            (row[0], row[1])
+            for row in db.execute(
+                "SELECT name,type FROM sqlite_master WHERE name IN ("
+                "'m25_telegram_feedback_interactions','one_active_m25_feedback_per_gate',"
+                "'m25_feedback_identity_immutable','m25_feedback_no_delete')"
+            )
+        }
+        assert objects == {
+            ("m25_telegram_feedback_interactions", "table"),
+            ("one_active_m25_feedback_per_gate", "index"),
+            ("m25_feedback_identity_immutable", "trigger"),
+            ("m25_feedback_no_delete", "trigger"),
+        }
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_clean_database_migrates_through_023(tmp_path: Path) -> None:
     with open_database(tmp_path / "clean.db") as db:
         apply_migrations(db)
-        assert current_schema_version(db) == 22
+        assert current_schema_version(db) == 23
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
