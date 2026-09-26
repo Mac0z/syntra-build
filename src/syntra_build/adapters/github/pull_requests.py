@@ -20,6 +20,12 @@ from syntra_build.application.pull_requests import (
     PullRequestFailure,
 )
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
+from syntra_build.domain.merges import (
+    MERGE_INTERFACE_VERSION,
+    MergeRequest,
+    MergeResult,
+    MergeStatus,
+)
 from syntra_build.domain.pull_requests import (
     PULL_REQUEST_INTERFACE_VERSION,
     PullRequestCreateRequest,
@@ -65,7 +71,7 @@ class GitHubPullRequestAdapter:
         try:
             response = self._transport(request, self._timeout)
         except Exception as error:
-            if method == "POST":
+            if method in {"POST", "PUT"}:
                 raise AmbiguousGitHubResult(
                     "GitHub mutation result is ambiguous"
                 ) from error
@@ -79,10 +85,10 @@ class GitHubPullRequestAdapter:
         if response.status >= 500:
             failure = (
                 PullRequestFailure.AMBIGUOUS
-                if method == "POST"
+                if method in {"POST", "PUT"}
                 else PullRequestFailure.TRANSIENT
             )
-            if method == "POST":
+            if method in {"POST", "PUT"}:
                 raise AmbiguousGitHubResult("GitHub mutation result is ambiguous")
             raise PullRequestError(failure, "GitHub is temporarily unavailable")
         try:
@@ -90,10 +96,10 @@ class GitHubPullRequestAdapter:
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             failure = (
                 PullRequestFailure.AMBIGUOUS
-                if method == "POST"
+                if method in {"POST", "PUT"}
                 else PullRequestFailure.TRANSIENT
             )
-            if method == "POST":
+            if method in {"POST", "PUT"}:
                 raise AmbiguousGitHubResult(
                     "GitHub mutation response was malformed"
                 ) from error
@@ -202,6 +208,36 @@ class GitHubPullRequestAdapter:
             )
         return self._normalize(
             payload, repository_full_name, request.project_id, request.milestone_id
+        )
+
+    def merge(self, repository_full_name: str, request: MergeRequest) -> MergeResult:
+        """Merge with GitHub's exact-head precondition; never infer the SHA."""
+        merge_method = {"SQUASH": "squash", "MERGE": "merge", "REBASE": "rebase"}[
+            request.merge_strategy.value
+        ]
+        status, payload = self._request(
+            "PUT",
+            f"{self._repo_path(repository_full_name)}/pulls/{request.pull_request_number}/merge",
+            {"sha": request.expected_head_sha, "merge_method": merge_method},
+        )
+        if status == 409:
+            outcome = MergeStatus.CONFLICT
+        elif status in {405, 422}:
+            outcome = MergeStatus.REJECTED
+        elif status != 200 or not isinstance(payload, Mapping):
+            outcome = MergeStatus.UNKNOWN
+        elif payload.get("merged") is True:
+            outcome = MergeStatus.MERGED
+        else:
+            outcome = MergeStatus.NOT_MERGED
+        sha = payload.get("sha") if isinstance(payload, Mapping) else None
+        return MergeResult(
+            MERGE_INTERFACE_VERSION,
+            request.project_id,
+            request.milestone_id,
+            request.pull_request_number,
+            outcome,
+            sha if isinstance(sha, str) and sha else None,
         )
 
     @staticmethod

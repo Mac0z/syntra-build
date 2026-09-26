@@ -1111,6 +1111,52 @@ MIGRATIONS: tuple[Migration, ...] = (
                 BEGIN SELECT RAISE(ABORT,'M25 feedback interactions are preservation-oriented'); END""",
         ),
     ),
+    Migration(
+        version=24,
+        name="024_deterministic_merge",
+        statements=(
+            """CREATE TABLE merge_eligibility_results (
+                id TEXT PRIMARY KEY, correlation_id TEXT NOT NULL,
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT NOT NULL REFERENCES milestones(id),
+                pull_request_id TEXT NOT NULL REFERENCES pull_requests(id),
+                repository_id INTEGER NOT NULL, pull_request_number INTEGER NOT NULL,
+                head_sha TEXT NOT NULL CHECK(length(head_sha)=40),
+                eligible INTEGER NOT NULL CHECK(eligible IN (0,1)),
+                guards_json TEXT NOT NULL CHECK(json_valid(guards_json)),
+                evaluated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id,milestone_id,pull_request_id)
+                    REFERENCES pull_requests(project_id,milestone_id,id)
+            ) STRICT""",
+            """CREATE TABLE merge_attempts (
+                id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                milestone_id TEXT NOT NULL, pull_request_id TEXT NOT NULL,
+                expected_head_sha TEXT NOT NULL CHECK(length(expected_head_sha)=40),
+                gatekeeper_result_id TEXT NOT NULL REFERENCES merge_eligibility_results(id),
+                gatekeeper_result_json TEXT NOT NULL CHECK(json_valid(gatekeeper_result_json)),
+                merge_strategy TEXT NOT NULL CHECK(merge_strategy IN ('SQUASH','MERGE','REBASE')),
+                status TEXT NOT NULL CHECK(status IN
+                    ('REQUESTED','MERGED','NOT_MERGED','CONFLICT','REJECTED','UNKNOWN')),
+                requested_at TEXT NOT NULL, completed_at TEXT, merge_commit_sha TEXT,
+                error_detail TEXT,
+                FOREIGN KEY(project_id,milestone_id,pull_request_id)
+                    REFERENCES pull_requests(project_id,milestone_id,id)
+            ) STRICT""",
+            """CREATE UNIQUE INDEX one_global_active_merge
+                ON merge_attempts((1)) WHERE status='REQUESTED'""",
+            "CREATE INDEX merge_attempts_milestone_requested ON merge_attempts(milestone_id,requested_at)",
+            """CREATE TRIGGER merge_attempts_identity_immutable BEFORE UPDATE OF
+                id,project_id,milestone_id,pull_request_id,expected_head_sha,
+                gatekeeper_result_id,gatekeeper_result_json,merge_strategy,requested_at
+                ON merge_attempts BEGIN SELECT RAISE(ABORT,'merge attempt identity is immutable'); END""",
+            """CREATE TRIGGER merge_attempts_no_delete BEFORE DELETE ON merge_attempts
+                BEGIN SELECT RAISE(ABORT,'merge attempts are preservation-oriented'); END""",
+            """CREATE TRIGGER merge_results_no_update BEFORE UPDATE ON merge_eligibility_results
+                BEGIN SELECT RAISE(ABORT,'Gatekeeper results are immutable'); END""",
+            """CREATE TRIGGER merge_results_no_delete BEFORE DELETE ON merge_eligibility_results
+                BEGIN SELECT RAISE(ABORT,'Gatekeeper results are preservation-oriented'); END""",
+        ),
+    ),
 )
 
 
