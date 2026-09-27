@@ -892,3 +892,103 @@ class Gatekeeper:
                 )
             )
         return True
+
+    def recover(
+        self, attempt_id: str, request: MergeRequest, *, now: datetime | None = None
+    ) -> bool:
+        """Observe an interrupted merge without ever issuing a second merge PUT."""
+        now = now or datetime.now(UTC)
+        context = self._attempt_context(attempt_id, request)
+        if context.milestone_state not in {
+            MilestoneState.MERGING,
+            MilestoneState.MERGE_VERIFY,
+        }:
+            raise MergeIdentityError("merge attempt is not recoverable")
+        if context.status not in {None, MergeStatus.UNKNOWN}:
+            raise MergeIdentityError("merge attempt has a terminal result")
+        observed = self.github.get(
+            context.repository_full_name,
+            context.pull_request_number,
+            context.project_id,
+            context.milestone_id,
+        )
+        if not self._live_matches(context, observed, require_merged=True):
+            # OPEN or ambiguous is deliberately not replayed. The recovery
+            # coordinator applies project-scoped blocking policy.
+            return False
+        with transaction(self.connection):
+            if context.milestone_state is MilestoneState.MERGING:
+                SQLiteMilestoneRepository(
+                    self.connection, self.id_factory
+                ).apply_transition(
+                    MilestoneTransitionRequest(
+                        context.milestone_id,
+                        context.project_id,
+                        MilestoneState.MERGING,
+                        MilestoneState.MERGE_VERIFY,
+                        "recovery observed exact pull request already merged",
+                        "RECOVERY",
+                        "gatekeeper",
+                        request.correlation_id,
+                        now,
+                        metadata={
+                            "merge_attempt_id": attempt_id,
+                            "reconciled_without_put": True,
+                        },
+                    )
+                )
+        # A second GET in verify is the required independent observation.
+        return self._verify_recovery(attempt_id, request, now)
+
+    def _verify_recovery(
+        self, attempt_id: str, request: MergeRequest, now: datetime
+    ) -> bool:
+        context = self._attempt_context(attempt_id, request)
+        observed = self.github.get(
+            context.repository_full_name,
+            context.pull_request_number,
+            context.project_id,
+            context.milestone_id,
+        )
+        if (
+            context.milestone_state is not MilestoneState.MERGE_VERIFY
+            or context.status not in {None, MergeStatus.UNKNOWN}
+            or not self._live_matches(context, observed, require_merged=True)
+            or not observed.merge_commit_sha
+            or not observed.merged_at
+        ):
+            return False
+        with transaction(self.connection):
+            pr = SQLitePullRequestRepository(self.connection).for_milestone(
+                context.milestone_id
+            )
+            if pr is None or pr.id != context.pull_request_id:
+                raise MergeIdentityError("persisted pull request differs from attempt")
+            SQLitePullRequestRepository(self.connection).save_verified(
+                pr.id, context.github_repository_id, observed, pr.title, now
+            )
+            self.connection.execute(
+                """UPDATE merge_attempts SET status='MERGED',completed_at=?,
+                   merge_commit_sha=? WHERE id=? AND status IN ('REQUESTED','UNKNOWN')""",
+                (now.isoformat(), observed.merge_commit_sha, attempt_id),
+            )
+            SQLiteMilestoneRepository(
+                self.connection, self.id_factory
+            ).apply_transition(
+                MilestoneTransitionRequest(
+                    context.milestone_id,
+                    context.project_id,
+                    MilestoneState.MERGE_VERIFY,
+                    MilestoneState.COMPLETE,
+                    "independent recovery observation verified merge",
+                    "RECOVERY",
+                    "gatekeeper",
+                    request.correlation_id,
+                    now,
+                    metadata={
+                        "merge_attempt_id": attempt_id,
+                        "merge_commit_sha": observed.merge_commit_sha,
+                    },
+                )
+            )
+        return True
