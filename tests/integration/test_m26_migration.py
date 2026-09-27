@@ -99,8 +99,9 @@ def test_genuine_023_upgrade_preserves_m25_data_and_builds_m26_constraints(
         db.execute(
             """INSERT INTO merge_attempts
             (id,project_id,milestone_id,pull_request_id,expected_head_sha,
+             expected_head_branch,expected_base_branch,
              gatekeeper_result_id,gatekeeper_result_json,merge_strategy,status,requested_at)
-             VALUES (?,?,?,?,?,?,?,'SQUASH','REQUESTED',?)""",
+             VALUES (?,?,?,?,?,'feature','main',?,?,'SQUASH','REQUESTED',?)""",
             (
                 attempt_id,
                 str(seed.project),
@@ -116,8 +117,9 @@ def test_genuine_023_upgrade_preserves_m25_data_and_builds_m26_constraints(
             db.execute(
                 """INSERT INTO merge_attempts
                 (id,project_id,milestone_id,pull_request_id,expected_head_sha,
+                 expected_head_branch,expected_base_branch,
                  gatekeeper_result_id,gatekeeper_result_json,merge_strategy,status,requested_at)
-                 VALUES (?,?,?,?,?,?,?,'SQUASH','REQUESTED',?)""",
+                 VALUES (?,?,?,?,?,'feature','main',?,?,'SQUASH','REQUESTED',?)""",
                 (
                     str(uuid4()),
                     str(seed.project),

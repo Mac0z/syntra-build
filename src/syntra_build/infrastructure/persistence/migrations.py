@@ -1131,6 +1131,7 @@ MIGRATIONS: tuple[Migration, ...] = (
                 id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
                 milestone_id TEXT NOT NULL, pull_request_id TEXT NOT NULL,
                 expected_head_sha TEXT NOT NULL CHECK(length(expected_head_sha)=40),
+                expected_head_branch TEXT NOT NULL, expected_base_branch TEXT NOT NULL,
                 gatekeeper_result_id TEXT NOT NULL REFERENCES merge_eligibility_results(id),
                 gatekeeper_result_json TEXT NOT NULL CHECK(json_valid(gatekeeper_result_json)),
                 merge_strategy TEXT NOT NULL CHECK(merge_strategy IN ('SQUASH','MERGE','REBASE')),
@@ -1146,6 +1147,7 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX merge_attempts_milestone_requested ON merge_attempts(milestone_id,requested_at)",
             """CREATE TRIGGER merge_attempts_identity_immutable BEFORE UPDATE OF
                 id,project_id,milestone_id,pull_request_id,expected_head_sha,
+                expected_head_branch,expected_base_branch,
                 gatekeeper_result_id,gatekeeper_result_json,merge_strategy,requested_at
                 ON merge_attempts BEGIN SELECT RAISE(ABORT,'merge attempt identity is immutable'); END""",
             """CREATE TRIGGER merge_attempts_no_delete BEFORE DELETE ON merge_attempts

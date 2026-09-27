@@ -581,8 +581,9 @@ def test_prepare_persists_before_mutation_and_global_serializes(db) -> None:
         db.execute(
             """INSERT INTO merge_attempts
             (id,project_id,milestone_id,pull_request_id,expected_head_sha,
+             expected_head_branch,expected_base_branch,
              gatekeeper_result_id,gatekeeper_result_json,merge_strategy,status,requested_at)
-             VALUES (?,?,?,?,?,?,?,?, 'REQUESTED',?)""",
+             VALUES (?,?,?,?,?,'feature','main',?,?,?, 'REQUESTED',?)""",
             (
                 uid(),
                 row["project_id"],
@@ -597,16 +598,163 @@ def test_prepare_persists_before_mutation_and_global_serializes(db) -> None:
         )
 
 
-def test_execute_derives_repository_and_freshly_rechecks_base_and_sha(db) -> None:
+@pytest.mark.parametrize(
+    "live_change",
+    [
+        {"base_branch": "release"},
+        {"head_branch": "other"},
+        {"head_sha": OTHER_SHA},
+        {"state": PullRequestState.CLOSED},
+    ],
+)
+def test_fresh_deterministic_mismatch_terminalises_and_blocks(db, live_change) -> None:
+    seed, github, keeper, attempt, request = prepared(db)
+    github.live = replace(github.live, **live_change)
+    result = keeper.execute(attempt, request, now=NOW)
+    assert result.status is MergeStatus.REJECTED
+    assert github.merge_calls == []
+    assert (
+        db.execute(
+            "SELECT status FROM merge_attempts WHERE id=?", (attempt,)
+        ).fetchone()[0]
+        == "REJECTED"
+    )
+    assert (
+        db.execute(
+            "SELECT state FROM milestones WHERE id=?", (str(seed.milestone),)
+        ).fetchone()[0]
+        == "BLOCKED"
+    )
+
+
+def test_terminal_pre_put_mismatch_releases_global_merge_slot(db) -> None:
     _, github, keeper, attempt, request = prepared(db)
     github.live = replace(github.live, base_branch="release")
-    with pytest.raises(MergeIdentityError):
+    keeper.execute(attempt, request, now=NOW)
+    row = db.execute("SELECT * FROM merge_attempts WHERE id=?", (attempt,)).fetchone()
+    db.execute(
+        """INSERT INTO merge_attempts
+        (id,project_id,milestone_id,pull_request_id,expected_head_sha,
+         expected_head_branch,expected_base_branch,gatekeeper_result_id,
+         gatekeeper_result_json,merge_strategy,status,requested_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,'REQUESTED',?)""",
+        (
+            uid(),
+            row["project_id"],
+            row["milestone_id"],
+            row["pull_request_id"],
+            row["expected_head_sha"],
+            row["expected_head_branch"],
+            row["expected_base_branch"],
+            row["gatekeeper_result_id"],
+            row["gatekeeper_result_json"],
+            row["merge_strategy"],
+            NOW.isoformat(),
+        ),
+    )
+
+
+@pytest.mark.parametrize("state", ["PAUSED", "CANCELLED", "BLOCKED"])
+def test_project_policy_change_after_prepare_prevents_put(db, state: str) -> None:
+    seed, github, keeper, attempt, request = prepared(db)
+    db.execute("UPDATE projects SET state=? WHERE id=?", (state, str(seed.project)))
+    result = keeper.execute(attempt, request, now=NOW)
+    assert result.status is MergeStatus.REJECTED
+    assert github.merge_calls == []
+    assert (
+        db.execute(
+            "SELECT status FROM merge_attempts WHERE id=?", (attempt,)
+        ).fetchone()[0]
+        == "REJECTED"
+    )
+
+
+def test_security_block_activated_after_prepare_prevents_put(db) -> None:
+    seed, github = seed_eligible(db)
+    blocked = False
+    keeper = Gatekeeper(db, github, security_blocked=lambda _p, _m: blocked)
+    attempt, request = keeper.prepare(seed.request, now=NOW)
+    blocked = True
+    assert keeper.execute(attempt, request, now=NOW).status is MergeStatus.REJECTED
+    assert github.merge_calls == []
+
+
+def test_new_unresolved_gate_after_prepare_prevents_put(db) -> None:
+    seed, github, keeper, attempt, request = prepared(db)
+    add_decision_gate(db, seed, "PRODUCT_DECISION", "PENDING")
+    assert keeper.execute(attempt, request, now=NOW).status is MergeStatus.REJECTED
+    assert github.merge_calls == []
+
+
+def test_new_blocking_finding_after_prepare_prevents_put(db) -> None:
+    seed, github, keeper, attempt, request = prepared(db)
+    db.execute(
+        """INSERT INTO architect_review_findings VALUES
+        (?,?,'late-block','major','M26','late','fix','OPEN',NULL,?)""",
+        (uid(), seed.review, NOW.isoformat()),
+    )
+    assert keeper.execute(attempt, request, now=NOW).status is MergeStatus.REJECTED
+    assert github.merge_calls == []
+
+
+@pytest.mark.parametrize(
+    ("column", "value"), [("state", "CLOSED"), ("head_sha", OTHER_SHA)]
+)
+def test_persisted_pr_freshness_change_after_prepare_prevents_put(
+    db, column: str, value: str
+) -> None:
+    seed, github, keeper, attempt, request = prepared(db)
+    prior_gets = len(github.get_calls)
+    db.execute(f"UPDATE pull_requests SET {column}=? WHERE id=?", (value, seed.pr))
+    assert keeper.execute(attempt, request, now=NOW).status is MergeStatus.REJECTED
+    assert len(github.get_calls) == prior_gets
+    assert github.merge_calls == []
+
+
+def test_transient_pre_put_get_failure_remains_retryable(db) -> None:
+    seed, github, keeper, attempt, request = prepared(db)
+    github.get_queue = [TimeoutError("temporary")]
+    with pytest.raises(TimeoutError):
         keeper.execute(attempt, request, now=NOW)
     assert github.merge_calls == []
-    github.live = replace(github.live, base_branch="main", head_sha=OTHER_SHA)
-    with pytest.raises(MergeIdentityError):
-        keeper.execute(attempt, request, now=NOW)
+    assert (
+        db.execute(
+            "SELECT status FROM merge_attempts WHERE id=?", (attempt,)
+        ).fetchone()[0]
+        == "REQUESTED"
+    )
+    assert (
+        db.execute(
+            "SELECT state FROM milestones WHERE id=?", (str(seed.milestone),)
+        ).fetchone()[0]
+        == "MERGING"
+    )
+
+
+def test_already_merged_pre_put_is_reconciled_without_put_then_verified(db) -> None:
+    seed, github, keeper, attempt, request = prepared(db)
+    github.live = replace(
+        github.live,
+        state=PullRequestState.MERGED,
+        merged_at=NOW.isoformat(),
+        merge_commit_sha=MERGE_SHA,
+    )
+    result = keeper.execute(attempt, request, now=NOW)
+    assert result.status is MergeStatus.MERGED
     assert github.merge_calls == []
+    assert (
+        db.execute(
+            "SELECT state FROM milestones WHERE id=?", (str(seed.milestone),)
+        ).fetchone()[0]
+        == "MERGE_VERIFY"
+    )
+    assert keeper.verify(attempt, request, now=NOW)
+    assert (
+        db.execute(
+            "SELECT state FROM milestones WHERE id=?", (str(seed.milestone),)
+        ).fetchone()[0]
+        == "COMPLETE"
+    )
 
 
 def test_unrelated_repository_argument_cannot_select_mutation_target(db) -> None:

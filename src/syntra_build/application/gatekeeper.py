@@ -80,6 +80,11 @@ class _AttemptContext:
     merge_strategy: MergeStrategy
     status: MergeStatus | None
     milestone_state: MilestoneState
+    project_state: str
+    persisted_pr_state: PullRequestState
+    persisted_head_sha: str
+    persisted_head_branch: str
+    persisted_base_branch: str
 
 
 class Gatekeeper:
@@ -408,14 +413,17 @@ class Gatekeeper:
                 self.connection.execute(
                     """INSERT INTO merge_attempts
                     (id,project_id,milestone_id,pull_request_id,expected_head_sha,
+                     expected_head_branch,expected_base_branch,
                      gatekeeper_result_id,gatekeeper_result_json,merge_strategy,status,requested_at)
-                    VALUES (?,?,?,?,?,?,?,?, 'REQUESTED',?)""",
+                    VALUES (?,?,?,?,?,?,?,?,?,?, 'REQUESTED',?)""",
                     (
                         attempt_id,
                         str(request.project_id),
                         str(request.milestone_id),
                         request.pull_request_id,
                         request.expected_head_sha,
+                        request.expected_head_branch,
+                        request.expected_base_branch,
                         result.result_id,
                         result_json,
                         strategy.value,
@@ -475,10 +483,13 @@ class Gatekeeper:
         self, attempt_id: str, request: MergeRequest
     ) -> _AttemptContext:
         row = self.connection.execute(
-            """SELECT a.*,m.state AS milestone_state,
-            p.github_repository_id,p.external_pr_number,p.head_branch,p.base_branch,
+            """SELECT a.*,m.state AS milestone_state,project.state AS project_state,
+            p.github_repository_id,p.external_pr_number,p.state AS persisted_pr_state,
+            p.head_sha AS persisted_head_sha,p.head_branch AS persisted_head_branch,
+            p.base_branch AS persisted_base_branch,
             r.external_repository_id,r.full_name,r.status AS repository_status
             FROM merge_attempts a JOIN milestones m ON m.id=a.milestone_id
+            JOIN projects project ON project.id=a.project_id
             JOIN pull_requests p ON p.id=a.pull_request_id
             JOIN github_repositories r ON r.id=p.github_repository_id WHERE a.id=?""",
             (attempt_id,),
@@ -509,13 +520,18 @@ class Gatekeeper:
             row["external_repository_id"],
             row["full_name"],
             row["external_pr_number"],
-            row["head_branch"],
-            row["base_branch"],
+            row["expected_head_branch"],
+            row["expected_base_branch"],
             row["expected_head_sha"],
             row["gatekeeper_result_id"],
             MergeStrategy(row["merge_strategy"]),
             None if row["status"] == "REQUESTED" else MergeStatus(row["status"]),
             MilestoneState(row["milestone_state"]),
+            row["project_state"],
+            PullRequestState(row["persisted_pr_state"]),
+            row["persisted_head_sha"],
+            row["persisted_head_branch"],
+            row["persisted_base_branch"],
         )
 
     @staticmethod
@@ -534,6 +550,154 @@ class Gatekeeper:
             and live.head_sha == context.expected_head_sha
         )
 
+    def _execution_policy_failure(self, context: _AttemptContext) -> str | None:
+        """Revalidate mutable persisted merge authority after prepare committed."""
+        if context.project_state != "BUILDING":
+            return f"project state {context.project_state} does not permit merge"
+        if context.persisted_pr_state is not PullRequestState.OPEN:
+            return "persisted pull request is no longer open"
+        if context.persisted_head_sha != context.expected_head_sha:
+            return "persisted pull request head changed after merge preparation"
+        if (
+            context.persisted_head_branch != context.head_branch
+            or context.persisted_base_branch != context.base_branch
+        ):
+            return "persisted pull request branches changed after merge preparation"
+        if self.security_blocked(context.project_id, context.milestone_id):
+            return "security policy blocks merge"
+        ci = self.connection.execute(
+            """SELECT 1 FROM ci_runs WHERE pull_request_id=? AND head_sha=?
+            AND overall_status='PASSED' LIMIT 1""",
+            (context.pull_request_id, context.expected_head_sha),
+        ).fetchone()
+        if ci is None:
+            return "current required CI evidence is unavailable"
+        if not ArchitectApprovalFreshness(self.connection).is_current(
+            context.project_id,
+            context.milestone_id,
+            context.pull_request_id,
+            context.expected_head_sha,
+        ):
+            return "current Architect approval is unavailable"
+        finding = self.connection.execute(
+            """SELECT 1 FROM architect_review_findings f
+            JOIN architect_reviews r ON r.id=f.review_id
+            WHERE r.project_id=? AND r.milestone_id=? AND r.pull_request_id=?
+            AND f.status='OPEN' LIMIT 1""",
+            (
+                str(context.project_id),
+                str(context.milestone_id),
+                context.pull_request_id,
+            ),
+        ).fetchone()
+        if finding is not None:
+            return "a blocking Architect finding is open"
+        gates = self.connection.execute(
+            """SELECT g.id,g.gate_type,g.state,
+            EXISTS(SELECT 1 FROM human_gate_responses response
+              WHERE response.gate_id=g.id AND response.validated=1) AS has_response
+            FROM human_gates g WHERE g.project_id=? AND g.milestone_id=?""",
+            (str(context.project_id), str(context.milestone_id)),
+        ).fetchall()
+        if any(
+            gate["state"] != "RESOLVED" or not bool(gate["has_response"])
+            for gate in gates
+        ):
+            return "a human gate lacks explicit valid resolution"
+        if any(gate["gate_type"] == "HUMAN_TEST" for gate in gates) and not (
+            HumanTestFreshness(self.connection).is_current(
+                context.project_id,
+                context.milestone_id,
+                context.pull_request_id,
+                context.expected_head_sha,
+            )
+        ):
+            return "current human test PASS evidence is unavailable"
+        return None
+
+    def _terminalize_before_put(
+        self,
+        context: _AttemptContext,
+        request: MergeRequest,
+        now: datetime,
+        reason: str,
+    ) -> MergeResult:
+        """Reject deterministically, release the global slot, and block the milestone."""
+        with transaction(self.connection):
+            self.connection.execute(
+                """UPDATE merge_attempts SET status='REJECTED',completed_at=?,
+                error_detail=? WHERE id=? AND status='REQUESTED'""",
+                (now.isoformat(), reason, context.attempt_id),
+            )
+            SQLiteMilestoneRepository(
+                self.connection, self.id_factory
+            ).apply_transition(
+                MilestoneTransitionRequest(
+                    context.milestone_id,
+                    context.project_id,
+                    MilestoneState.MERGING,
+                    MilestoneState.BLOCKED,
+                    reason,
+                    "SYSTEM",
+                    "gatekeeper",
+                    request.correlation_id,
+                    now,
+                    metadata={
+                        "merge_attempt_id": context.attempt_id,
+                        "merge_status": MergeStatus.REJECTED.value,
+                        "phase": "PRE_PUT_REVALIDATION",
+                    },
+                )
+            )
+        return MergeResult(
+            MERGE_INTERFACE_VERSION,
+            context.project_id,
+            context.milestone_id,
+            context.pull_request_number,
+            MergeStatus.REJECTED,
+            detail=reason,
+        )
+
+    def _advance_observed_merge(
+        self,
+        context: _AttemptContext,
+        request: MergeRequest,
+        now: datetime,
+        observed: PullRequestDescriptor,
+    ) -> MergeResult:
+        """Adopt an exact already-merged observation without replaying the PUT."""
+        with transaction(self.connection):
+            SQLiteMilestoneRepository(
+                self.connection, self.id_factory
+            ).apply_transition(
+                MilestoneTransitionRequest(
+                    context.milestone_id,
+                    context.project_id,
+                    MilestoneState.MERGING,
+                    MilestoneState.MERGE_VERIFY,
+                    "fresh GitHub observation found the exact PR already merged",
+                    "SYSTEM",
+                    "gatekeeper",
+                    request.correlation_id,
+                    now,
+                    metadata={
+                        "merge_attempt_id": context.attempt_id,
+                        "reconciled_without_put": True,
+                    },
+                )
+            )
+        return MergeResult(
+            MERGE_INTERFACE_VERSION,
+            context.project_id,
+            context.milestone_id,
+            context.pull_request_number,
+            MergeStatus.MERGED,
+            observed.merge_commit_sha,
+            datetime.fromisoformat(observed.merged_at.replace("Z", "+00:00"))
+            if observed.merged_at
+            else None,
+        )
+
     def execute(
         self, attempt_id: str, request: MergeRequest, *, now: datetime | None = None
     ) -> MergeResult:
@@ -545,14 +709,26 @@ class Gatekeeper:
             or context.milestone_state is not MilestoneState.MERGING
         ):
             raise MergeIdentityError("merge attempt is not executable")
+        policy_failure = self._execution_policy_failure(context)
+        if policy_failure is not None:
+            return self._terminalize_before_put(context, request, now, policy_failure)
+        # A failed observation is intentionally propagated with REQUESTED/MERGING
+        # unchanged so the bounded scheduler/recovery path may safely retry the GET.
         live = self.github.get(
             context.repository_full_name,
             context.pull_request_number,
             context.project_id,
             context.milestone_id,
         )
+        if self._live_matches(context, live, require_merged=True):
+            return self._advance_observed_merge(context, request, now, live)
         if not self._live_matches(context, live, require_merged=False):
-            raise MergeIdentityError("fresh pull request identity differs before merge")
+            return self._terminalize_before_put(
+                context,
+                request,
+                now,
+                "fresh pull request identity or state differs before merge",
+            )
         try:
             result = self.github.merge(context.repository_full_name, request)
         except AmbiguousGitHubResult:
