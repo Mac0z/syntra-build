@@ -9,14 +9,28 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 from uuid import uuid4
 
+from syntra_build.application.ci_handoff import PullRequestCIHandoff
+from syntra_build.application.ci_monitor import CIMonitor
+from syntra_build.application.gatekeeper import Gatekeeper
+from syntra_build.application.human_intervention import HumanInterventionService
+from syntra_build.application.review_rework import ReviewReworkCoordinator
 from syntra_build.application.scheduler.core import Scheduler
+from syntra_build.application.workspaces import WorkspaceService
+from syntra_build.domain.ci import CIOverallStatus
 from syntra_build.domain.identifiers import JobId
 from syntra_build.domain.job_state_machine import JobTransitionRequest
 from syntra_build.domain.jobs import Job, JobState, WorkerClass
+from syntra_build.domain.merges import (
+    MERGE_INTERFACE_VERSION,
+    MergeRequest,
+    MergeStatus,
+    MergeStrategy,
+)
 from syntra_build.domain.milestone_state_machine import MilestoneTransitionRequest
 from syntra_build.domain.milestones import MilestoneState
 from syntra_build.domain.project_state_machine import ProjectTransitionRequest
@@ -42,6 +56,17 @@ class RecoveryHandler(Protocol):
     ) -> RecoveryDecision: ...
 
 
+@dataclass(frozen=True, slots=True)
+class RecoveryServices:
+    """Trusted M22–M26 services used by concrete recovery paths."""
+
+    pull_requests: PullRequestCIHandoff | None = None
+    ci: CIMonitor | None = None
+    gatekeeper: Gatekeeper | None = None
+    workspace: WorkspaceService | None = None
+    human: HumanInterventionService | None = None
+
+
 _UNSAFE_STATES = frozenset(
     {"COMMITTING", "PUSHING", "PR_CREATING", "MERGING", "MERGE_VERIFY"}
 )
@@ -58,12 +83,14 @@ class RecoveryCoordinator:
         scheduler: Scheduler,
         *,
         handlers: Mapping[str, RecoveryHandler] | None = None,
+        services: RecoveryServices | None = None,
         workspace_clean: Callable[[RecoverySubject], bool] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         id_factory: Callable[[], str] = lambda: str(uuid4()),
     ) -> None:
         self.connection, self.scheduler = connection, scheduler
         self.handlers = dict(handlers or {})
+        self.services = services or RecoveryServices()
         self.workspace_clean = workspace_clean
         self.clock, self.id_factory = clock, id_factory
         self.repository = SQLiteRecoveryRepository(connection, id_factory)
@@ -107,13 +134,22 @@ class RecoveryCoordinator:
         state = subject.milestone_state or subject.project_state
         handler = self.handlers.get(state)
         try:
-            if handler is not None:
-                return handler(subject, correlation_id)
             if subject.job_id is not None and subject.job_state in {
                 "DISPATCHED",
                 "RUNNING",
             }:
                 return self._lost_local_job(subject, correlation_id)
+            if subject.job_id is not None:
+                return RecoveryDecision(
+                    subject.job_state or "JOB",
+                    RecoveryDisposition.RESTORED_WAIT,
+                    "durable non-local wait retained",
+                )
+            concrete = self._concrete(subject, correlation_id)
+            if concrete is not None:
+                return concrete
+            if handler is not None:
+                return handler(subject, correlation_id)
             if state in _HUMAN_STATES:
                 return self._restore_human(subject)
             if (
@@ -134,6 +170,228 @@ class RecoveryCoordinator:
             )
         except Exception as error:
             return self._block(subject, correlation_id, str(error))
+
+    def _concrete(
+        self, subject: RecoverySubject, correlation_id: str
+    ) -> RecoveryDecision | None:
+        state = subject.milestone_state
+        if subject.milestone_id is None or state is None:
+            return None
+        if state == "PR_CREATING" and self.services.pull_requests is not None:
+            row = self.connection.execute(
+                """SELECT cs.id FROM change_sets cs JOIN commits c
+                   ON c.change_set_id=cs.id
+                   WHERE cs.project_id=? AND cs.milestone_id=? AND cs.decision='ACCEPT'
+                   ORDER BY cs.created_at DESC,cs.id LIMIT 1""",
+                (str(subject.project_id), str(subject.milestone_id)),
+            ).fetchone()
+            if row is None:
+                raise ValueError("PR recovery lacks accepted change-set/commit intent")
+            record = self.services.pull_requests.establish(
+                subject.project_id,
+                subject.milestone_id,
+                row["id"],
+                correlation_id,
+                now=self.clock(),
+            )
+            return RecoveryDecision(
+                "PR_CREATING",
+                RecoveryDisposition.RECONCILED,
+                "trusted PR adopted and CI handoff restored",
+                {"pull_request_id": record.id, "head_sha": record.head_sha},
+            )
+        if state == "CI_RUNNING" and self.services.ci is not None:
+            pr = self.connection.execute(
+                "SELECT head_sha FROM pull_requests WHERE milestone_id=?",
+                (str(subject.milestone_id),),
+            ).fetchone()
+            if pr is None:
+                raise ValueError("CI recovery lacks trusted pull request")
+            run = self.services.ci.reconcile(
+                subject.project_id,
+                subject.milestone_id,
+                correlation_id,
+                expected_head_sha=pr["head_sha"],
+            )
+            disposition = (
+                RecoveryDisposition.RECONCILED
+                if run.overall_status
+                in {CIOverallStatus.PASSED, CIOverallStatus.FAILED}
+                else RecoveryDisposition.RESTORED_WAIT
+            )
+            return RecoveryDecision(
+                "CI_RUNNING",
+                disposition,
+                "existing exact-head CI reconciled",
+                {
+                    "ci_run_id": run.id,
+                    "head_sha": run.head_sha,
+                    "status": run.overall_status.value,
+                },
+            )
+        if state in {"COMMITTING", "PUSHING"} and self.services.workspace is not None:
+            commit = self.connection.execute(
+                """SELECT c.commit_sha,c.pushed_at,c.change_set_id
+                   FROM commits c JOIN change_sets cs ON cs.id=c.change_set_id
+                   WHERE c.project_id=? AND c.milestone_id=? AND cs.decision='ACCEPT'
+                   ORDER BY c.created_at DESC,c.id LIMIT 1""",
+                (str(subject.project_id), str(subject.milestone_id)),
+            ).fetchone()
+            if commit is None:
+                raise ValueError("Git recovery cannot identify one accepted commit")
+            inspection = self.services.workspace.inspect(
+                subject.project_id, subject.milestone_id, self.clock()
+            )
+            if inspection.head_sha != commit["commit_sha"] or not inspection.clean:
+                raise ValueError("workspace does not match the exact accepted commit")
+            if state == "COMMITTING":
+                self._advance_milestone(
+                    subject,
+                    MilestoneState.PUSHING,
+                    correlation_id,
+                    "recovery adopted exact existing trusted commit",
+                )
+                return RecoveryDecision(
+                    state,
+                    RecoveryDisposition.RECONCILED,
+                    "existing trusted commit adopted without committing",
+                    {"commit_sha": commit["commit_sha"]},
+                )
+            pushed = self.services.workspace.push(
+                subject.project_id,
+                subject.milestone_id,
+                commit["commit_sha"],
+                self.clock(),
+            )
+            self._advance_milestone(
+                subject,
+                MilestoneState.PR_CREATING,
+                correlation_id,
+                "recovery verified exact remote branch commit",
+            )
+            return RecoveryDecision(
+                state,
+                RecoveryDisposition.RECONCILED,
+                "remote branch reconciled without force push",
+                {"commit_sha": pushed.commit_sha, "remote_sha": pushed.remote_sha},
+            )
+        if state in {"MERGING", "MERGE_VERIFY"} and self.services.gatekeeper:
+            return self._recover_merge(subject, correlation_id)
+        if state in _HUMAN_STATES and self.services.human is not None:
+            gate = self.services.human.recover_gate(
+                subject.project_id, subject.milestone_id, occurred_at=self.clock()
+            )
+            return RecoveryDecision(
+                "HUMAN_GATE",
+                RecoveryDisposition.RESTORED_WAIT,
+                "durable human gate restored",
+                {"gate_id": str(gate.id), "gate_state": gate.state.value},
+            )
+        if state in {"ARCHITECT_REVIEW", "REVIEW_REWORK"}:
+            review = self.connection.execute(
+                """SELECT r.* FROM architect_reviews r
+                   WHERE r.project_id=? AND r.milestone_id=?
+                   ORDER BY r.created_at DESC,r.id LIMIT 1""",
+                (str(subject.project_id), str(subject.milestone_id)),
+            ).fetchone()
+            if review is None:
+                return None
+            if (
+                review["verdict"] in {"HUMAN_TEST_REQUIRED", "HUMAN_DECISION_REQUIRED"}
+                and self.services.human is not None
+            ):
+                gate = self.services.human.reconcile_review(
+                    review["id"], occurred_at=self.clock()
+                )
+                return RecoveryDecision(
+                    "ARCHITECT_HANDOFF",
+                    RecoveryDisposition.RECONCILED,
+                    "persisted review handoff reconciled without Architect call",
+                    {"review_id": review["id"], "gate_id": str(gate.id)},
+                )
+            if review["verdict"] == "CHANGES_REQUIRED":
+                task = self.connection.execute(
+                    "SELECT * FROM architect_rework_tasks WHERE review_id=?",
+                    (review["id"],),
+                ).fetchone()
+                if task is None:
+                    raise ValueError("review rework task was not durably created")
+                job = ReviewReworkCoordinator(
+                    self.connection, clock=self.clock, id_factory=self.id_factory
+                ).enqueue(
+                    subject.project_id,
+                    subject.milestone_id,
+                    review["id"],
+                    task["id"],
+                    review["pull_request_id"],
+                    correlation_id,
+                    self.clock(),
+                )
+                return RecoveryDecision(
+                    "ARCHITECT_HANDOFF",
+                    RecoveryDisposition.RECONCILED,
+                    "persisted rework handoff restored without Architect call",
+                    {"review_id": review["id"], "job_id": str(job.id)},
+                )
+        return None
+
+    def _advance_milestone(
+        self,
+        subject: RecoverySubject,
+        target: MilestoneState,
+        correlation_id: str,
+        reason: str,
+    ) -> None:
+        assert subject.milestone_id is not None and subject.milestone_state is not None
+        with transaction(self.connection):
+            self.milestones.apply_transition(
+                MilestoneTransitionRequest(
+                    subject.milestone_id,
+                    subject.project_id,
+                    MilestoneState(subject.milestone_state),
+                    target,
+                    reason,
+                    "RECOVERY",
+                    "startup-recovery",
+                    correlation_id,
+                    self.clock(),
+                )
+            )
+
+    def _recover_merge(
+        self, subject: RecoverySubject, correlation_id: str
+    ) -> RecoveryDecision:
+        assert subject.milestone_id is not None and self.services.gatekeeper is not None
+        row = self.connection.execute(
+            """SELECT a.*,r.external_repository_id,p.external_pr_number
+               FROM merge_attempts a JOIN pull_requests p ON p.id=a.pull_request_id
+               JOIN github_repositories r ON r.id=p.github_repository_id
+               WHERE a.project_id=? AND a.milestone_id=?
+               ORDER BY a.requested_at DESC,a.id LIMIT 1""",
+            (str(subject.project_id), str(subject.milestone_id)),
+        ).fetchone()
+        if row is None:
+            raise ValueError("merge recovery lacks durable merge attempt")
+        request = MergeRequest(
+            MERGE_INTERFACE_VERSION,
+            correlation_id,
+            subject.project_id,
+            subject.milestone_id,
+            row["external_repository_id"],
+            row["external_pr_number"],
+            row["expected_head_sha"],
+            MergeStrategy(row["merge_strategy"]),
+            row["gatekeeper_result_id"],
+        )
+        outcome = self.services.gatekeeper.recover(row["id"], request, now=self.clock())
+        if outcome:
+            return RecoveryDecision(
+                subject.milestone_state or "MERGE",
+                RecoveryDisposition.RECONCILED,
+                "existing merge observed and independently verified",
+                {"merge_attempt_id": row["id"], "status": MergeStatus.MERGED.value},
+            )
+        return self._block(subject, correlation_id, "merge outcome remains uncertain")
 
     def _restore_human(self, subject: RecoverySubject) -> RecoveryDecision:
         gate = self.connection.execute(
@@ -195,6 +453,24 @@ class RecoveryCoordinator:
                 )
             )
             replacement = self._replacement(job, correlation_id) if clean else None
+        if not clean:
+            blocked = self._block(
+                subject,
+                correlation_id,
+                "lost local process has a dirty, missing, or ambiguous workspace",
+            )
+            return RecoveryDecision(
+                job.job_type,
+                RecoveryDisposition.BLOCKED,
+                blocked.action,
+                {
+                    "abandoned_job_id": str(abandoned.id),
+                    "attempt_number": abandoned.attempt_number,
+                    "workspace_clean": False,
+                    "worktree_preserved": True,
+                },
+                blocked.reason,
+            )
         return RecoveryDecision(
             job.job_type,
             RecoveryDisposition.ABANDONED,
@@ -205,9 +481,7 @@ class RecoveryCoordinator:
                 "workspace_clean": clean,
                 "replacement_job_id": str(replacement.id) if replacement else None,
             },
-            None
-            if clean
-            else "workspace is dirty, missing, or could not be proven clean",
+            None,
         )
 
     def _replacement(self, prior: Job, correlation_id: str) -> Job:

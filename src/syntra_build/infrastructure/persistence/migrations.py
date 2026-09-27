@@ -1164,7 +1164,7 @@ MIGRATIONS: tuple[Migration, ...] = (
         statements=(
             """CREATE TABLE recovery_runs (
                 id TEXT PRIMARY KEY,
-                correlation_id TEXT NOT NULL UNIQUE,
+                correlation_id TEXT NOT NULL,
                 status TEXT NOT NULL CHECK(status IN ('RECOVERING','READY','FAILED')),
                 started_at TEXT NOT NULL, completed_at TEXT, error_detail TEXT,
                 CHECK((status='RECOVERING' AND completed_at IS NULL)

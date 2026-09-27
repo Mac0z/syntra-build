@@ -233,6 +233,84 @@ class HumanInterventionService:
             occurred_at=occurred_at,
         )
 
+    def recover_gate(
+        self,
+        project_id: ProjectId,
+        milestone_id: MilestoneId,
+        *,
+        occurred_at: datetime | None = None,
+    ) -> HumanGate:
+        """Restore one exact M25 gate or finish its persisted resolved handoff."""
+        now = occurred_at or self.clock()
+        rows = self.connection.execute(
+            """SELECT id FROM human_gates WHERE project_id=? AND milestone_id=?
+               ORDER BY created_at DESC,id""",
+            (str(project_id), str(milestone_id)),
+        ).fetchall()
+        if len(rows) != 1:
+            raise HumanInterventionError("human recovery requires exactly one gate")
+        gate = self.gate_repository.get(GateId.from_string(rows[0]["id"]))
+        if gate.state is GateState.PENDING:
+            return self._ensure_notified(gate, now)
+        if gate.state is not GateState.RESOLVED:
+            return gate
+        milestone = self.milestones.get(milestone_id, project_id)
+        if milestone.state not in {
+            MilestoneState.HUMAN_TEST,
+            MilestoneState.HUMAN_DECISION,
+        }:
+            return gate
+        response = self.connection.execute(
+            """SELECT response_code,id FROM human_gate_responses
+               WHERE gate_id=? AND validated=1 ORDER BY responded_at DESC,id LIMIT 1""",
+            (str(gate.id),),
+        ).fetchone()
+        if response is None:
+            raise HumanInterventionError("resolved gate lacks validated response")
+        code = response["response_code"]
+        if gate.gate_type is GateType.HUMAN_TEST:
+            target = {
+                HumanTestResponse.PASS: MilestoneState.ARCHITECT_REVIEW,
+                HumanTestResponse.FAIL: MilestoneState.REVIEW_REWORK,
+                HumanTestResponse.BLOCKED: MilestoneState.BLOCKED,
+            }.get(code)
+        else:
+            target = gate.resume_milestone_state
+        if target is None:
+            raise HumanInterventionError("resolved gate has no deterministic handoff")
+        with transaction(self.connection):
+            self.milestones.apply_transition(
+                MilestoneTransitionRequest(
+                    milestone_id,
+                    project_id,
+                    milestone.state,
+                    target,
+                    f"recovered resolved human gate as {code}",
+                    "RECOVERY",
+                    "human-intervention",
+                    gate.correlation_id,
+                    now,
+                    metadata={"gate_id": str(gate.id), "response_id": response["id"]},
+                )
+            )
+            project = self.projects.get(project_id)
+            if project.state is ProjectState.WAITING_HUMAN:
+                self.projects.apply_transition(
+                    ProjectTransitionRequest(
+                        project_id,
+                        ProjectState.WAITING_HUMAN,
+                        ProjectState.BLOCKED
+                        if target is MilestoneState.BLOCKED
+                        else ProjectState.BUILDING,
+                        "recovered resolved human gate handoff",
+                        "RECOVERY",
+                        "human-intervention",
+                        gate.correlation_id,
+                        now,
+                    )
+                )
+        return gate
+
     def _ensure_notified(self, gate: HumanGate, occurred_at: datetime) -> HumanGate:
         if gate.state is not GateState.PENDING or self.notifier is None:
             return gate

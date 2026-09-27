@@ -12,14 +12,15 @@ project is converted to a project-scoped blocked disposition while discovery con
 
 ## Reconciliation policy
 
-State handlers are explicit observation-first seams for PR, CI, Git, merge, and review
-services. They receive project-scoped durable identity and cannot obtain another
-project's subject from discovery. PR and merge recovery have no default mutation path:
-without a conclusive handler they block, so restart can never itself repeat `create` or
-merge `PUT`. CI and Architect work retain their existing external wait until their
-observer reconciles exact-head evidence. Commit/push handlers must compare persisted
-commit intent, local HEAD, and remote ref; force-push and uncertain second commits are
-not recovery actions.
+`RecoveryServices` wires the coordinator to the existing M22 PR/CI handoff, M23
+`CIMonitor`, M19 `WorkspaceService`, M25 human intervention, and M26 `Gatekeeper`.
+PR recovery reloads accepted ChangeSet/commit/intent identity and runs M22's
+find-before-create lifecycle. CI recovery invokes the exact-head monitor. Merge recovery
+has a dedicated GET-only Gatekeeper path: it performs two independent observations and
+never exposes merge `PUT`. Without a configured conclusive service, mutation-bearing
+states block, so restart cannot itself repeat `create` or merge. Commit recovery adopts
+only an exact clean trusted commit. Push recovery uses the existing compare-before-push
+implementation and never force-pushes.
 
 Human states restore the existing durable gate and preserve notification, response,
 human-test SHA/CI binding, and feedback-interaction state. Recovery does not create or

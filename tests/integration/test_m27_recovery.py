@@ -5,6 +5,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 from syntra_build.application.recovery import RecoveryCoordinator
 from syntra_build.application.scheduler import Scheduler, WorkerCapacity
 from syntra_build.domain import (
@@ -66,9 +68,49 @@ def test_024_to_025_preserves_active_work_and_adds_append_only_audit(
     SQLiteProjectRepository(db, lambda: "h").add(
         Project(project, "active", ProjectState.BUILDING, NOW, NOW)
     )
+    before = tuple(db.execute("SELECT * FROM projects").fetchone())
+    assert (
+        db.execute(
+            "SELECT name FROM sqlite_master WHERE name='recovery_runs'"
+        ).fetchone()
+        is None
+    )
     apply_migrations(db)
     assert current_schema_version(db) == 25
     assert db.execute("SELECT state FROM projects").fetchone()[0] == "BUILDING"
+    assert tuple(db.execute("SELECT * FROM projects").fetchone()) == before
+    names = {
+        row[0]
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','index','trigger')"
+        )
+    }
+    assert {
+        "recovery_runs",
+        "recovery_observations",
+        "recovery_observations_run",
+        "recovery_observations_project",
+        "recovery_observations_no_update",
+        "recovery_observations_no_delete",
+        "recovery_runs_no_delete",
+    } <= names
+    run, observation = str(uuid4()), str(uuid4())
+    db.execute(
+        "INSERT INTO recovery_runs VALUES (?,?,'RECOVERING',?,NULL,NULL)",
+        (run, "migration", NOW.isoformat()),
+    )
+    db.execute(
+        """INSERT INTO recovery_observations VALUES
+           (?,?,?,NULL,NULL,'PROJECT','BUILDING','{}','NO_ACTION',
+            'preserved','migration',NULL,?)""",
+        (observation, run, str(project), NOW.isoformat()),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        db.execute("UPDATE recovery_observations SET resulting_action='x'")
+    with pytest.raises(sqlite3.IntegrityError, match="preservation-oriented"):
+        db.execute("DELETE FROM recovery_observations")
+    with pytest.raises(sqlite3.IntegrityError, match="preservation-oriented"):
+        db.execute("DELETE FROM recovery_runs")
     assert db.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
@@ -171,5 +213,7 @@ def test_lost_codex_is_abandoned_once_and_dirty_worktree_is_preserved(
     assert jobs.get(job_id, project).state is JobState.ABANDONED
     assert jobs.attempts(job_id, project)[0].state.value == "ABANDONED"
     assert db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "BLOCKED"
+    assert db.execute("SELECT state FROM projects").fetchone()[0] == "BLOCKED"
     scheduler.close()
     db.close()
