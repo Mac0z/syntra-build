@@ -11,20 +11,27 @@ from syntra_build.application.commands.models import (
     CommandType,
     InboundMessage,
 )
-from syntra_build.application.commands.parser import CommandParser
+from syntra_build.application.commands.parser import CommandParser, ParseFailure
 from syntra_build.application.commands.services import (
     CommandAuditRequest,
     CommandAuditSink,
     HumanGateCommandService,
+    IntentResolver,
     LocalHealthService,
     ProjectCommandService,
     ProjectQueryService,
     ProjectSummary,
     ResolutionOutcome,
+    StatusService,
 )
 from syntra_build.application.projects import (
     ProjectCreationError,
     ProjectCreationService,
+)
+from syntra_build.application.status import (
+    format_active_projects,
+    format_project_status,
+    format_waiting,
 )
 from syntra_build.infrastructure.logging import logging_context, new_correlation_id
 
@@ -38,6 +45,7 @@ pause <project>
 resume <project>
 cancel <project>
 waiting
+active
 gate <gate-id> <response>"""
 
 _LOGGER = logging.getLogger("syntra_build.application.commands")
@@ -54,6 +62,8 @@ class CommandRouter:
         gate_commands: HumanGateCommandService | None = None,
         project_creation: ProjectCreationService | None = None,
         parser: CommandParser | None = None,
+        status_service: StatusService | None = None,
+        intent_resolver: IntentResolver | None = None,
     ) -> None:
         self._queries = project_queries
         self._commands = project_commands
@@ -62,10 +72,18 @@ class CommandRouter:
         self._gate_commands = gate_commands
         self._project_creation = project_creation
         self._parser = parser or CommandParser()
+        self._status = status_service
+        self._intent_resolver = intent_resolver
 
     def route(self, message: InboundMessage) -> CommandResponse:
         parsed = self._parser.parse(message)
         command = parsed.command
+        if (
+            command is None
+            and parsed.failure is ParseFailure.UNKNOWN
+            and self._intent_resolver is not None
+        ):
+            command = self._intent_resolver.resolve(message)
         if command is None:
             correlation_id = new_correlation_id()
             _LOGGER.info(
@@ -110,6 +128,12 @@ class CommandRouter:
             return self._health.current_health()
         if command.type is CommandType.LIST_PROJECTS:
             return self._format_projects(self._queries.list_projects())
+        if command.type is CommandType.ACTIVE_PROJECTS:
+            return (
+                format_active_projects(self._status.active_projects())
+                if self._status
+                else "Active project status is not available."
+            )
         if command.type is CommandType.CREATE_PROJECT:
             if self._project_creation is None:
                 return "Project creation is not available."
@@ -124,6 +148,8 @@ class CommandRouter:
                 "design phase."
             )
         if command.type is CommandType.WAITING:
+            if self._status is not None:
+                return format_waiting(self._status.waiting_for_human())
             return (
                 self._gate_commands.waiting()
                 if self._gate_commands
@@ -139,6 +165,8 @@ class CommandRouter:
         if isinstance(project, str):
             return project
         if command.type is CommandType.PROJECT_STATUS:
+            if self._status is not None:
+                return format_project_status(self._status.project_status(project.id))
             return self._format_status(self._queries.get_project_status(project.id))
 
         audit = CommandAuditRequest(

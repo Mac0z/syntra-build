@@ -389,20 +389,41 @@ def test_real_host_router_composes_m14_github_check_and_persistence(
         )
     )
     assert "State: DESIGNING" in response.text
-    assert (
-        router.route(
-            InboundMessage(
-                "telegram",
-                "102",
-                "202",
-                "301",
-                datetime.now(UTC),
-                "/status Host Project",
-                "401",
-            )
-        ).text
-        == "Project: Host Project\nState: DESIGNING"
+    assert router.route(
+        InboundMessage(
+            "telegram",
+            "102",
+            "202",
+            "301",
+            datetime.now(UTC),
+            "/status Host Project",
+            "401",
+        )
+    ).text.startswith("Project: Host Project\nState: DESIGNING\nActivity:")
+    active = router.route(
+        InboundMessage(
+            "telegram",
+            "103",
+            "203",
+            "301",
+            datetime.now(UTC),
+            "What projects are active?",
+            "401",
+        )
     )
+    assert "Active projects:\nHost Project — DESIGNING" in active.text
+    waiting = router.route(
+        InboundMessage(
+            "telegram",
+            "104",
+            "204",
+            "301",
+            datetime.now(UTC),
+            "Is anything waiting for me?",
+            "401",
+        )
+    )
+    assert waiting.text == "Nothing is currently waiting for you."
     connection.close()
 
 

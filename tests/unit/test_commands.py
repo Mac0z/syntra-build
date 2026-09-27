@@ -95,6 +95,7 @@ def test_mutability_classification_is_explicit_and_complete() -> None:
         CommandType.PING,
         CommandType.HEALTH,
         CommandType.LIST_PROJECTS,
+        CommandType.ACTIVE_PROJECTS,
         CommandType.PROJECT_STATUS,
         CommandType.WAITING,
     }

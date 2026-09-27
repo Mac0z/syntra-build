@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from syntra_build.application.commands.models import Command, InboundMessage
 from syntra_build.domain import ProjectId, ProjectState
 from syntra_build.domain.ci import CIProgress
+
+if TYPE_CHECKING:
+    from syntra_build.application.status import HumanAction, ProjectStatusProjection
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +80,14 @@ class HumanGateCommandService(Protocol):
 
 
 class IntentResolver(Protocol):
-    """Future extension used only after deterministic parsing is unrecognized."""
+    """Read-only extension used only after deterministic parsing is unrecognized."""
 
     def resolve(self, message: InboundMessage) -> Command | None: ...
+
+
+class StatusService(Protocol):
+    def project_status(self, project_id: ProjectId) -> ProjectStatusProjection: ...
+
+    def active_projects(self) -> tuple[ProjectStatusProjection, ...]: ...
+
+    def waiting_for_human(self) -> tuple[HumanAction, ...]: ...

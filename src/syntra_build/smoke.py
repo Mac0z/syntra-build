@@ -40,11 +40,12 @@ from syntra_build.application.commands.services import (
 )
 from syntra_build.application.gates import HumanGateCommandHandler, HumanGateService
 from syntra_build.application.human_intervention import HumanInterventionService
-from syntra_build.application.projects import (
-    ProjectCreationService,
-    SQLiteProjectQueryService,
-)
+from syntra_build.application.projects import ProjectCreationService
 from syntra_build.application.specification import DesignPackageDecisionHandler
+from syntra_build.application.status import (
+    ReadOnlyStatusIntentResolver,
+    SQLiteStatusService,
+)
 from syntra_build.domain import ProjectId
 from syntra_build.infrastructure.config import ApplicationConfig, load_host_config
 from syntra_build.infrastructure.logging import configure_logging
@@ -167,13 +168,16 @@ def build_host_router(
         ),
         HumanInterventionService(connection, authorised_responder_ids=authorised),
     )
+    status = SQLiteStatusService(connection, projects)
     return CommandRouter(
-        project_queries=SQLiteProjectQueryService(projects),
+        project_queries=status,
         project_commands=_UnavailableProjectCommands(),
         audit_sink=_NoopAudit(),
         health=_LocalHealth(),
         project_creation=creation,
         gate_commands=gate_commands,
+        status_service=status,
+        intent_resolver=ReadOnlyStatusIntentResolver(),
     )
 
 
