@@ -87,7 +87,8 @@ def main() -> int:
             )
             output = {
                 "eligible": True,
-                "gatekeeper_result_id": eligibility.result_id,
+                "gatekeeper_result_id": merge_request.gatekeeper_result_id,
+                "preflight_gatekeeper_result_id": eligibility.result_id,
                 "merge_attempt_id": attempt_id,
                 "merge_status": result.status.value,
                 "verified_complete": verified,

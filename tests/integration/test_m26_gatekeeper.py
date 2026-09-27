@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import sys
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 
+from syntra_build import m26_smoke
 from syntra_build.application.gatekeeper import (
     Gatekeeper,
     MergeIdentityError,
@@ -943,3 +945,62 @@ def test_duplicate_execution_never_repeats_put(db) -> None:
     with pytest.raises(MergeIdentityError):
         keeper.execute(attempt, request, now=NOW)
     assert len(github.merge_calls) == 1
+
+
+def test_m26_smoke_reports_attempt_bound_gatekeeper_result(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    path = tmp_path / "smoke.db"
+    with open_database(path) as connection:
+        apply_migrations(connection)
+        seed, github = seed_eligible(connection)
+
+    def observe_merged() -> None:
+        github.live = replace(
+            github.live,
+            state=PullRequestState.MERGED,
+            merged_at=NOW.isoformat(),
+            merge_commit_sha=MERGE_SHA,
+        )
+
+    github.before_merge = observe_merged
+    monkeypatch.setattr(m26_smoke, "load_m18_host_config", lambda: object())
+    monkeypatch.setattr(m26_smoke, "GitHubPullRequestAdapter", lambda _config: github)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "m26_smoke",
+            "--database",
+            str(path),
+            "--project-id",
+            str(seed.project),
+            "--milestone-id",
+            str(seed.milestone),
+            "--pull-request-id",
+            seed.pr,
+            "--correlation-id",
+            "smoke-correlation",
+        ],
+    )
+
+    assert m26_smoke.main() == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["eligible"] is True
+    assert output["verified_complete"] is True
+    assert output["gatekeeper_result_id"] != output["preflight_gatekeeper_result_id"]
+
+    with open_database(path) as connection:
+        attempt = connection.execute(
+            "SELECT * FROM merge_attempts WHERE id=?", (output["merge_attempt_id"],)
+        ).fetchone()
+        transition = connection.execute(
+            """SELECT metadata_json FROM state_transitions
+            WHERE milestone_id=? AND new_state='MERGING' ORDER BY rowid DESC LIMIT 1""",
+            (str(seed.milestone),),
+        ).fetchone()
+    assert attempt["gatekeeper_result_id"] == output["gatekeeper_result_id"]
+    assert (
+        json.loads(transition["metadata_json"])["gatekeeper_result_id"]
+        == output["gatekeeper_result_id"]
+    )
