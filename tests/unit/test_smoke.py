@@ -424,6 +424,20 @@ def test_real_host_router_composes_m14_github_check_and_persistence(
         )
     )
     assert waiting.text == "Nothing is currently waiting for you."
+    natural_status = router.route(
+        InboundMessage(
+            "telegram",
+            "105",
+            "205",
+            "301",
+            datetime.now(UTC),
+            "What's happening with Host Project?",
+            "401",
+        )
+    )
+    assert natural_status.text.startswith(
+        "Project: Host Project\nState: DESIGNING\nActivity:"
+    )
     connection.close()
 
 

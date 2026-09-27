@@ -4,7 +4,13 @@ import sqlite3
 from datetime import UTC, datetime
 from uuid import UUID
 
-from syntra_build.application.commands.models import InboundMessage
+from syntra_build.application.commands.models import Command, InboundMessage
+from syntra_build.application.commands.router import CommandRouter
+from syntra_build.application.commands.services import (
+    CommandAuditRequest,
+    ProjectCommandResult,
+    ProjectSummary,
+)
 from syntra_build.application.status import (
     ReadOnlyStatusIntentResolver,
     SQLiteStatusService,
@@ -66,6 +72,33 @@ def add_milestone(connection: sqlite3.Connection, state: str = "CODING") -> None
 def service(connection: sqlite3.Connection) -> SQLiteStatusService:
     return SQLiteStatusService(
         connection, SQLiteProjectRepository(connection, lambda: "unused")
+    )
+
+
+class _Commands:
+    def handle(self, command: Command, project: ProjectSummary) -> ProjectCommandResult:
+        raise AssertionError("status must not call project mutations")
+
+
+class _Audit:
+    def record(self, request: CommandAuditRequest) -> None:
+        raise AssertionError("status must not create mutation audit records")
+
+
+class _Health:
+    def current_health(self) -> str:
+        return "healthy"
+
+
+def message(text: str, sequence: int) -> InboundMessage:
+    return InboundMessage(
+        "telegram",
+        str(sequence),
+        str(sequence),
+        "human",
+        datetime.now(UTC),
+        text,
+        "chat",
     )
 
 
@@ -131,35 +164,105 @@ def test_active_projects_excludes_waiting_paused_blocked_and_terminal() -> None:
     ]
 
 
-def test_waiting_human_and_feedback_projection() -> None:
+def test_waiting_for_me_includes_only_gates_needing_input() -> None:
     connection = database()
     add_project(connection, PID, "FlowTrack", "WAITING_HUMAN")
     add_milestone(connection, "HUMAN_TEST")
+    states = (
+        "PENDING",
+        "NOTIFIED",
+        "RESPONDED",
+        "VALIDATED",
+        "RESOLVED",
+        "CANCELLED",
+        "EXPIRED",
+    )
+    for index, state in enumerate(states):
+        connection.execute(
+            """INSERT INTO human_gates
+            (id,project_id,milestone_id,gate_type,state,title,prompt,
+             expected_response_type,options_json,created_at,created_by,correlation_id)
+            VALUES (?,?,?,'HUMAN_TEST',?,'Test release','Run the checks',
+            'HUMAN_TEST','[]',?,'syntra','correlation')""",
+            (f"gate-{index}", PID, MID, state, NOW),
+        )
+    actions = service(connection).waiting_for_human()
+    assert [(action.gate_id, action.state) for action in actions] == [
+        ("gate-0", "PENDING"),
+        ("gate-1", "NOTIFIED"),
+    ]
+
+
+def test_prompting_and_waiting_feedback_are_not_fresh_human_tests() -> None:
+    for feedback_state in ("PROMPTING", "WAITING_FEEDBACK"):
+        connection = database()
+        add_project(connection, PID, "FlowTrack", "WAITING_HUMAN")
+        add_milestone(connection, "HUMAN_TEST")
+        connection.execute(
+            """INSERT INTO human_gates
+            (id,project_id,milestone_id,gate_type,state,title,prompt,
+             expected_response_type,options_json,created_at,created_by,correlation_id)
+            VALUES ('gate-1',?,?,'HUMAN_TEST','RESPONDED','Test release',
+            'Run the checks','HUMAN_TEST','[]',?,'syntra','correlation')""",
+            (PID, MID, NOW),
+        )
+        prompt_message_id = "message" if feedback_state == "WAITING_FEEDBACK" else None
+        connection.execute(
+            """INSERT INTO m25_telegram_feedback_interactions
+            (id,gate_id,outcome,chat_id,user_id,prompt_message_id,state,created_at)
+            VALUES ('feedback-1','gate-1','FAIL','chat','user',?,?,?)""",
+            (prompt_message_id, feedback_state, NOW),
+        )
+        status_service = service(connection)
+        actions = status_service.waiting_for_human()
+        assert len(actions) == 1
+        assert actions[0].feedback_state == feedback_state
+        projection = status_service.project_status(ProjectId(UUID(PID)))
+        assert "feedback" in projection.activity.lower()
+        assert "test result" not in projection.next_action.lower()
+
+
+def test_human_test_binding_is_projected_exactly() -> None:
+    connection = database()
+    add_project(connection, PID, "FlowTrack", "WAITING_HUMAN")
+    add_milestone(connection, "HUMAN_TEST")
+    connection.execute("PRAGMA foreign_keys=OFF")
+    sha = "c" * 40
     connection.execute(
         """INSERT INTO human_gates
         (id,project_id,milestone_id,gate_type,state,title,prompt,expected_response_type,
          options_json,created_at,created_by,correlation_id)
-        VALUES ('gate-1',?,?,'HUMAN_TEST','NOTIFIED','Test release','Run the checks',
+        VALUES ('gate-1',?,?,'HUMAN_TEST','NOTIFIED','Test release','Run checks',
         'HUMAN_TEST','[]',?,'syntra','correlation')""",
         (PID, MID, NOW),
     )
     connection.execute(
-        """INSERT INTO m25_telegram_feedback_interactions
-        (id,gate_id,outcome,chat_id,user_id,prompt_message_id,state,created_at)
-        VALUES ('feedback-1','gate-1','FAIL','chat','user','message',
-        'WAITING_FEEDBACK',?)""",
-        (NOW,),
+        """INSERT INTO ci_runs
+        (id,project_id,milestone_id,pull_request_id,head_sha,attempt_number,
+         overall_status,started_at,last_checked_at,summary_json,retry_count)
+        VALUES ('ci-bound',?,?,'pr-bound',?,1,'PASSED',?,?,'{}',0)""",
+        (PID, MID, sha, NOW, NOW),
     )
-    status_service = service(connection)
-    actions = status_service.waiting_for_human()
-    assert len(actions) == 1
-    assert actions[0].project_name == "FlowTrack"
-    assert actions[0].milestone_code == "M04"
-    assert actions[0].waiting_for_feedback
-    projection = status_service.project_status(ProjectId(UUID(PID)))
-    assert not projection.workers
-    assert projection.activity == "Waiting for human feedback"
-    assert projection.next_action == "Waiting for your feedback."
+    connection.execute(
+        """INSERT INTO human_test_bindings
+        (gate_id,project_id,milestone_id,architect_review_id,pull_request_id,
+         pull_request_number,tested_head_sha,ci_run_id,artifact_reference,
+         test_instructions,created_at)
+        VALUES ('gate-1',?,?,'review-bound','pr-bound',41,?,'ci-bound',
+        'artifact://release','Run exact acceptance checks',?)""",
+        (PID, MID, sha, NOW),
+    )
+    action = service(connection).waiting_for_human()[0]
+    assert action.pull_request_number == 41
+    assert action.tested_head_sha == sha
+    assert action.ci_run_id == "ci-bound"
+    assert action.ci_status == "PASSED"
+    assert action.artifact_reference == "artifact://release"
+    assert action.test_instructions == "Run exact acceptance checks"
+    rendered = format_project_status(
+        service(connection).project_status(ProjectId.from_string(PID))
+    )
+    assert "Human test: PR #41 @ cccccccccc, CI passed" in rendered
 
 
 def test_pr_head_ci_and_architect_freshness() -> None:
@@ -209,6 +312,127 @@ def test_pr_head_ci_and_architect_freshness() -> None:
     assert stale.architect and not stale.architect.current
     rendered = format_project_status(stale)
     assert rendered.count("stale; not current head") == 2
+
+
+def test_ci_is_scoped_to_selected_pr_head_and_latest_attempt() -> None:
+    connection = database()
+    add_project(connection, PID, "FlowTrack", "BUILDING")
+    add_milestone(connection, "CI_RUNNING")
+    connection.execute("PRAGMA foreign_keys=OFF")
+    old_sha, current_sha = "a" * 40, "b" * 40
+    for pr_id, number, state, sha in (
+        ("pr-old", 40, "CLOSED", old_sha),
+        ("pr-current", 41, "OPEN", current_sha),
+    ):
+        connection.execute(
+            """INSERT INTO pull_requests
+            (id,project_id,milestone_id,github_repository_id,external_pr_number,state,
+             head_branch,base_branch,head_sha,web_url,title,created_at,updated_at,
+             last_reconciled_at) VALUES (?,?,?,'repo-1',?,?,?,?,?,?,'M04',?,?,?)""",
+            (
+                pr_id,
+                PID,
+                MID,
+                number,
+                state,
+                f"syntra/{pr_id}",
+                "main",
+                sha,
+                f"https://example.invalid/{number}",
+                NOW,
+                NOW,
+                NOW,
+            ),
+        )
+    connection.execute(
+        """INSERT INTO ci_runs
+        (id,project_id,milestone_id,pull_request_id,head_sha,attempt_number,
+         overall_status,started_at,last_checked_at,summary_json,retry_count)
+        VALUES ('ci-old',?,?,'pr-old',?,1,'PASSED',?,?,'{}',0)""",
+        (PID, MID, old_sha, NOW, NOW),
+    )
+    status_service = service(connection)
+    without_current = status_service.project_status(ProjectId.from_string(PID))
+    assert without_current.pull_request and without_current.pull_request.number == 41
+    assert without_current.ci is None
+    for attempt, status in ((1, "FAILED"), (2, "RUNNING")):
+        connection.execute(
+            """INSERT INTO ci_runs
+            (id,project_id,milestone_id,pull_request_id,head_sha,attempt_number,
+             overall_status,started_at,last_checked_at,summary_json,retry_count)
+            VALUES (?,?,?,'pr-current',?,?,?, ?,?,'{}',0)""",
+            (
+                f"ci-current-{attempt}",
+                PID,
+                MID,
+                current_sha,
+                attempt,
+                status,
+                NOW,
+                NOW,
+            ),
+        )
+    current = status_service.project_status(ProjectId.from_string(PID))
+    assert current.ci and current.ci.current
+    assert current.ci.status == "RUNNING"
+
+
+def test_architect_counts_prior_unresolved_blocking_findings() -> None:
+    connection = database()
+    add_project(connection, PID, "FlowTrack", "BUILDING")
+    add_milestone(connection, "ARCHITECT_REVIEW")
+    connection.execute("PRAGMA foreign_keys=OFF")
+    sha = "a" * 40
+    connection.execute(
+        """INSERT INTO pull_requests
+        (id,project_id,milestone_id,github_repository_id,external_pr_number,state,
+         head_branch,base_branch,head_sha,web_url,title,created_at,updated_at,
+         last_reconciled_at) VALUES
+        ('pr-1',?,?,'repo-1',41,'OPEN','syntra/m04','main',?,
+         'https://example.invalid/41','M04',?,?,?)""",
+        (PID, MID, sha, NOW, NOW, NOW),
+    )
+    connection.execute(
+        """INSERT INTO architect_reviews
+        (id,project_id,milestone_id,architect_request_id,pull_request_id,
+         reviewed_sha,verdict,summary,created_at)
+        VALUES ('review-a',?,?,'request-a','pr-1',?,'CHANGES_REQUIRED','Fix',?)""",
+        (PID, MID, sha, "2026-09-27T12:00:00+00:00"),
+    )
+    connection.execute(
+        """INSERT INTO architect_review_findings
+        (id,review_id,finding_code,severity,requirement_ref,description,
+         recommended_action,status,created_at)
+        VALUES ('finding-a','review-a','F-1','major','M28','Problem','Fix it',
+        'OPEN',?)""",
+        (NOW,),
+    )
+    connection.execute(
+        """INSERT INTO architect_reviews
+        (id,project_id,milestone_id,architect_request_id,pull_request_id,
+         reviewed_sha,verdict,summary,created_at)
+        VALUES ('review-b',?,?,'request-b','pr-1',?,'HUMAN_TEST_REQUIRED',
+        'Test it','2026-09-27T13:00:00+00:00')""",
+        (PID, MID, sha),
+    )
+    status_service = service(connection)
+    projection = status_service.project_status(ProjectId.from_string(PID))
+    assert projection.architect and projection.architect.blocking_findings == 1
+    connection.execute(
+        """INSERT INTO architect_reviews
+        (id,project_id,milestone_id,architect_request_id,pull_request_id,
+         reviewed_sha,verdict,summary,created_at)
+        VALUES ('review-c',?,?,'request-c','pr-1',?,'APPROVE','Approved',
+        '2026-09-27T14:00:00+00:00')""",
+        (PID, MID, sha),
+    )
+    connection.execute(
+        """UPDATE architect_review_findings SET status='RESOLVED',
+        resolved_by_review_id='review-c' WHERE id='finding-a'"""
+    )
+    resolved = status_service.project_status(ProjectId.from_string(PID))
+    assert resolved.architect and resolved.architect.verdict == "APPROVE"
+    assert resolved.architect.blocking_findings == 0
 
 
 def test_paused_blocked_failed_and_complete_next_actions() -> None:
@@ -267,5 +491,87 @@ def test_natural_language_resolver_is_status_only() -> None:
     assert command.type.value == "PROJECT_STATUS"
     assert command.project_reference == "FlowTrack"
     assert resolve("pause FlowTrack please") is None
+    assert resolve("resume FlowTrack please") is None
     assert resolve("cancel FlowTrack") is None
+    assert resolve("gate gate-1 APPROVE") is None
+    assert resolve("create FlowTrack please") is None
     assert resolve("tell me a story") is None
+
+
+def test_router_status_queries_are_repeatedly_observational() -> None:
+    connection = database()
+    add_project(connection, PID, "FlowTrack", "BUILDING")
+    add_milestone(connection)
+    connection.execute(
+        """INSERT INTO jobs
+        (id,project_id,milestone_id,job_type,state,priority,correlation_id,
+         attempt_number,max_attempts,started_at,worker_class,payload_json,result_json,
+         created_at,updated_at)
+        VALUES ('job-1',?,?,'CODEX_IMPLEMENT','RUNNING',0,'correlation',1,3,?,
+        'CODEX','{}','{}',?,?)""",
+        (PID, MID, NOW, NOW, NOW),
+    )
+    connection.execute(
+        """INSERT INTO job_attempts
+        (id,job_id,attempt_number,state,started_at,result_json)
+        VALUES ('attempt-1','job-1',1,'RUNNING',?,'{}')""",
+        (NOW,),
+    )
+    connection.execute(
+        """INSERT INTO human_gates
+        (id,project_id,milestone_id,gate_type,state,title,prompt,
+         expected_response_type,options_json,created_at,created_by,correlation_id)
+        VALUES ('gate-1',?,?,'PRODUCT_DECISION','NOTIFIED','Choose','Choose one',
+        'OPTION','[]',?,'syntra','correlation')""",
+        (PID, MID, NOW),
+    )
+    status_service = service(connection)
+    router = CommandRouter(
+        project_queries=status_service,
+        project_commands=_Commands(),
+        audit_sink=_Audit(),
+        health=_Health(),
+        status_service=status_service,
+        intent_resolver=ReadOnlyStatusIntentResolver(),
+    )
+    tables = (
+        "projects",
+        "milestones",
+        "jobs",
+        "job_attempts",
+        "human_gates",
+        "state_transitions",
+        "merge_attempts",
+        "ci_runs",
+        "architect_requests",
+        "codex_runs",
+    )
+
+    def snapshot() -> dict[str, tuple[tuple[object, ...], ...]]:
+        return {
+            table: tuple(
+                tuple(row)
+                for row in connection.execute(f"SELECT * FROM {table} ORDER BY rowid")
+            )
+            for table in tables
+        }
+
+    before = snapshot()
+    for iteration in range(3):
+        assert (
+            "Project: FlowTrack"
+            in router.route(message("status FlowTrack", iteration * 3 + 1)).text
+        )
+        assert (
+            "Active projects:"
+            in router.route(
+                message("What projects are active?", iteration * 3 + 2)
+            ).text
+        )
+        assert (
+            "Waiting for you:"
+            in router.route(
+                message("Is anything waiting for me?", iteration * 3 + 3)
+            ).text
+        )
+    assert snapshot() == before

@@ -44,7 +44,8 @@ _ACTIVE_JOB_STATES = (
     "QUEUED",
 )
 _TERMINAL_MILESTONES = ("PENDING", "COMPLETE", "FAILED", "CANCELLED")
-_OPEN_GATES = ("PENDING", "NOTIFIED", "RESPONDED", "VALIDATED")
+_HUMAN_INPUT_GATE_STATES = ("PENDING", "NOTIFIED")
+_ACTIVE_FEEDBACK_STATES = ("PROMPTING", "WAITING_FEEDBACK")
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +111,17 @@ class HumanAction:
     project_name: str
     milestone_code: str | None
     milestone_title: str | None
-    waiting_for_feedback: bool = False
+    feedback_state: str | None = None
+    pull_request_number: int | None = None
+    tested_head_sha: str | None = None
+    ci_run_id: str | None = None
+    ci_status: str | None = None
+    artifact_reference: str | None = None
+    test_instructions: str | None = None
+
+    @property
+    def waiting_for_feedback(self) -> bool:
+        return self.feedback_state in _ACTIVE_FEEDBACK_STATES
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,13 +198,19 @@ class SQLiteStatusService:
             rows = self._connection.execute(
                 f"""SELECT g.*,p.name AS project_name,m.code AS milestone_code,
                 m.title AS milestone_title,
-                EXISTS(SELECT 1 FROM m25_telegram_feedback_interactions f
-                  WHERE f.gate_id=g.id AND f.state='WAITING_FEEDBACK') AS feedback
+                f.state AS feedback_state,b.pull_request_number,b.tested_head_sha,
+                b.ci_run_id,b.artifact_reference AS binding_artifact_reference,
+                b.test_instructions,c.overall_status AS ci_status
                 FROM human_gates g JOIN projects p ON p.id=g.project_id
                 LEFT JOIN milestones m ON m.id=g.milestone_id
-                WHERE g.state IN ({",".join("?" for _ in _OPEN_GATES)})
+                LEFT JOIN m25_telegram_feedback_interactions f ON f.gate_id=g.id
+                  AND f.state IN ({",".join("?" for _ in _ACTIVE_FEEDBACK_STATES)})
+                LEFT JOIN human_test_bindings b ON b.gate_id=g.id
+                LEFT JOIN ci_runs c ON c.id=b.ci_run_id
+                WHERE g.state IN ({",".join("?" for _ in _HUMAN_INPUT_GATE_STATES)})
+                  OR f.id IS NOT NULL
                 ORDER BY p.name,g.created_at,g.id""",
-                _OPEN_GATES,
+                (*_ACTIVE_FEEDBACK_STATES, *_HUMAN_INPUT_GATE_STATES),
             ).fetchall()
             return tuple(self._human_action(row) for row in rows)
 
@@ -224,7 +241,7 @@ class SQLiteStatusService:
                 (str(project_id), milestone.id if milestone else ""),
             )
             pr = self._pr(pr_row) if pr_row else None
-            ci = self._ci(milestone.id, pr) if milestone and pr else None
+            ci = self._ci(pr_row["id"], pr) if pr_row and pr else None
             architect = self._architect(pr_row["id"], pr) if pr_row and pr else None
             activity = self._activity(
                 project.state, jobs, actions, milestone, project.activity
@@ -312,13 +329,24 @@ class SQLiteStatusService:
         rows = self._connection.execute(
             f"""SELECT g.*,p.name AS project_name,m.code AS milestone_code,
             m.title AS milestone_title,
-            EXISTS(SELECT 1 FROM m25_telegram_feedback_interactions f
-              WHERE f.gate_id=g.id AND f.state='WAITING_FEEDBACK') AS feedback
+            f.state AS feedback_state,b.pull_request_number,b.tested_head_sha,
+            b.ci_run_id,b.artifact_reference AS binding_artifact_reference,
+            b.test_instructions,c.overall_status AS ci_status
             FROM human_gates g JOIN projects p ON p.id=g.project_id
             LEFT JOIN milestones m ON m.id=g.milestone_id
-            WHERE g.project_id=? AND g.state IN ({",".join("?" for _ in _OPEN_GATES)})
+            LEFT JOIN m25_telegram_feedback_interactions f ON f.gate_id=g.id
+              AND f.state IN ({",".join("?" for _ in _ACTIVE_FEEDBACK_STATES)})
+            LEFT JOIN human_test_bindings b ON b.gate_id=g.id
+            LEFT JOIN ci_runs c ON c.id=b.ci_run_id
+            WHERE g.project_id=? AND
+              (g.state IN ({",".join("?" for _ in _HUMAN_INPUT_GATE_STATES)})
+               OR f.id IS NOT NULL)
             ORDER BY g.created_at,g.id""",
-            (project_id, *_OPEN_GATES),
+            (
+                *_ACTIVE_FEEDBACK_STATES,
+                project_id,
+                *_HUMAN_INPUT_GATE_STATES,
+            ),
         ).fetchall()
         return tuple(self._human_action(row) for row in rows)
 
@@ -333,7 +361,13 @@ class SQLiteStatusService:
             row["project_name"],
             row["milestone_code"],
             row["milestone_title"],
-            bool(row["feedback"]),
+            row["feedback_state"],
+            row["pull_request_number"],
+            row["tested_head_sha"],
+            row["ci_run_id"],
+            row["ci_status"],
+            row["binding_artifact_reference"],
+            row["test_instructions"],
         )
 
     @staticmethod
@@ -346,11 +380,18 @@ class SQLiteStatusService:
             row["web_url"],
         )
 
-    def _ci(self, milestone_id: str, pr: PullRequestStatus) -> CIStatus | None:
+    def _ci(self, pull_request_id: str, pr: PullRequestStatus) -> CIStatus | None:
         row = self._one(
-            "SELECT * FROM ci_runs WHERE milestone_id=? ORDER BY last_checked_at DESC,id DESC LIMIT 1",
-            (milestone_id,),
+            """SELECT * FROM ci_runs WHERE pull_request_id=? AND head_sha=?
+            ORDER BY attempt_number DESC,last_checked_at DESC,id DESC LIMIT 1""",
+            (pull_request_id, pr.head_sha),
         )
+        if row is None:
+            row = self._one(
+                """SELECT * FROM ci_runs WHERE pull_request_id=?
+                ORDER BY last_checked_at DESC,attempt_number DESC,id DESC LIMIT 1""",
+                (pull_request_id,),
+            )
         if row is None:
             return None
         checks = self._connection.execute(
@@ -377,8 +418,11 @@ class SQLiteStatusService:
         if row is None:
             return None
         count = self._connection.execute(
-            "SELECT count(*) FROM architect_review_findings WHERE review_id=? AND status='OPEN' AND severity IN ('major','critical')",
-            (row["id"],),
+            """SELECT count(*) FROM architect_review_findings f
+            JOIN architect_reviews r ON r.id=f.review_id
+            WHERE r.pull_request_id=? AND f.status IN ('OPEN','ACCEPTED')
+              AND f.severity IN ('major','critical')""",
+            (pull_request_id,),
         ).fetchone()[0]
         return ArchitectStatus(
             row["verdict"],
@@ -415,8 +459,10 @@ class SQLiteStatusService:
             return f"{job.worker_class.title()} {job.state.lower()} — {job.job_type}"
         if actions:
             return (
-                "Waiting for human feedback"
-                if actions[0].waiting_for_feedback
+                "Preparing human feedback request"
+                if actions[0].feedback_state == "PROMPTING"
+                else "Waiting for human feedback"
+                if actions[0].feedback_state == "WAITING_FEEDBACK"
                 else f"Waiting for human {actions[0].gate_type.lower().replace('_', ' ')}"
             )
         if state is ProjectState.PAUSED:
@@ -452,8 +498,10 @@ class SQLiteStatusService:
         if actions:
             action = actions[0]
             return (
-                "Waiting for your feedback."
-                if action.waiting_for_feedback
+                "Feedback is required; Syntra is preparing the request."
+                if action.feedback_state == "PROMPTING"
+                else "Waiting for your feedback."
+                if action.feedback_state == "WAITING_FEEDBACK"
                 else "Waiting for your test result."
                 if action.gate_type == "HUMAN_TEST"
                 else "Waiting for your decision."
@@ -565,11 +613,33 @@ def format_project_status(status: ProjectStatusProjection) -> str:
     if status.human_actions:
         for action in status.human_actions:
             request = (
-                "feedback required" if action.waiting_for_feedback else action.prompt
+                "preparing feedback request"
+                if action.feedback_state == "PROMPTING"
+                else "waiting for your feedback"
+                if action.feedback_state == "WAITING_FEEDBACK"
+                else action.prompt
             )
             lines.append(
                 f"Human action: {action.gate_type} {action.state} — {action.title}: {request} (gate {action.gate_id})"
             )
+            if action.gate_type == "HUMAN_TEST":
+                if (
+                    action.pull_request_number
+                    and action.tested_head_sha
+                    and action.ci_run_id
+                ):
+                    binding = (
+                        f"Human test: PR #{action.pull_request_number} @ "
+                        f"{action.tested_head_sha[:10]}, CI "
+                        f"{(action.ci_status or 'unknown').lower()}"
+                    )
+                    if action.test_instructions:
+                        binding += f" — {action.test_instructions}"
+                    if action.artifact_reference:
+                        binding += f" (artifact: {action.artifact_reference})"
+                    lines.append(binding)
+                else:
+                    lines.append("Human test binding: unavailable/incomplete")
     else:
         lines.append("Human action: none")
     lines.append(f"Latest error: {status.latest_error or 'none'}")
@@ -604,6 +674,10 @@ def format_waiting(actions: tuple[HumanAction, ...]) -> str:
             else ""
         )
         request = "feedback required" if action.waiting_for_feedback else action.prompt
+        if action.feedback_state == "PROMPTING":
+            request = "preparing feedback request"
+        elif action.feedback_state == "WAITING_FEEDBACK":
+            request = "waiting for your feedback"
         lines.append(
             f"{action.project_name}{milestone} — {action.gate_type} {action.state}: {request} (gate {action.gate_id})"
         )

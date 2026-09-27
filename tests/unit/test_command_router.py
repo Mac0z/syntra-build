@@ -290,6 +290,26 @@ def test_unknown_input_without_resolver_returns_help() -> None:
     assert health.calls == 0
 
 
+def test_malformed_known_command_bypasses_intent_resolver() -> None:
+    resolver = FutureIntentResolver()
+    queries, commands, audit, health = (
+        FakeQueries(),
+        FakeCommands(),
+        FakeAudit(),
+        FakeHealth(),
+    )
+    router = CommandRouter(
+        project_queries=queries,
+        project_commands=commands,
+        audit_sink=audit,
+        health=health,
+        parser=CommandParser(lambda: "correlation-6"),
+        intent_resolver=resolver,
+    )
+    assert router.route(inbound("status")).text == HELP_TEXT
+    assert resolver.calls == 0
+
+
 def test_duplicate_source_is_neutral_and_routes_twice() -> None:
     queries = FakeQueries(resolution=ProjectResolution(ResolutionOutcome.FOUND, FLOW))
     router, _, commands, audit, _ = make_router(queries=queries)
