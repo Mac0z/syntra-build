@@ -69,6 +69,31 @@ def add_milestone(connection: sqlite3.Connection, state: str = "CODING") -> None
     )
 
 
+def add_milestone_record(
+    connection: sqlite3.Connection,
+    sequence: int,
+    state: str,
+    *,
+    updated_at: str = NOW,
+) -> None:
+    milestone_id = f"00000000-0000-0000-1000-{sequence:012d}"
+    connection.execute(
+        """INSERT INTO milestones
+        (id,project_id,sequence_number,code,title,state,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (
+            milestone_id,
+            PID,
+            sequence,
+            f"M{sequence:02d}",
+            f"Milestone {sequence}",
+            state,
+            NOW,
+            updated_at,
+        ),
+    )
+
+
 def service(connection: sqlite3.Connection) -> SQLiteStatusService:
     return SQLiteStatusService(
         connection, SQLiteProjectRepository(connection, lambda: "unused")
@@ -162,6 +187,63 @@ def test_active_projects_excludes_waiting_paused_blocked_and_terminal() -> None:
         "BUILDING",
         "READY",
     ]
+
+
+def test_failed_project_ignores_future_pending_milestones() -> None:
+    connection = database()
+    add_project(connection, PID, "Failed project", "FAILED")
+    for sequence, state in (
+        (1, "COMPLETE"),
+        (2, "FAILED"),
+        (3, "PENDING"),
+        (4, "PENDING"),
+    ):
+        add_milestone_record(connection, sequence, state)
+    milestone = service(connection).project_status(ProjectId.from_string(PID)).milestone
+    assert milestone and (milestone.code, milestone.state) == ("M02", "FAILED")
+
+
+def test_cancelled_project_ignores_future_pending_milestones() -> None:
+    connection = database()
+    add_project(connection, PID, "Cancelled project", "CANCELLED")
+    add_milestone_record(connection, 1, "COMPLETE")
+    add_milestone_record(connection, 2, "CANCELLED")
+    add_milestone_record(connection, 3, "PENDING")
+    milestone = service(connection).project_status(ProjectId.from_string(PID)).milestone
+    assert milestone and (milestone.code, milestone.state) == ("M02", "CANCELLED")
+
+
+def test_complete_project_reports_latest_completed_milestone() -> None:
+    connection = database()
+    add_project(connection, PID, "Complete project", "COMPLETE")
+    add_milestone_record(connection, 1, "COMPLETE")
+    add_milestone_record(connection, 2, "COMPLETE")
+    add_milestone_record(connection, 3, "PENDING")
+    milestone = service(connection).project_status(ProjectId.from_string(PID)).milestone
+    assert milestone and (milestone.code, milestone.state) == ("M02", "COMPLETE")
+
+
+def test_project_with_only_future_milestones_has_no_current_milestone() -> None:
+    connection = database()
+    add_project(connection, PID, "Ready project", "READY")
+    add_milestone_record(connection, 1, "PENDING")
+    add_milestone_record(connection, 2, "PENDING")
+    projection = service(connection).project_status(ProjectId.from_string(PID))
+    assert projection.milestone is None
+    assert projection.activity == "No active work"
+    assert "Milestone: No active implementation milestone" in format_project_status(
+        projection
+    )
+
+
+def test_active_milestone_wins_over_complete_and_future_milestones() -> None:
+    connection = database()
+    add_project(connection, PID, "Building project", "BUILDING")
+    add_milestone_record(connection, 1, "COMPLETE")
+    add_milestone_record(connection, 2, "CODING")
+    add_milestone_record(connection, 3, "PENDING")
+    milestone = service(connection).project_status(ProjectId.from_string(PID)).milestone
+    assert milestone and (milestone.code, milestone.state) == ("M02", "CODING")
 
 
 def test_waiting_for_me_includes_only_gates_needing_input() -> None:
@@ -377,7 +459,7 @@ def test_ci_is_scoped_to_selected_pr_head_and_latest_attempt() -> None:
     assert current.ci.status == "RUNNING"
 
 
-def test_architect_counts_prior_unresolved_blocking_findings() -> None:
+def test_architect_blocking_findings_match_gatekeeper_open_semantics() -> None:
     connection = database()
     add_project(connection, PID, "FlowTrack", "BUILDING")
     add_milestone(connection, "ARCHITECT_REVIEW")
@@ -407,6 +489,19 @@ def test_architect_counts_prior_unresolved_blocking_findings() -> None:
         'OPEN',?)""",
         (NOW,),
     )
+    for suffix, status in (
+        ("accepted", "ACCEPTED"),
+        ("resolved", "RESOLVED"),
+        ("superseded", "SUPERSEDED"),
+    ):
+        connection.execute(
+            """INSERT INTO architect_review_findings
+            (id,review_id,finding_code,severity,requirement_ref,description,
+             recommended_action,status,created_at)
+            VALUES (?, 'review-a', ?, 'critical', 'M28', 'Historical', 'Action',
+            ?, ?)""",
+            (f"finding-{suffix}", f"F-{suffix}", status, NOW),
+        )
     connection.execute(
         """INSERT INTO architect_reviews
         (id,project_id,milestone_id,architect_request_id,pull_request_id,
@@ -417,6 +512,7 @@ def test_architect_counts_prior_unresolved_blocking_findings() -> None:
     )
     status_service = service(connection)
     projection = status_service.project_status(ProjectId.from_string(PID))
+    # Gatekeeper's merge guard treats only OPEN findings as blocking.
     assert projection.architect and projection.architect.blocking_findings == 1
     connection.execute(
         """INSERT INTO architect_reviews

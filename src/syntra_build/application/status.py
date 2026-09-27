@@ -43,7 +43,7 @@ _ACTIVE_JOB_STATES = (
     "RETRY_WAIT",
     "QUEUED",
 )
-_TERMINAL_MILESTONES = ("PENDING", "COMPLETE", "FAILED", "CANCELLED")
+_NON_ACTIVE_MILESTONE_STATES = ("PENDING", "COMPLETE", "FAILED", "CANCELLED")
 _HUMAN_INPUT_GATE_STATES = ("PENDING", "NOTIFIED")
 _ACTIVE_FEEDBACK_STATES = ("PROMPTING", "WAITING_FEEDBACK")
 
@@ -217,12 +217,7 @@ class SQLiteStatusService:
     def project_status(self, project_id: ProjectId) -> ProjectStatusProjection:
         with _snapshot(self._connection):
             project = self._projects.get(project_id)
-            milestone_row = self._connection.execute(
-                f"""SELECT * FROM milestones WHERE project_id=?
-                ORDER BY state NOT IN ({",".join("?" for _ in _TERMINAL_MILESTONES)}) DESC,
-                sequence_number DESC LIMIT 1""",
-                (str(project_id), *_TERMINAL_MILESTONES),
-            ).fetchone()
+            milestone_row = self._relevant_milestone(str(project_id), project.state)
             milestone = self._milestone(milestone_row) if milestone_row else None
             jobs = self._jobs(
                 str(project_id),
@@ -267,6 +262,31 @@ class SQLiteStatusService:
     def _one(self, sql: str, values: tuple[object, ...]) -> sqlite3.Row | None:
         return cast(
             sqlite3.Row | None, self._connection.execute(sql, values).fetchone()
+        )
+
+    def _relevant_milestone(
+        self, project_id: str, project_state: ProjectState
+    ) -> sqlite3.Row | None:
+        active = self._one(
+            f"""SELECT * FROM milestones WHERE project_id=?
+            AND state NOT IN
+              ({",".join("?" for _ in _NON_ACTIVE_MILESTONE_STATES)})
+            ORDER BY sequence_number DESC LIMIT 1""",
+            (project_id, *_NON_ACTIVE_MILESTONE_STATES),
+        )
+        if active is not None:
+            return active
+        fallback_state = {
+            ProjectState.FAILED: "FAILED",
+            ProjectState.CANCELLED: "CANCELLED",
+            ProjectState.COMPLETE: "COMPLETE",
+        }.get(project_state)
+        if fallback_state is None:
+            return None
+        return self._one(
+            """SELECT * FROM milestones WHERE project_id=? AND state=?
+            ORDER BY updated_at DESC,sequence_number DESC,id DESC LIMIT 1""",
+            (project_id, fallback_state),
         )
 
     @staticmethod
@@ -420,7 +440,7 @@ class SQLiteStatusService:
         count = self._connection.execute(
             """SELECT count(*) FROM architect_review_findings f
             JOIN architect_reviews r ON r.id=f.review_id
-            WHERE r.pull_request_id=? AND f.status IN ('OPEN','ACCEPTED')
+            WHERE r.pull_request_id=? AND f.status='OPEN'
               AND f.severity IN ('major','critical')""",
             (pull_request_id,),
         ).fetchone()[0]
@@ -587,6 +607,8 @@ def format_project_status(status: ProjectStatusProjection) -> str:
             f"Milestone: {status.milestone.code} — {status.milestone.title}",
             f"Milestone state: {status.milestone.state}",
         ]
+    else:
+        lines.append("Milestone: No active implementation milestone")
     for worker in status.workers:
         detail = f"{worker.worker_class} {worker.state} — {worker.job_type}, attempt {worker.attempt}/{worker.max_attempts}"
         if worker.next_retry_at:

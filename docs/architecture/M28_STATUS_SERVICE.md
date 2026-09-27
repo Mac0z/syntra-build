@@ -15,6 +15,12 @@ the strongest supporting evidence currently present, in this order: active jobs
 human actions, persisted activity, milestone state, or no active work. A milestone
 state alone never implies that a worker is running.
 
+The current milestone is the single non-terminal, non-`PENDING` milestone when one
+exists. Without an active milestone, failed, cancelled, and complete projects use the
+latest milestone in their corresponding terminal state. Future `PENDING` milestones
+are never presented as current; other projects with only future milestones report no
+active implementation milestone.
+
 An **active project** is in `NEW`, `DESIGNING`, `PROVISIONING`, `READY`, `BUILDING`, or
 `COMPLETING`. `DESIGN_APPROVAL`, `WAITING_HUMAN`, `PAUSED`, `BLOCKED`, and terminal
 projects are excluded because they cannot make implementation progress without a
@@ -35,6 +41,9 @@ Evidence for an older SHA is displayed as stale and is never represented as curr
 approval or current passing CI. The service reports the last committed trusted
 external observation. M28 deliberately does not add live GitHub reconciliation, so a
 GitHub outage cannot prevent status responses.
+
+The displayed Architect `blocking_findings` count follows Gatekeeper merge authority:
+only major or critical findings whose persisted status is `OPEN` are blocking.
 
 ## Natural-language status intents
 
