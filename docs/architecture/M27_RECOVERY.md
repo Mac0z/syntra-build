@@ -40,11 +40,25 @@ duplicate a replacement.
 Run the bounded, non-daemon inspection against a copied or purpose-built database:
 
 ```bash
-python -m syntra_build.m27_smoke --database /path/to/m27-acceptance.db
+# Observe/reconcile PR, CI and merge plus local Git/worktree state.
+python -m syntra_build.m27_smoke --mode github \
+  --database /path/to/m27-acceptance.db --data-root /configured/data/root
+
+# Reconcile only commit/push and lost Codex/worktree state.
+python -m syntra_build.m27_smoke --mode local \
+  --database /path/to/m27-acceptance.db --data-root /configured/data/root
+
+# Restore persisted human gates/interactions without a GitHub connection.
+python -m syntra_build.m27_smoke --mode human \
+  --database /path/to/m27-acceptance.db
+
+# Compose every concrete recovery service in one bounded pass.
+python -m syntra_build.m27_smoke --mode all \
+  --database /path/to/m27-acceptance.db --data-root /configured/data/root
 ```
 
-The command uses real SQLite state, performs coordinator discovery/reconciliation, and
-prints concise append-only outcomes. Provider observation handlers may be supplied by a
-host harness for a harmless GitHub acceptance repository; destructive actions should
-remain observation-only. It does not reboot the host, start a daemon, replay a PR
-creation/merge, reset a worktree, or manufacture expected terminal states.
+The command uses real SQLite state and composes the normal trusted host configuration,
+GitHub adapters, workspace service, CI monitor, Gatekeeper and human-intervention
+service selected by the mode. It prints concise append-only outcomes. Use only a copied
+database and harmless acceptance repository. It does not reboot the host, start a
+daemon, replay a merge, reset a worktree, or manufacture expected terminal states.
