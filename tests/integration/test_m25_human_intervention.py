@@ -1354,7 +1354,7 @@ def test_migration_022_to_023_preserves_m25_data_and_adds_feedback(
             ),
         )
 
-        apply_migrations(db)
+        apply_migrations(db, MIGRATIONS[:23])
 
         assert current_schema_version(db) == 23
         assert tuple(
@@ -1382,6 +1382,6 @@ def test_migration_022_to_023_preserves_m25_data_and_adds_feedback(
 
 def test_clean_database_migrates_through_023(tmp_path: Path) -> None:
     with open_database(tmp_path / "clean.db") as db:
-        apply_migrations(db)
+        apply_migrations(db, MIGRATIONS[:23])
         assert current_schema_version(db) == 23
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []
