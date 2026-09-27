@@ -467,3 +467,58 @@ def test_cli_failure_is_nonzero_and_secret_safe(
     output = capsys.readouterr()
     assert result == 1
     assert "synthetic-secret-token" not in output.err
+
+
+def test_host_router_uses_real_operational_health(tmp_path: Path) -> None:
+    from syntra_build.application.operational_health import OperationalHealth
+    from syntra_build.domain.health import HealthState, ResourceSnapshot
+    from syntra_build.infrastructure.config.models import ResourceThresholdConfig
+
+    class Resources:
+        free = 50.0
+
+        def sample(self) -> ResourceSnapshot:
+            return ResourceSnapshot(
+                100, int(100 - self.free), int(self.free), self.free
+            )
+
+    base = _config(tmp_path)
+    config = load_config(
+        {**base.safe_dict(), "github": {"enabled": True, "owner": "Mac0z"}},
+        environ={},
+        secrets=SecretInputs(github_token=SecretValue("synthetic-github-token")),
+    )
+    connection = bootstrap_database(config)
+    resources = Resources()
+    health = OperationalHealth(resources, ResourceThresholdConfig())
+    router = build_host_router(
+        config,
+        connection,
+        github_transport=lambda _request, _timeout: GitHubHTTPResponse(404, b"{}"),
+        health=health,
+    )
+
+    def response() -> str:
+        return router.route(
+            InboundMessage(
+                "telegram",
+                "health-update",
+                "health-message",
+                "301",
+                datetime.now(UTC),
+                "/health",
+                "401",
+            )
+        ).text
+
+    health.running()
+    assert response() == "Health: HEALTHY\nReady: yes\nReasons: none"
+    resources.free = 7
+    assert response() == "Health: DEGRADED\nReady: yes\nReasons: DISK_CODEX_STOP"
+    health.recovering()
+    assert response() == "Health: RECOVERING\nReady: no\nReasons: none"
+    health.running()
+    resources.free = 4
+    assert response() == "Health: UNHEALTHY\nReady: no\nReasons: DISK_CRITICAL"
+    assert health.projection().state is HealthState.UNHEALTHY
+    connection.close()

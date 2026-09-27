@@ -52,7 +52,8 @@ class PrometheusRecorder(MetricsRecorder):
 
     def samples(self) -> list[str]:
         with self._lock:
-            lines = [
+            lines = ["# TYPE syntra_build_api_failures_total counter"]
+            lines += [
                 _sample(
                     "syntra_build_api_failures_total",
                     count,
@@ -60,6 +61,7 @@ class PrometheusRecorder(MetricsRecorder):
                 )
                 for (p, c), count in sorted(self.api_failures.items())
             ]
+            lines.append("# TYPE syntra_build_resource_guard_denials_total counter")
             lines += [
                 _sample(
                     "syntra_build_resource_guard_denials_total",
@@ -93,6 +95,7 @@ class MetricsService:
             "# HELP syntra_build_ready Operational readiness",
             "# TYPE syntra_build_ready gauge",
             _sample("syntra_build_ready", int(projection.ready)),
+            "# TYPE syntra_build_system_health gauge",
         ]
         for health_state in HealthState:
             lines.append(
@@ -110,7 +113,9 @@ class MetricsService:
             ("disk_free_percent", resource.free_percent),
             ("artifact_bytes", resource.artifact_bytes),
         ):
+            lines.append(f"# TYPE syntra_build_{suffix} gauge")
             lines.append(_sample(f"syntra_build_{suffix}", value))
+        lines.append("# TYPE syntra_build_worker_capacity gauge")
         for worker in WorkerClass:
             for kind, value in (
                 ("limit", self._capacity.capacity(worker)),
@@ -125,6 +130,7 @@ class MetricsService:
                     )
                 )
         with closing(self._connections()) as connection:
+            lines.append("# TYPE syntra_build_projects gauge")
             counts = dict(
                 connection.execute("SELECT state,count(*) FROM projects GROUP BY state")
             )
@@ -143,6 +149,7 @@ class MetricsService:
                     "GROUP BY worker_class,state"
                 )
             }
+            lines.append("# TYPE syntra_build_jobs gauge")
             for worker in WorkerClass:
                 for job_state in JobState:
                     lines.append(
@@ -159,6 +166,7 @@ class MetricsService:
                 "process_status",
                 "syntra_build_codex_runs_total",
                 ("status",),
+                metric_type="counter",
             )
             self._group(
                 lines,
@@ -167,6 +175,7 @@ class MetricsService:
                 "request_type,status",
                 "syntra_build_architect_requests_total",
                 ("request_type", "status"),
+                metric_type="counter",
             )
             self._group(
                 lines,
@@ -175,6 +184,7 @@ class MetricsService:
                 "overall_status",
                 "syntra_build_ci_runs_total",
                 ("status",),
+                metric_type="counter",
             )
             self._group(
                 lines,
@@ -183,6 +193,7 @@ class MetricsService:
                 "entity_type,new_state",
                 "syntra_build_state_transitions_total",
                 ("entity_type", "new_state"),
+                metric_type="counter",
             )
             self._histogram(
                 lines,
@@ -210,7 +221,10 @@ class MetricsService:
         columns: str,
         name: str,
         labels: tuple[str, ...],
+        *,
+        metric_type: str,
     ) -> None:
+        lines.append(f"# TYPE {name} {metric_type}")
         rows = connection.execute(
             f"SELECT {columns},count(*) FROM {table} GROUP BY {columns}"
         )
@@ -223,6 +237,7 @@ class MetricsService:
     def _histogram(
         lines: list[str], connection: sqlite3.Connection, table: str, name: str
     ) -> None:
+        lines.append(f"# TYPE {name} histogram")
         durations = [
             (
                 datetime.fromisoformat(done) - datetime.fromisoformat(start)

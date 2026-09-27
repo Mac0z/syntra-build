@@ -27,6 +27,12 @@ from syntra_build.adapters.telegram.models import (
     TelegramSentMessage,
     TelegramUpdateDisposition,
 )
+from syntra_build.application.metrics import (
+    APIFailureClassification,
+    APIProvider,
+    MetricsRecorder,
+    NoOpMetricsRecorder,
+)
 from syntra_build.infrastructure.config import ApplicationConfig
 
 _LOGGER = logging.getLogger("syntra_build.adapters.telegram")
@@ -62,6 +68,7 @@ class TelegramClient:
         *,
         transport: HTTPTransport = _stdlib_transport,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        metrics: MetricsRecorder | None = None,
     ) -> None:
         token = config.secrets.telegram_bot_token
         if not config.telegram.enabled:
@@ -73,6 +80,7 @@ class TelegramClient:
         self._poll_timeout = config.telegram.polling_timeout_seconds
         self._transport = transport
         self._clock = clock
+        self._metrics = metrics or NoOpMetricsRecorder()
 
     def poll_updates(
         self, *, offset: int | None = None
@@ -262,6 +270,27 @@ class TelegramClient:
         return self._decode_response(method, request, timeout)
 
     def _decode_response(self, method: str, request: Request, timeout: float) -> object:
+        try:
+            return self._decode_response_unrecorded(method, request, timeout)
+        except TelegramTransportError:
+            self._metrics.api_failure(
+                APIProvider.TELEGRAM, APIFailureClassification.TRANSPORT
+            )
+            raise
+        except TelegramAPIError:
+            self._metrics.api_failure(
+                APIProvider.TELEGRAM, APIFailureClassification.REJECTION
+            )
+            raise
+        except TelegramProtocolError:
+            self._metrics.api_failure(
+                APIProvider.TELEGRAM, APIFailureClassification.PROTOCOL
+            )
+            raise
+
+    def _decode_response_unrecorded(
+        self, method: str, request: Request, timeout: float
+    ) -> object:
         try:
             response = self._transport(request, timeout)
         except Exception as error:

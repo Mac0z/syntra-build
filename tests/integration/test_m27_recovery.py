@@ -26,7 +26,11 @@ from syntra_build.domain import (
     WorkerClass,
 )
 from syntra_build.domain.merges import MergeStrategy
-from syntra_build.domain.recovery import RecoveryDecision, RecoveryDisposition
+from syntra_build.domain.recovery import (
+    RecoveryDecision,
+    RecoveryDisposition,
+    RecoverySubject,
+)
 from syntra_build.infrastructure.config import SchedulerConfig
 from syntra_build.infrastructure.persistence import (
     MIGRATIONS,
@@ -433,5 +437,119 @@ def test_clean_lost_codex_queues_one_idempotent_replacement(tmp_path: Path) -> N
     assert len(replacements) == 1 and replacements[0]["state"] == "QUEUED"
     assert f'"replaces_job_id":"{job_id}"' in replacements[0]["payload_json"]
     assert db.execute("SELECT state FROM milestones").fetchone()[0] == "CODING"
+    scheduler.close()
+    db.close()
+
+
+def test_operational_health_tracks_real_recovery_and_drain(tmp_path: Path) -> None:
+    import urllib.error
+    import urllib.request
+
+    from syntra_build.application.operational_health import OperationalHealth
+    from syntra_build.domain.health import HealthState, ResourceSnapshot
+    from syntra_build.infrastructure.config.models import ResourceThresholdConfig
+    from syntra_build.infrastructure.health_http import HealthHTTPServer
+    from syntra_build.infrastructure.metrics import MetricsService
+
+    class Resources:
+        free = 50.0
+
+        def sample(self) -> ResourceSnapshot:
+            return ResourceSnapshot(
+                100, int(100 - self.free), int(self.free), self.free
+            )
+
+    database = tmp_path / "health-recovery.db"
+    db, _, _ = _seed(database, MilestoneState.PR_CREATING)
+    capacity = WorkerCapacity(SchedulerConfig().worker_class_limits())
+    scheduler = Scheduler(SQLiteJobRepository(db, lambda: "unused"), capacity, {})
+    resources = Resources()
+    health = OperationalHealth(resources, ResourceThresholdConfig())
+    observed: list[tuple[HealthState, bool, bool]] = []
+
+    def connect() -> sqlite3.Connection:
+        return sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+
+    server = HealthHTTPServer(
+        "127.0.0.1", 0, health, MetricsService(connect, health, capacity)
+    )
+    server.start()
+    host, port = server.address
+
+    def readiness() -> int:
+        try:
+            with urllib.request.urlopen(
+                f"http://{host}:{port}/ready", timeout=2
+            ) as response:
+                return int(response.status)
+        except urllib.error.HTTPError as error:
+            return int(error.code)
+
+    def inspect(subject: RecoverySubject, correlation_id: str) -> RecoveryDecision:
+        del subject, correlation_id
+        observed.append(
+            (
+                health.projection().state,
+                health.projection().ready,
+                scheduler.is_draining,
+            )
+        )
+        assert readiness() == 503
+        assert scheduler.run_once().dispatched == 0
+        return RecoveryDecision(
+            "PR_CREATING", RecoveryDisposition.BLOCKED, "controlled"
+        )
+
+    coordinator = RecoveryCoordinator(
+        db,
+        scheduler,
+        handlers={"PR_CREATING": inspect},
+        health_sink=health,
+    )
+    assert health.projection().state is HealthState.STARTING
+    assert not health.projection().ready
+    assert readiness() == 503
+    coordinator.recover()
+    assert observed == [(HealthState.RECOVERING, False, True)]
+    assert not scheduler.is_draining
+    assert health.projection().state is HealthState.HEALTHY
+    assert health.projection().ready
+    assert readiness() == 200
+
+    resources.free = 7
+    coordinator.recover()
+    assert health.projection().state is HealthState.DEGRADED
+    assert health.projection().ready
+    assert readiness() == 200
+    server.stop()
+    scheduler.close()
+    db.close()
+
+
+def test_global_recovery_failure_keeps_drain_and_health_unsafe(tmp_path: Path) -> None:
+    from syntra_build.application.operational_health import OperationalHealth
+    from syntra_build.domain.health import HealthReason, HealthState, ResourceSnapshot
+    from syntra_build.infrastructure.config.models import ResourceThresholdConfig
+
+    class Resources:
+        def sample(self) -> ResourceSnapshot:
+            return ResourceSnapshot(100, 50, 50, 50)
+
+    db, _, _ = _seed(tmp_path / "health-recovery-failure.db", MilestoneState.READY)
+    scheduler = _scheduler(db)
+    health = OperationalHealth(Resources(), ResourceThresholdConfig())
+    coordinator = RecoveryCoordinator(db, scheduler, health_sink=health)
+
+    def fail_discovery() -> tuple[RecoverySubject, ...]:
+        raise RuntimeError("synthetic global recovery failure")
+
+    coordinator.repository.discover = fail_discovery  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="synthetic global"):
+        coordinator.recover()
+    projection = health.projection()
+    assert projection.state is HealthState.UNHEALTHY
+    assert projection.ready is False
+    assert projection.reasons == (HealthReason.RECOVERY_FAILED,)
+    assert scheduler.is_draining
     scheduler.close()
     db.close()

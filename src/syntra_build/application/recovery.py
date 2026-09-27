@@ -130,11 +130,13 @@ class RecoveryCoordinator:
             with transaction(self.connection):
                 self.repository.finish(run_id, self.clock())
         except Exception as error:
+            # The process-wide safety projection must fail closed even if recording
+            # the failed recovery run encounters the same database outage.
+            if self.health_sink is not None:
+                self.health_sink.recovery_failed()
             with transaction(self.connection):
                 self.repository.finish(run_id, self.clock(), str(error))
             # A global database/coordinator failure keeps the drain barrier closed.
-            if self.health_sink is not None:
-                self.health_sink.recovery_failed()
             raise
         self.lifecycle = RecoveryLifecycle.READY
         self.scheduler.exit_drain()

@@ -38,6 +38,14 @@ disk free is below 20/10/5, or API failure rate is elevated.
 
 Run `python -m syntra_build.m29_smoke` for a bounded loopback probe, or
 `python -m syntra_build.m29_smoke --serve-seconds 60` for a bounded host scrape.
-The command uses host configuration and schema 25 without dispatching or mutation.
+The command loads `/etc/syntra-build/config.json` and the normal protected secret
+files through `load_host_config`. Probe mode intentionally replaces the configured
+port with an ephemeral port; serve mode uses the configured bind address and port.
+It refuses to run when `metrics.enabled` is false unless the operator explicitly adds
+`--allow-disabled`. Alternate protected paths may be supplied with `--config`,
+`--telegram-token`, `--github-token`, and `--architect-key` without printing secrets.
+The command uses schema 25 without dispatching or mutation. Its capacity gauges are
+acceptance-process limits; a composed runtime must pass the same `WorkerCapacity`
+instance to both `Scheduler` and `MetricsService`.
 M30 retains ownership of daemon/systemd lifecycle, graceful shutdown, backup/restore,
 and administrative CLI behavior.

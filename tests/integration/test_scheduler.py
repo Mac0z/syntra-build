@@ -9,6 +9,8 @@ from threading import Condition, Event
 
 import pytest
 
+from syntra_build.application.dispatch_guard import DiskDispatchGuard
+from syntra_build.application.operational_health import ResourceSampler
 from syntra_build.application.scheduler import (
     JobExecutionDisposition,
     JobExecutionResult,
@@ -31,7 +33,10 @@ from syntra_build.domain.failures import (
     RetryBackoffPolicy,
     TransientFailure,
 )
+from syntra_build.domain.health import ResourceSnapshot
 from syntra_build.infrastructure.config import SchedulerConfig
+from syntra_build.infrastructure.config.models import ResourceThresholdConfig
+from syntra_build.infrastructure.metrics import PrometheusRecorder
 from syntra_build.infrastructure.persistence import (
     SQLiteJobRepository,
     SQLiteProjectRepository,
@@ -41,6 +46,16 @@ from syntra_build.infrastructure.persistence import (
 from syntra_build.infrastructure.persistence.jobs import SchedulableJob
 
 NOW = datetime(2026, 9, 8, 12, tzinfo=UTC)
+
+
+@dataclass
+class FixedResources(ResourceSampler):
+    free_percent: float
+
+    def sample(self) -> ResourceSnapshot:
+        return ResourceSnapshot(
+            100, int(100 - self.free_percent), int(self.free_percent), self.free_percent
+        )
 
 
 def capacities(**overrides: int) -> WorkerCapacity:
@@ -698,3 +713,94 @@ def test_rework_job_returns_behind_waiting_project(tmp_path: Path) -> None:
     scheduler.run_once()
     scheduler.close()
     db.close()
+
+
+def test_disk_stop_guard_operates_at_scheduler_boundary(tmp_path: Path) -> None:
+    connection, _, jobs, project_id = database(tmp_path / "guard-stop.db")
+    codex_id = add_job(jobs, project_id, worker_class=WorkerClass.CODEX)
+    message_id = add_job(jobs, project_id, worker_class=WorkerClass.MESSAGING)
+    codex_executor, message_executor = RecordingExecutor(), RecordingExecutor()
+    capacity = capacities()
+    metrics = PrometheusRecorder()
+    scheduler = Scheduler(
+        jobs,
+        capacity,
+        {
+            WorkerClass.CODEX: codex_executor,
+            WorkerClass.MESSAGING: message_executor,
+        },
+        clock=lambda: NOW,
+        dispatch_guard=DiskDispatchGuard(FixedResources(7), ResourceThresholdConfig()),
+        metrics=metrics,
+    )
+    result = scheduler.run_once()
+    assert result.skipped_resource == 1
+    assert jobs.get(codex_id).state is JobState.QUEUED
+    assert codex_executor.calls == []
+    assert capacity.in_use(WorkerClass.CODEX) == 0
+    assert metrics.guard_denials == {"DISK_CODEX_STOP": 1}
+    assert message_executor.wait_for_calls(1)
+    assert jobs.get(message_id).state is JobState.RUNNING
+    scheduler.close()
+    connection.close()
+
+
+def test_critical_guard_blocks_all_implementation_but_not_control(
+    tmp_path: Path,
+) -> None:
+    connection, _, jobs, project_id = database(tmp_path / "guard-critical.db")
+    implementation = {
+        worker: add_job(jobs, project_id, worker_class=worker)
+        for worker in (
+            WorkerClass.CODEX,
+            WorkerClass.ARCHITECT,
+            WorkerClass.GIT,
+            WorkerClass.GITHUB,
+            WorkerClass.CI,
+        )
+    }
+    running_id = add_job(
+        jobs, project_id, worker_class=WorkerClass.CODEX, state=JobState.RUNNING
+    )
+    message_id = add_job(jobs, project_id, worker_class=WorkerClass.MESSAGING)
+    message_executor = RecordingExecutor()
+    capacity = capacities()
+    metrics = PrometheusRecorder()
+    scheduler = Scheduler(
+        jobs,
+        capacity,
+        {WorkerClass.MESSAGING: message_executor},
+        clock=lambda: NOW,
+        dispatch_guard=DiskDispatchGuard(FixedResources(4), ResourceThresholdConfig()),
+        metrics=metrics,
+    )
+    result = scheduler.run_once()
+    assert result.skipped_resource == 5
+    assert all(
+        jobs.get(job_id).state is JobState.QUEUED for job_id in implementation.values()
+    )
+    assert jobs.get(running_id).state is JobState.RUNNING
+    assert message_executor.wait_for_calls(1)
+    assert jobs.get(message_id).state is JobState.RUNNING
+    assert metrics.guard_denials == {"DISK_CRITICAL": 5}
+    scheduler.close()
+    connection.close()
+
+
+def test_disk_guard_allows_codex_above_stop_threshold(tmp_path: Path) -> None:
+    connection, _, jobs, project_id = database(tmp_path / "guard-healthy.db")
+    job_id = add_job(jobs, project_id, worker_class=WorkerClass.CODEX)
+    executor = RecordingExecutor()
+    capacity = capacities()
+    scheduler = Scheduler(
+        jobs,
+        capacity,
+        {WorkerClass.CODEX: executor},
+        clock=lambda: NOW,
+        dispatch_guard=DiskDispatchGuard(FixedResources(11), ResourceThresholdConfig()),
+    )
+    assert scheduler.run_once().dispatched == 1
+    assert executor.wait_for_calls(1)
+    assert jobs.get(job_id).state is JobState.RUNNING
+    scheduler.close()
+    connection.close()

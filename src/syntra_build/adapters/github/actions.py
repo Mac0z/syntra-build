@@ -13,6 +13,12 @@ from syntra_build.adapters.github.repository_names import (
     GitHubTransport,
     _stdlib_transport,
 )
+from syntra_build.application.metrics import (
+    APIFailureClassification,
+    APIProvider,
+    MetricsRecorder,
+    NoOpMetricsRecorder,
+)
 from syntra_build.domain.ci import (
     CICheck,
     CICheckConclusion,
@@ -43,6 +49,7 @@ class GitHubActionsAdapter:
         config: ApplicationConfig,
         *,
         transport: GitHubTransport = _stdlib_transport,
+        metrics: MetricsRecorder | None = None,
     ) -> None:
         token = config.secrets.github_token
         if not config.github.enabled or token is None:
@@ -52,8 +59,26 @@ class GitHubActionsAdapter:
         self._token = token.value
         self._timeout = config.github.api_timeout_seconds
         self._transport = transport
+        self._metrics = metrics or NoOpMetricsRecorder()
 
     def _request(self, method: str, path: str) -> Mapping[str, object] | None:
+        try:
+            return self._request_unrecorded(method, path)
+        except CIProviderError as error:
+            classifications = {
+                CIProviderFailure.AUTHENTICATION: APIFailureClassification.AUTHENTICATION,
+                CIProviderFailure.REJECTION: APIFailureClassification.REJECTION,
+                CIProviderFailure.TRANSIENT: APIFailureClassification.TRANSIENT,
+                CIProviderFailure.MALFORMED: APIFailureClassification.MALFORMED,
+            }
+            self._metrics.api_failure(
+                APIProvider.GITHUB, classifications[error.failure]
+            )
+            raise
+
+    def _request_unrecorded(
+        self, method: str, path: str
+    ) -> Mapping[str, object] | None:
         request = Request(
             f"{_API_ROOT}{path}",
             method=method,

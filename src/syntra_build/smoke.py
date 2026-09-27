@@ -33,6 +33,7 @@ from syntra_build.application.commands.models import Command, InboundMessage
 from syntra_build.application.commands.router import CommandRouter
 from syntra_build.application.commands.services import (
     CommandAuditRequest,
+    LocalHealthService,
     ProjectCommandResult,
     ProjectResolution,
     ProjectSummary,
@@ -139,6 +140,7 @@ def build_host_router(
     connection: sqlite3.Connection,
     *,
     github_transport: GitHubTransport | None = None,
+    health: LocalHealthService | None = None,
 ) -> CommandRouter:
     """Compose the durable M14 services used by real Telegram host routing."""
     projects = SQLiteProjectRepository(connection, lambda: str(uuid4()))
@@ -173,7 +175,7 @@ def build_host_router(
         project_queries=status,
         project_commands=_UnavailableProjectCommands(),
         audit_sink=_NoopAudit(),
-        health=_LocalHealth(),
+        health=health or _LocalHealth(),
         project_creation=creation,
         gate_commands=gate_commands,
         status_service=status,
