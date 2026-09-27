@@ -1158,6 +1158,48 @@ MIGRATIONS: tuple[Migration, ...] = (
                 BEGIN SELECT RAISE(ABORT,'Gatekeeper results are preservation-oriented'); END""",
         ),
     ),
+    Migration(
+        version=25,
+        name="025_recovery_observations",
+        statements=(
+            """CREATE TABLE recovery_runs (
+                id TEXT PRIMARY KEY,
+                correlation_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('RECOVERING','READY','FAILED')),
+                started_at TEXT NOT NULL, completed_at TEXT, error_detail TEXT,
+                CHECK((status='RECOVERING' AND completed_at IS NULL)
+                   OR (status IN ('READY','FAILED') AND completed_at IS NOT NULL))
+            ) STRICT""",
+            """CREATE TABLE recovery_observations (
+                id TEXT PRIMARY KEY,
+                recovery_run_id TEXT NOT NULL REFERENCES recovery_runs(id),
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                milestone_id TEXT, job_id TEXT,
+                category TEXT NOT NULL,
+                persisted_state TEXT NOT NULL,
+                observed_state_json TEXT NOT NULL CHECK(json_valid(observed_state_json)),
+                disposition TEXT NOT NULL CHECK(disposition IN
+                    ('RECONCILED','SAFE_RETRY','RESTORED_WAIT','ABANDONED',
+                     'BLOCKED','NO_ACTION','UNKNOWN')),
+                resulting_action TEXT NOT NULL,
+                correlation_id TEXT NOT NULL,
+                reason_detail TEXT,
+                observed_at TEXT NOT NULL,
+                FOREIGN KEY(project_id,milestone_id) REFERENCES milestones(project_id,id),
+                FOREIGN KEY(project_id,job_id) REFERENCES jobs(project_id,id)
+            ) STRICT""",
+            "CREATE INDEX recovery_observations_run ON recovery_observations(recovery_run_id,observed_at,id)",
+            "CREATE INDEX recovery_observations_project ON recovery_observations(project_id,observed_at,id)",
+            """CREATE TRIGGER recovery_observations_no_update BEFORE UPDATE
+                ON recovery_observations BEGIN
+                SELECT RAISE(ABORT,'recovery observations are append-only'); END""",
+            """CREATE TRIGGER recovery_observations_no_delete BEFORE DELETE
+                ON recovery_observations BEGIN
+                SELECT RAISE(ABORT,'recovery observations are preservation-oriented'); END""",
+            """CREATE TRIGGER recovery_runs_no_delete BEFORE DELETE ON recovery_runs
+                BEGIN SELECT RAISE(ABORT,'recovery runs are preservation-oriented'); END""",
+        ),
+    ),
 )
 
 

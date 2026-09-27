@@ -14,7 +14,7 @@ from syntra_build.infrastructure.persistence import (
 
 def test_clean_database_migrates_through_024(tmp_path: Path) -> None:
     with open_database(tmp_path / "m26.db") as db:
-        apply_migrations(db)
+        apply_migrations(db, MIGRATIONS[:24])
         assert current_schema_version(db) == 24
         names = {
             row[0]
@@ -53,7 +53,7 @@ def test_genuine_023_upgrade_preserves_m25_data_and_builds_m26_constraints(
         assert "merge_eligibility_results" not in existing
         assert "merge_attempts" not in existing
 
-        apply_migrations(db)
+        apply_migrations(db, MIGRATIONS[:24])
 
         after = {
             name: tuple(
