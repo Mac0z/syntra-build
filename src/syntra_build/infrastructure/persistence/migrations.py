@@ -1116,17 +1116,16 @@ MIGRATIONS: tuple[Migration, ...] = (
         name="024_deterministic_merge",
         statements=(
             """CREATE TABLE merge_eligibility_results (
-                id TEXT PRIMARY KEY, correlation_id TEXT NOT NULL,
-                project_id TEXT NOT NULL REFERENCES projects(id),
-                milestone_id TEXT NOT NULL REFERENCES milestones(id),
-                pull_request_id TEXT NOT NULL REFERENCES pull_requests(id),
-                repository_id INTEGER NOT NULL, pull_request_number INTEGER NOT NULL,
+                id TEXT PRIMARY KEY, interface_version TEXT NOT NULL CHECK(interface_version='1.0'),
+                correlation_id TEXT NOT NULL, project_id TEXT NOT NULL,
+                milestone_id TEXT NOT NULL, github_repository_id TEXT NOT NULL,
+                pull_request_id TEXT NOT NULL, repository_id INTEGER NOT NULL,
+                pull_request_number INTEGER NOT NULL,
                 head_sha TEXT NOT NULL CHECK(length(head_sha)=40),
                 eligible INTEGER NOT NULL CHECK(eligible IN (0,1)),
                 guards_json TEXT NOT NULL CHECK(json_valid(guards_json)),
-                evaluated_at TEXT NOT NULL,
-                FOREIGN KEY(project_id,milestone_id,pull_request_id)
-                    REFERENCES pull_requests(project_id,milestone_id,id)
+                evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json)),
+                evaluated_at TEXT NOT NULL
             ) STRICT""",
             """CREATE TABLE merge_attempts (
                 id TEXT PRIMARY KEY, project_id TEXT NOT NULL,

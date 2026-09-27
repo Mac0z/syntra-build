@@ -18,3 +18,22 @@ Migration 024 is forward-only and creates `merge_eligibility_results` and
 while retaining schema 024 is not supported by the migration runner; operational
 recovery should restore a pre-migration database backup together with the earlier
 application revision. No existing table or M1–M25 record is rewritten.
+
+## Bounded host acceptance
+
+Run the real M26 path for an already persisted project, milestone, and PR whose CI,
+Architect review, findings, and human gates are already authoritative:
+
+```bash
+python -m syntra_build.m26_smoke \
+  --database /var/lib/syntra-build/syntra.db \
+  --project-id <project-uuid> \
+  --milestone-id <milestone-uuid> \
+  --pull-request-id <internal-pr-id> \
+  --correlation-id <stable-correlation-id> \
+  --strategy SQUASH
+```
+
+The runner derives repository, PR, branch, and SHA identity from persistence. It
+performs one bounded evaluation/prepare/execute/verify sequence and never creates
+or alters CI, Architect, finding, or human-gate evidence.

@@ -1,3 +1,4 @@
+# mypy: disable-error-code="no-untyped-def,no-untyped-call,arg-type"
 from __future__ import annotations
 
 import json
@@ -111,3 +112,89 @@ def test_create_422_is_a_body_independent_reconciliation_signal(tmp_path: Path) 
     with pytest.raises(PullRequestCreateConflict) as conflict:
         adapter.create("owner/repo", request)
     assert "synthetic secret" not in str(conflict.value)
+
+
+def _merge_request(strategy):
+    from syntra_build.domain.merges import MERGE_INTERFACE_VERSION, MergeRequest
+
+    return MergeRequest(
+        MERGE_INTERFACE_VERSION,
+        "corr",
+        ProjectId.generate(),
+        MilestoneId.generate(),
+        77,
+        12,
+        "a" * 40,
+        strategy,
+        "gate-result",
+    )
+
+
+@pytest.mark.parametrize(
+    ("strategy", "provider_value"),
+    [
+        ("SQUASH", "squash"),
+        ("MERGE", "merge"),
+        ("REBASE", "rebase"),
+    ],
+)
+def test_merge_sends_exact_sha_and_strategy(
+    tmp_path: Path, strategy: str, provider_value: str
+) -> None:
+    from syntra_build.domain.merges import MergeStatus, MergeStrategy
+
+    seen: list[Request] = []
+
+    def transport(request: Request, timeout: float) -> GitHubHTTPResponse:
+        seen.append(request)
+        return GitHubHTTPResponse(
+            200, b'{"merged":true,"sha":"cccccccccccccccccccccccccccccccccccccccc"}'
+        )
+
+    result = GitHubPullRequestAdapter(_config(tmp_path), transport=transport).merge(
+        "owner/repo", _merge_request(MergeStrategy(strategy))
+    )
+    payload = json.loads(seen[0].data or b"{}")
+    assert seen[0].method == "PUT"
+    assert payload == {"sha": "a" * 40, "merge_method": provider_value}
+    assert result.status is MergeStatus.MERGED
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (403, "REJECTED"),
+        (409, "CONFLICT"),
+        (422, "REJECTED"),
+        (200, "NOT_MERGED"),
+    ],
+)
+def test_merge_maps_known_provider_outcomes(
+    tmp_path: Path, status: int, expected: str
+) -> None:
+    from syntra_build.domain.merges import MergeStrategy
+
+    body = b'{"merged":false}'
+    result = GitHubPullRequestAdapter(
+        _config(tmp_path), transport=lambda _r, _t: GitHubHTTPResponse(status, body)
+    ).merge("owner/repo", _merge_request(MergeStrategy.SQUASH))
+    assert result.status.value == expected
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [
+        lambda _r, _t: (_ for _ in ()).throw(TimeoutError()),
+        lambda _r, _t: GitHubHTTPResponse(500, b"{}"),
+        lambda _r, _t: GitHubHTTPResponse(200, b"not-json"),
+    ],
+)
+def test_merge_timeout_5xx_and_malformed_response_are_ambiguous(
+    tmp_path: Path, transport
+) -> None:
+    from syntra_build.application.provisioning import AmbiguousGitHubResult
+    from syntra_build.domain.merges import MergeStrategy
+
+    adapter = GitHubPullRequestAdapter(_config(tmp_path), transport=transport)
+    with pytest.raises(AmbiguousGitHubResult):
+        adapter.merge("owner/repo", _merge_request(MergeStrategy.SQUASH))

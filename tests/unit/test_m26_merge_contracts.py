@@ -8,6 +8,7 @@ from syntra_build.domain.identifiers import MilestoneId, ProjectId
 from syntra_build.domain.merges import (
     MERGE_INTERFACE_VERSION,
     MergeEligibilityResult,
+    MergeEvidence,
     MergeGuardResult,
     MergeRequest,
     MergeStatus,
@@ -53,6 +54,7 @@ def test_merge_request_requires_typed_strategy_and_exact_sha() -> None:
 def test_eligibility_cannot_disagree_with_individual_guards() -> None:
     with pytest.raises(DomainValidationError):
         MergeEligibilityResult(
+            MERGE_INTERFACE_VERSION,
             "result",
             "correlation",
             _project(),
@@ -62,7 +64,27 @@ def test_eligibility_cannot_disagree_with_individual_guards() -> None:
             "a" * 40,
             True,
             (MergeGuardResult("required_ci", False, "current_ci_not_passed"),),
+            MergeEvidence(None, None, None, None),
             datetime.now(UTC),
+        )
+
+
+def test_eligibility_contracts_reject_unknown_versions() -> None:
+    from syntra_build.domain.merges import MergeEligibilityRequest
+
+    with pytest.raises(DomainValidationError):
+        MergeEligibilityRequest(
+            "2.0",
+            "correlation",
+            _project(),
+            _milestone(),
+            "repo",
+            42,
+            "pr",
+            7,
+            "head",
+            "main",
+            "a" * 40,
         )
 
 

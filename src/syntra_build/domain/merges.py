@@ -34,6 +34,7 @@ class MergeStatus(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class MergeEligibilityRequest:
+    interface_version: str
     correlation_id: str
     project_id: ProjectId
     milestone_id: MilestoneId
@@ -46,6 +47,8 @@ class MergeEligibilityRequest:
     expected_head_sha: str
 
     def __post_init__(self) -> None:
+        if self.interface_version != MERGE_INTERFACE_VERSION:
+            raise DomainValidationError("unsupported merge interface_version")
         require_text(self.correlation_id, "correlation_id")
         require_identifier(self.project_id, ProjectId, "project_id")
         require_identifier(self.milestone_id, MilestoneId, "milestone_id")
@@ -82,6 +85,7 @@ class MergeGuardResult:
 
 @dataclass(frozen=True, slots=True)
 class MergeEligibilityResult:
+    interface_version: str
     result_id: str
     correlation_id: str
     project_id: ProjectId
@@ -91,9 +95,12 @@ class MergeEligibilityResult:
     head_sha: str
     eligible: bool
     guards: tuple[MergeGuardResult, ...]
+    evidence: MergeEvidence
     evaluated_at: datetime
 
     def __post_init__(self) -> None:
+        if self.interface_version != MERGE_INTERFACE_VERSION:
+            raise DomainValidationError("unsupported merge interface_version")
         require_text(self.result_id, "result_id")
         require_text(self.correlation_id, "correlation_id")
         require_identifier(self.project_id, ProjectId, "project_id")
@@ -111,6 +118,37 @@ class MergeEligibilityResult:
             raise DomainValidationError(
                 "eligible must equal the combined guard results"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class MergeEvidence:
+    """Stable identifiers for the trusted records used by one evaluation."""
+
+    github_repository_id: str | None
+    pull_request_id: str | None
+    ci_run_id: str | None
+    architect_review_id: str | None
+    human_gate_ids: tuple[str, ...] = ()
+    human_response_ids: tuple[str, ...] = ()
+    human_test_gate_id: str | None = None
+    human_test_result_id: str | None = None
+    human_test_ci_run_id: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "github_repository_id",
+            "pull_request_id",
+            "ci_run_id",
+            "architect_review_id",
+            "human_test_gate_id",
+            "human_test_result_id",
+            "human_test_ci_run_id",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                require_text(value, name)
+        for value in (*self.human_gate_ids, *self.human_response_ids):
+            require_text(value, "evidence identifier")
 
 
 @dataclass(frozen=True, slots=True)

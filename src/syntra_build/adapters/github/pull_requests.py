@@ -215,11 +215,23 @@ class GitHubPullRequestAdapter:
         merge_method = {"SQUASH": "squash", "MERGE": "merge", "REBASE": "rebase"}[
             request.merge_strategy.value
         ]
-        status, payload = self._request(
-            "PUT",
-            f"{self._repo_path(repository_full_name)}/pulls/{request.pull_request_number}/merge",
-            {"sha": request.expected_head_sha, "merge_method": merge_method},
-        )
+        try:
+            status, payload = self._request(
+                "PUT",
+                f"{self._repo_path(repository_full_name)}/pulls/{request.pull_request_number}/merge",
+                {"sha": request.expected_head_sha, "merge_method": merge_method},
+            )
+        except PullRequestError as error:
+            if error.failure is PullRequestFailure.AUTHENTICATION:
+                return MergeResult(
+                    MERGE_INTERFACE_VERSION,
+                    request.project_id,
+                    request.milestone_id,
+                    request.pull_request_number,
+                    MergeStatus.REJECTED,
+                    detail="GitHub authentication or policy rejected merge",
+                )
+            raise
         if status == 409:
             outcome = MergeStatus.CONFLICT
         elif status in {405, 422}:
