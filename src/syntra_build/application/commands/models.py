@@ -12,6 +12,7 @@ class CommandType(StrEnum):
     PING = "PING"
     HEALTH = "HEALTH"
     LIST_PROJECTS = "LIST_PROJECTS"
+    ACTIVE_PROJECTS = "ACTIVE_PROJECTS"
     PROJECT_STATUS = "PROJECT_STATUS"
     PAUSE_PROJECT = "PAUSE_PROJECT"
     RESUME_PROJECT = "RESUME_PROJECT"
@@ -25,6 +26,7 @@ READ_ONLY_COMMANDS = frozenset(
         CommandType.PING,
         CommandType.HEALTH,
         CommandType.LIST_PROJECTS,
+        CommandType.ACTIVE_PROJECTS,
         CommandType.PROJECT_STATUS,
         CommandType.WAITING,
     }

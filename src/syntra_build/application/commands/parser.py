@@ -30,6 +30,7 @@ _COMMANDS = {
     "ping": (CommandType.PING, False),
     "health": (CommandType.HEALTH, False),
     "projects": (CommandType.LIST_PROJECTS, False),
+    "active": (CommandType.ACTIVE_PROJECTS, False),
     "status": (CommandType.PROJECT_STATUS, True),
     "pause": (CommandType.PAUSE_PROJECT, True),
     "resume": (CommandType.RESUME_PROJECT, True),

@@ -280,16 +280,34 @@ def test_invalid_input_returns_help_without_services(text: str) -> None:
     assert health.calls == 0
 
 
-def test_unknown_input_does_not_invoke_future_intent_resolution() -> None:
-    future_resolver = FutureIntentResolver()
+def test_unknown_input_without_resolver_returns_help() -> None:
     router, queries, commands, audit, health = make_router()
 
     assert router.route(inbound("what is happening with FlowTrack")).text == HELP_TEXT
 
-    assert "intent_resolver" not in signature(CommandRouter).parameters
-    assert future_resolver.calls == 0
+    assert "intent_resolver" in signature(CommandRouter).parameters
     assert not queries.calls and not commands.calls and not audit.requests
     assert health.calls == 0
+
+
+def test_malformed_known_command_bypasses_intent_resolver() -> None:
+    resolver = FutureIntentResolver()
+    queries, commands, audit, health = (
+        FakeQueries(),
+        FakeCommands(),
+        FakeAudit(),
+        FakeHealth(),
+    )
+    router = CommandRouter(
+        project_queries=queries,
+        project_commands=commands,
+        audit_sink=audit,
+        health=health,
+        parser=CommandParser(lambda: "correlation-6"),
+        intent_resolver=resolver,
+    )
+    assert router.route(inbound("status")).text == HELP_TEXT
+    assert resolver.calls == 0
 
 
 def test_duplicate_source_is_neutral_and_routes_twice() -> None:
