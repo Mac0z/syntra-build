@@ -33,6 +33,7 @@ from syntra_build.application.commands.models import Command, InboundMessage
 from syntra_build.application.commands.router import CommandRouter
 from syntra_build.application.commands.services import (
     CommandAuditRequest,
+    LocalHealthService,
     ProjectCommandResult,
     ProjectResolution,
     ProjectSummary,
@@ -40,6 +41,10 @@ from syntra_build.application.commands.services import (
 )
 from syntra_build.application.gates import HumanGateCommandHandler, HumanGateService
 from syntra_build.application.human_intervention import HumanInterventionService
+from syntra_build.application.operational_health import (
+    LocalResourceSampler,
+    OperationalHealth,
+)
 from syntra_build.application.projects import ProjectCreationService
 from syntra_build.application.specification import DesignPackageDecisionHandler
 from syntra_build.application.status import (
@@ -139,6 +144,7 @@ def build_host_router(
     connection: sqlite3.Connection,
     *,
     github_transport: GitHubTransport | None = None,
+    health: LocalHealthService | None = None,
 ) -> CommandRouter:
     """Compose the durable M14 services used by real Telegram host routing."""
     projects = SQLiteProjectRepository(connection, lambda: str(uuid4()))
@@ -173,11 +179,47 @@ def build_host_router(
         project_queries=status,
         project_commands=_UnavailableProjectCommands(),
         audit_sink=_NoopAudit(),
-        health=_LocalHealth(),
+        health=health or _LocalHealth(),
         project_creation=creation,
         gate_commands=gate_commands,
         status_service=status,
         intent_resolver=ReadOnlyStatusIntentResolver(),
+    )
+
+
+def build_host_operational_health(config: ApplicationConfig) -> OperationalHealth:
+    """Build truthful local health for an already-initialized bounded host run."""
+
+    def database_available() -> bool:
+        try:
+            with sqlite3.connect(
+                f"file:{config.database.sqlite_path}?mode=ro", uri=True
+            ) as connection:
+                return bool(connection.execute("SELECT 1").fetchone() == (1,))
+        except sqlite3.Error:
+            return False
+
+    health = OperationalHealth(
+        LocalResourceSampler(config.filesystem.data_root),
+        config.security,
+        database_available,
+    )
+    health.running()
+    return health
+
+
+def build_m29_host_router(
+    config: ApplicationConfig,
+    connection: sqlite3.Connection,
+    *,
+    github_transport: GitHubTransport | None = None,
+) -> CommandRouter:
+    """Compose the bounded real host router with truthful M29 local health."""
+    return build_host_router(
+        config,
+        connection,
+        github_transport=github_transport,
+        health=build_host_operational_health(config),
     )
 
 
@@ -383,7 +425,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 telegram = TelegramClient(config)
                 count = run_telegram_once(
                     telegram,
-                    build_host_router(config, connection),
+                    build_m29_host_router(config, connection),
                     SQLiteProviderCursorRepository(connection),
                     TelegramDesignApprovalHandler(
                         connection,

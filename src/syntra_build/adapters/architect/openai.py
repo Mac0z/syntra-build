@@ -7,9 +7,15 @@ import json
 import urllib.error
 import urllib.request
 from collections.abc import Callable
-from typing import cast
+from typing import TypeVar, cast
 
 from syntra_build.application.architect import ArchitectError, ArchitectFailureKind
+from syntra_build.application.metrics import (
+    APIFailureClassification,
+    APIProvider,
+    MetricsRecorder,
+    NoOpMetricsRecorder,
+)
 from syntra_build.domain import (
     ArchitectDesignRequest,
     ArchitectDesignResponse,
@@ -210,6 +216,7 @@ REVIEW_SCHEMA: dict[str, object] = {
     },
 }
 Transport = Callable[[dict[str, object], str, float], dict[str, object]]
+_T = TypeVar("_T")
 
 
 class OpenAIArchitectProvider:
@@ -223,6 +230,7 @@ class OpenAIArchitectProvider:
         reasoning_effort: str = "high",
         timeout_seconds: float = 600.0,
         transport: Transport | None = None,
+        metrics: MetricsRecorder | None = None,
     ) -> None:
         if not api_key or not model or timeout_seconds <= 0:
             raise ArchitectError(
@@ -235,8 +243,12 @@ class OpenAIArchitectProvider:
         self._timeout = timeout_seconds
         self._transport = transport or self._http
         self._usage: dict[str, int | str | None] = {}
+        self._metrics = metrics or NoOpMetricsRecorder()
 
     def design(self, request: ArchitectDesignRequest) -> ArchitectDesignResponse:
+        return self._recorded(lambda: self._design(request))
+
+    def _design(self, request: ArchitectDesignRequest) -> ArchitectDesignResponse:
         payload: dict[str, object] = {
             "model": self.model,
             "reasoning": {"effort": self._reasoning_effort},
@@ -333,6 +345,11 @@ class OpenAIArchitectProvider:
     def draft_specification(
         self, request: SpecificationDraftRequest
     ) -> SpecificationDraft:
+        return self._recorded(lambda: self._draft_specification(request))
+
+    def _draft_specification(
+        self, request: SpecificationDraftRequest
+    ) -> SpecificationDraft:
         """Produce bounded source-of-truth drafts without granting provider capabilities."""
         payload: dict[str, object] = {
             "model": self.model,
@@ -375,6 +392,9 @@ class OpenAIArchitectProvider:
         return response
 
     def review(self, request: ArchitectReviewRequest) -> ArchitectReview:
+        return self._recorded(lambda: self._review(request))
+
+    def _review(self, request: ArchitectReviewRequest) -> ArchitectReview:
         """Review supplied evidence only; the provider receives no GitHub capability."""
         payload: dict[str, object] = {
             "model": self.model,
@@ -489,6 +509,25 @@ class OpenAIArchitectProvider:
 
     def telemetry(self) -> dict[str, int | str | None]:
         return dict(self._usage)
+
+    def _recorded(self, operation: Callable[[], _T]) -> _T:
+        """Count one already-normalised failure per public provider operation."""
+        try:
+            return operation()
+        except ArchitectError as error:
+            classification = {
+                ArchitectFailureKind.CONFIGURATION: APIFailureClassification.AUTHENTICATION,
+                ArchitectFailureKind.TIMEOUT: APIFailureClassification.TRANSIENT,
+                ArchitectFailureKind.TRANSIENT_PROVIDER: APIFailureClassification.TRANSIENT,
+                ArchitectFailureKind.THROTTLED: APIFailureClassification.TRANSIENT,
+                ArchitectFailureKind.PERMANENT_PROVIDER: APIFailureClassification.REJECTION,
+                ArchitectFailureKind.MALFORMED_RESPONSE: APIFailureClassification.MALFORMED,
+                ArchitectFailureKind.REFUSAL: APIFailureClassification.REJECTION,
+                ArchitectFailureKind.INCOMPLETE_RESPONSE: APIFailureClassification.PROTOCOL,
+                ArchitectFailureKind.INVALID_REQUEST: APIFailureClassification.PROTOCOL,
+            }[error.kind]
+            self._metrics.api_failure(APIProvider.ARCHITECT, classification)
+            raise
 
     @staticmethod
     def _http(

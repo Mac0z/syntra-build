@@ -8,7 +8,7 @@ import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Final
+from typing import Final, TypeVar
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -27,6 +27,12 @@ from syntra_build.adapters.telegram.models import (
     TelegramSentMessage,
     TelegramUpdateDisposition,
 )
+from syntra_build.application.metrics import (
+    APIFailureClassification,
+    APIProvider,
+    MetricsRecorder,
+    NoOpMetricsRecorder,
+)
 from syntra_build.infrastructure.config import ApplicationConfig
 
 _LOGGER = logging.getLogger("syntra_build.adapters.telegram")
@@ -43,6 +49,7 @@ class HTTPResponse:
 
 
 HTTPTransport = Callable[[Request, float], HTTPResponse]
+_T = TypeVar("_T")
 
 
 def _stdlib_transport(request: Request, timeout: float) -> HTTPResponse:
@@ -62,6 +69,7 @@ class TelegramClient:
         *,
         transport: HTTPTransport = _stdlib_transport,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        metrics: MetricsRecorder | None = None,
     ) -> None:
         token = config.secrets.telegram_bot_token
         if not config.telegram.enabled:
@@ -73,8 +81,14 @@ class TelegramClient:
         self._poll_timeout = config.telegram.polling_timeout_seconds
         self._transport = transport
         self._clock = clock
+        self._metrics = metrics or NoOpMetricsRecorder()
 
     def poll_updates(
+        self, *, offset: int | None = None
+    ) -> tuple[TelegramPolledUpdate, ...]:
+        return self._recorded(lambda: self._poll_updates(offset=offset))
+
+    def _poll_updates(
         self, *, offset: int | None = None
     ) -> tuple[TelegramPolledUpdate, ...]:
         """Fetch updates, retaining IDs while enforcing authorization locally."""
@@ -163,6 +177,25 @@ class TelegramClient:
         reply_to_message_id: int | None = None,
         reply_markup: Mapping[str, object] | None = None,
     ) -> TelegramSentMessage:
+        return self._recorded(
+            lambda: self._send_text(
+                chat_id=chat_id,
+                text=text,
+                thread_id=thread_id,
+                reply_to_message_id=reply_to_message_id,
+                reply_markup=reply_markup,
+            )
+        )
+
+    def _send_text(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        thread_id: int | None = None,
+        reply_to_message_id: int | None = None,
+        reply_markup: Mapping[str, object] | None = None,
+    ) -> TelegramSentMessage:
         """Send one plain-text message and return its stable provider reference."""
         parameters: dict[str, object] = {"chat_id": chat_id, "text": text}
         if thread_id is not None:
@@ -190,12 +223,38 @@ class TelegramClient:
         return sent
 
     def answer_callback(self, callback_query_id: str, text: str | None = None) -> None:
+        self._recorded(lambda: self._answer_callback(callback_query_id, text))
+
+    def _answer_callback(self, callback_query_id: str, text: str | None = None) -> None:
         parameters: dict[str, object] = {"callback_query_id": callback_query_id}
         if text:
             parameters["text"] = text
         self._request("answerCallbackQuery", parameters, _TRANSPORT_OVERHEAD_SECONDS)
 
     def send_document(
+        self,
+        *,
+        chat_id: int,
+        content: bytes,
+        filename: str,
+        mime_type: str,
+        caption: str | None = None,
+        thread_id: int | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> TelegramSentMessage:
+        return self._recorded(
+            lambda: self._send_document(
+                chat_id=chat_id,
+                content=content,
+                filename=filename,
+                mime_type=mime_type,
+                caption=caption,
+                thread_id=thread_id,
+                reply_to_message_id=reply_to_message_id,
+            )
+        )
+
+    def _send_document(
         self,
         *,
         chat_id: int,
@@ -306,6 +365,26 @@ class TelegramClient:
         if "result" not in envelope:
             raise TelegramProtocolError("Telegram response is missing result")
         return envelope["result"]
+
+    def _recorded(self, operation: Callable[[], _T]) -> _T:
+        """Record exactly one normalized failure per public Telegram operation."""
+        try:
+            return operation()
+        except TelegramTransportError:
+            self._metrics.api_failure(
+                APIProvider.TELEGRAM, APIFailureClassification.TRANSPORT
+            )
+            raise
+        except TelegramAPIError:
+            self._metrics.api_failure(
+                APIProvider.TELEGRAM, APIFailureClassification.REJECTION
+            )
+            raise
+        except TelegramProtocolError:
+            self._metrics.api_failure(
+                APIProvider.TELEGRAM, APIFailureClassification.PROTOCOL
+            )
+            raise
 
     def _normalise_update(
         self,

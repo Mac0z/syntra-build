@@ -56,6 +56,12 @@ class RecoveryHandler(Protocol):
     ) -> RecoveryDecision: ...
 
 
+class RecoveryHealthSink(Protocol):
+    def recovering(self) -> None: ...
+    def running(self) -> None: ...
+    def recovery_failed(self) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class RecoveryServices:
     """Trusted M22–M26 services used by concrete recovery paths."""
@@ -87,6 +93,7 @@ class RecoveryCoordinator:
         workspace_clean: Callable[[RecoverySubject], bool] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         id_factory: Callable[[], str] = lambda: str(uuid4()),
+        health_sink: RecoveryHealthSink | None = None,
     ) -> None:
         self.connection, self.scheduler = connection, scheduler
         self.handlers = dict(handlers or {})
@@ -98,12 +105,15 @@ class RecoveryCoordinator:
         self.milestones = SQLiteMilestoneRepository(connection, id_factory)
         self.projects = SQLiteProjectRepository(connection, id_factory)
         self.lifecycle = RecoveryLifecycle.STARTING
+        self.health_sink = health_sink
 
     def recover(self, *, correlation_id: str | None = None) -> str:
         """Run a bounded startup pass; project failures never abort sibling recovery."""
         correlation_id = correlation_id or f"recovery-{self.id_factory()}"
         self.scheduler.enter_drain()
         self.lifecycle = RecoveryLifecycle.RECOVERING
+        if self.health_sink is not None:
+            self.health_sink.recovering()
         now = self.clock()
         with transaction(self.connection):
             run_id = self.repository.begin(correlation_id, now)
@@ -120,12 +130,18 @@ class RecoveryCoordinator:
             with transaction(self.connection):
                 self.repository.finish(run_id, self.clock())
         except Exception as error:
+            # The process-wide safety projection must fail closed even if recording
+            # the failed recovery run encounters the same database outage.
+            if self.health_sink is not None:
+                self.health_sink.recovery_failed()
             with transaction(self.connection):
                 self.repository.finish(run_id, self.clock(), str(error))
             # A global database/coordinator failure keeps the drain barrier closed.
             raise
         self.lifecycle = RecoveryLifecycle.READY
         self.scheduler.exit_drain()
+        if self.health_sink is not None:
+            self.health_sink.running()
         return run_id
 
     def _reconcile(

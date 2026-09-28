@@ -11,6 +11,8 @@ from enum import StrEnum
 from threading import Event, Lock
 from typing import Protocol, cast
 
+from syntra_build.application.dispatch_guard import AllowAllDispatchGuard, DispatchGuard
+from syntra_build.application.metrics import MetricsRecorder, NoOpMetricsRecorder
 from syntra_build.application.retries import (
     RetryJobRepository,
     promote_due_retries,
@@ -94,6 +96,7 @@ class SchedulerCycleResult:
     skipped_capacity: int = 0
     skipped_project_state: int = 0
     skipped_executor: int = 0
+    skipped_resource: int = 0
     stale_claims: int = 0
     worker_start_failures: int = 0
     errors: tuple[SchedulerError, ...] = ()
@@ -151,6 +154,8 @@ class Scheduler:
         retry_promotion_limit: int = 100,
         exhaustion_handler: Callable[[Job, datetime], None] | None = None,
         due_work_enqueuer: Callable[[datetime], None] | None = None,
+        dispatch_guard: DispatchGuard | None = None,
+        metrics: MetricsRecorder | None = None,
     ):
         self._jobs = jobs
         self._capacity = capacity
@@ -171,6 +176,8 @@ class Scheduler:
         self._fairness_cursor: dict[tuple[WorkerClass, int], str] = {}
         self._exhaustion_handler = exhaustion_handler
         self._due_work_enqueuer = due_work_enqueuer
+        self._dispatch_guard = dispatch_guard or AllowAllDispatchGuard()
+        self._metrics = metrics or NoOpMetricsRecorder()
 
     @property
     def is_draining(self) -> bool:
@@ -213,6 +220,7 @@ class Scheduler:
                 "skipped_capacity": 0,
                 "skipped_project_state": 0,
                 "skipped_executor": 0,
+                "skipped_resource": 0,
                 "stale_claims": 0,
             }
             for candidate in self._fair_order(candidates):
@@ -271,6 +279,12 @@ class Scheduler:
         errors: list[SchedulerError],
     ) -> None:
         job = candidate.job
+        decision = self._dispatch_guard.evaluate(job)
+        if not decision.allowed:
+            counts["skipped_resource"] += 1
+            if decision.reason is not None:
+                self._metrics.resource_guard_denied(decision.reason.value)
+            return
         allowed = (
             IMPLEMENTATION_PROJECT_STATES
             if is_implementation_work(job)
