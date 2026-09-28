@@ -1,0 +1,17 @@
+[Unit]
+Description=Syntra Build control plane
+After=network-online.target
+
+[Service]
+Type=simple
+User=syntra-build
+Group=syntra-build
+ExecStart=/opt/syntra-build/venv/bin/python -m syntra_build.service --config /etc/syntra-build/config.json
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

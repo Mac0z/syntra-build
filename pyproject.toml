@@ -10,6 +10,10 @@ readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = ["fpdf2==2.8.8"]
 
+[project.scripts]
+syntra-build-admin = "syntra_build.admin:main"
+syntra-build-service = "syntra_build.service:main"
+
 [project.optional-dependencies]
 dev = [
     "mypy>=1.18,<2",

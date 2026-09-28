@@ -518,23 +518,24 @@ def test_waiting_human_blocks_codex_but_allows_control_work(tmp_path: Path) -> N
 
 def test_drain_keeps_queue_and_active_work_can_finish(tmp_path: Path) -> None:
     connection, _, jobs, project_id = database(tmp_path / "drain.db")
-    first = add_job(jobs, project_id)
-    second = add_job(jobs, project_id)
+    job_a = add_job(jobs, project_id)
+    job_b = add_job(jobs, project_id)
     release = Event()
     executor = RecordingExecutor(release=release)
+    capacity = capacities(codex_concurrency=1)
     scheduler = Scheduler(
         jobs,
-        capacities(codex_concurrency=1),
+        capacity,
         {WorkerClass.CODEX: executor},
         clock=lambda: NOW,
     )
     scheduler.run_once()
     running = next(
         job_id
-        for job_id in (first, second)
+        for job_id in (job_a, job_b)
         if jobs.get(job_id, project_id).state is JobState.RUNNING
     )
-    queued = second if running == first else first
+    queued = job_b if running == job_a else job_a
     scheduler.enter_drain()
     assert scheduler.run_once().dispatched == 0
     assert jobs.get(queued, project_id).state is JobState.QUEUED
@@ -604,6 +605,62 @@ def test_blocking_worker_does_not_block_control_plane_database_read(
 
     release.set()
     harvest(scheduler, executor)
+    scheduler.close()
+    connection.close()
+
+
+def test_graceful_drain_harvests_completion_without_claiming_queued(
+    tmp_path: Path,
+) -> None:
+    connection, _projects, jobs, project_id = database(tmp_path / "drain.db")
+    job_a = add_job(jobs, project_id)
+    job_b = add_job(jobs, project_id)
+    release = Event()
+    executor = RecordingExecutor(release=release)
+    capacity = capacities(codex_concurrency=1)
+    scheduler = Scheduler(
+        jobs,
+        capacity,
+        {WorkerClass.CODEX: executor},
+        clock=lambda: NOW,
+    )
+    assert scheduler.run_once().dispatched == 1
+    assert executor.started.wait(2)
+    first = executor.calls[0].id
+    second = job_b if first == job_a else job_a
+    scheduler.enter_drain()
+    release.set()
+    assert scheduler.drain_until_idle(2, poll_interval_seconds=0.01)
+    assert jobs.get(first, project_id).state is JobState.SUCCEEDED
+    assert jobs.get(second, project_id).state is JobState.QUEUED
+    assert scheduler.active_execution_count == 0
+    assert capacity.in_use(WorkerClass.CODEX) == 0
+    scheduler.close()
+    connection.close()
+
+
+def test_graceful_drain_timeout_preserves_uncertain_and_queued_jobs(
+    tmp_path: Path,
+) -> None:
+    connection, _projects, jobs, project_id = database(tmp_path / "timeout-drain.db")
+    job_a = add_job(jobs, project_id)
+    job_b = add_job(jobs, project_id)
+    release = Event()
+    executor = RecordingExecutor(release=release)
+    capacity = capacities(codex_concurrency=1)
+    scheduler = Scheduler(
+        jobs, capacity, {WorkerClass.CODEX: executor}, clock=lambda: NOW
+    )
+    scheduler.run_once()
+    assert executor.started.wait(2)
+    first = executor.calls[0].id
+    second = job_b if first == job_a else job_a
+    assert not scheduler.drain_until_idle(0.01, poll_interval_seconds=0.005)
+    assert jobs.get(first, project_id).state in {JobState.DISPATCHED, JobState.RUNNING}
+    assert jobs.get(second, project_id).state is JobState.QUEUED
+    assert capacity.in_use(WorkerClass.CODEX) == 1
+    release.set()
+    assert scheduler.drain_until_idle(2, poll_interval_seconds=0.01)
     scheduler.close()
     connection.close()
 

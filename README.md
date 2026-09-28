@@ -155,6 +155,7 @@ and protected GitHub token configuration.
 ## Project documentation
 
 - [M6A target-host development deployment](docs/DEVELOPMENT_DEPLOYMENT.md)
+- [M30 service, administration, backup, and systemd operations](docs/OPERATIONS_M30.md)
 - [Implementation specification](SPEC.md)
 - [Engineering instructions](AGENTS.md)
 - [Design documents](docs/)
