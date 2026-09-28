@@ -1,9 +1,11 @@
 # M30 operations
 
-The `syntra-build-service` process composes schema bootstrap, M27 recovery,
+The continuously running `syntra-build-service` process composes schema bootstrap, M27 recovery,
 M29 health/metrics, the existing durable scheduler, and a cooperative daily
-backup check. It does **not** add M32 autonomous project orchestration or new
-worker executors.
+backup check. When Telegram is enabled it continuously runs the existing bounded
+poll/router with its durable cursor, so health, status, active-project, and
+waiting-for-me controls remain available. It does **not** add M32 autonomous
+project orchestration or new worker executors.
 
 ## Administration and backups
 
@@ -13,7 +15,10 @@ subcommand. Use `version`, `health`, `projects [--active|--waiting]`,
 `restore-verify FILE`, and `reconcile [--apply]`. Health exits zero when ready
 (including usable degraded health) and nonzero otherwise. Reconcile defaults
 to observation only; apply fails closed when trusted provider composition is
-not available and cannot set workflow evidence or state directly.
+not available and cannot set workflow evidence or state directly. Read commands
+open the database without bootstrapping or migrating it and fail closed unless
+its migration history exactly matches the running code. Service startup is the
+documented migration path; manual backup can preserve an older supported schema.
 
 Backups use SQLite's online backup API, are verified before atomic publication,
 and are named with UTC time, schema, and a bounded reason. Automatic scheduling
@@ -33,12 +38,13 @@ backups. Schema remains 25.
 ## Install, upgrade, and systemd
 
 Bootstrap the host as documented in `DEVELOPMENT_DEPLOYMENT.md`. For the first
-upgrade from a pre-M30 release, stop the service and use Python's SQLite online
-backup API from the old environment, validate `PRAGMA integrity_check` and
-`PRAGMA foreign_key_check`, and retain that file before installing M30. Later
-upgrades use `scripts/host/upgrade.sh EXACT_40_CHARACTER_SHA`; it invokes the
-currently installed admin CLI for a verified `pre-upgrade` backup **before**
-`install-dev.sh` replaces the application. Failure aborts installation.
+upgrade from a pre-M30 release, stop the service and run
+`scripts/host/upgrade.sh EXACT_40_CHARACTER_SHA` from the exact reviewed M30
+checkout. The wrapper runs `python3.14` with that checkout's `src` on
+`PYTHONPATH`, creates and verifies a `PRE_UPGRADE` backup, and only then invokes
+`install-dev.sh`. This works before the M30 CLI is installed; backup failure
+aborts before package replacement or the `REVISION` update. The same reviewed
+path is used for later upgrades.
 
 As root, install (but do not start) the reviewed unit with
 `scripts/host/install-service.sh`; add `--enable` only when wanted. Then:
@@ -55,8 +61,12 @@ sudo systemctl stop syntra-build
 sudo systemctl start syntra-build
 ```
 
-Startup binds health in STARTING/RECOVERING, keeps the scheduler drained, runs
-M27 reconciliation, and only then releases dispatch. SIGTERM/SIGINT immediately
+Startup loads the real protected host configuration, binds health in
+STARTING/RECOVERING, keeps the scheduler drained, and runs M27 reconciliation.
+GitHub-enabled hosts compose the released PR, CI, Gatekeeper, and workspace
+observers; human-gate restoration is always composed. Provider paths that are
+not configured remain unavailable and therefore fail closed. Only after recovery
+does dispatch begin. SIGTERM/SIGINT immediately
 sets DRAINING, stops new claims and backup checks, gives threads a bounded unit
 stop window, closes HTTP/SQLite, and leaves durable uncertain work for M27.
 
