@@ -161,3 +161,52 @@ def test_real_architect_failure_records_once() -> None:
         and SECRET not in exported
         and project.name not in exported
     )
+
+
+def test_telegram_post_decode_malformed_poll_records_once(tmp_path: Path) -> None:
+    metrics = PrometheusRecorder()
+
+    def transport(_request: object, _timeout: float) -> HTTPResponse:
+        return HTTPResponse(200, b'{"ok":true,"result":{"raw":"PRIVATE"}}')
+
+    client = TelegramClient(config(tmp_path), transport=transport, metrics=metrics)
+    with pytest.raises(TelegramProtocolError):
+        client.poll_updates()
+    assert metrics.api_failures == {
+        (APIProvider.TELEGRAM.value, APIFailureClassification.PROTOCOL.value): 1
+    }
+    assert "PRIVATE" not in "\n".join(metrics.samples())
+
+
+def test_telegram_post_decode_malformed_send_records_once(tmp_path: Path) -> None:
+    metrics = PrometheusRecorder()
+
+    def transport(_request: object, _timeout: float) -> HTTPResponse:
+        return HTTPResponse(200, b'{"ok":true,"result":{"message_id":"PRIVATE"}}')
+
+    client = TelegramClient(config(tmp_path), transport=transport, metrics=metrics)
+    with pytest.raises(TelegramProtocolError):
+        client.send_text(chat_id=1, text="human text must not export")
+    assert metrics.api_failures == {
+        (APIProvider.TELEGRAM.value, APIFailureClassification.PROTOCOL.value): 1
+    }
+    exported = "\n".join(metrics.samples())
+    assert "PRIVATE" not in exported and "human text must not export" not in exported
+
+
+def test_github_post_decode_malformed_observation_records_once(tmp_path: Path) -> None:
+    metrics = PrometheusRecorder()
+    response = GitHubHTTPResponse(
+        200, b'{"workflow_runs":{"raw":"PRIVATE_PROVIDER_VALUE"}}'
+    )
+    adapter = GitHubActionsAdapter(
+        config(tmp_path), transport=lambda _r, _t: response, metrics=metrics
+    )
+    with pytest.raises(CIProviderError):
+        adapter.observe("owner/private-repository", 7, "a" * 40)
+    assert metrics.api_failures == {
+        (APIProvider.GITHUB.value, APIFailureClassification.MALFORMED.value): 1
+    }
+    exported = "\n".join(metrics.samples())
+    assert "PRIVATE_PROVIDER_VALUE" not in exported
+    assert "private-repository" not in exported

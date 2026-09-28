@@ -26,6 +26,7 @@ from syntra_build.smoke import (
     _load_host_config,
     _parser,
     build_host_router,
+    build_m29_host_router,
     build_smoke_router,
     main,
     run_local_smoke,
@@ -439,6 +440,51 @@ def test_real_host_router_composes_m14_github_check_and_persistence(
         "Project: Host Project\nState: DESIGNING\nActivity:"
     )
     connection.close()
+
+
+def test_actual_host_health_composition_uses_resources_and_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections import namedtuple
+
+    base = _config(tmp_path)
+    config = load_config(
+        {**base.safe_dict(), "github": {"enabled": True, "owner": "Mac0z"}},
+        environ={},
+        secrets=SecretInputs(github_token=SecretValue("synthetic-github-token")),
+    )
+    connection = bootstrap_database(config)
+    usage = namedtuple("usage", "total used free")
+    free = 50
+    monkeypatch.setattr(
+        "syntra_build.application.operational_health.shutil.disk_usage",
+        lambda _path: usage(100, 100 - free, free),
+    )
+    router = build_m29_host_router(
+        config,
+        connection,
+        github_transport=lambda _request, _timeout: GitHubHTTPResponse(404, b"{}"),
+    )
+
+    def response() -> str:
+        return router.route(
+            InboundMessage(
+                "telegram",
+                "health-update-real",
+                "health-message-real",
+                "301",
+                datetime.now(UTC),
+                "/health",
+                "401",
+            )
+        ).text
+
+    assert response() == "Health: HEALTHY\nReady: yes\nReasons: none"
+    free = 7
+    assert response() == "Health: DEGRADED\nReady: yes\nReasons: DISK_CODEX_STOP"
+    connection.close()
+    config.database.sqlite_path.rename(config.database.sqlite_path.with_suffix(".gone"))
+    assert response() == ("Health: UNHEALTHY\nReady: no\nReasons: DATABASE_UNAVAILABLE")
 
 
 def test_cli_failure_is_nonzero_and_secret_safe(

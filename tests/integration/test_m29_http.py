@@ -17,7 +17,7 @@ from syntra_build.infrastructure.config.models import (
     SchedulerConfig,
 )
 from syntra_build.infrastructure.health_http import HealthHTTPServer
-from syntra_build.infrastructure.metrics import MetricsService
+from syntra_build.infrastructure.metrics import MetricsService, PrometheusRecorder
 from syntra_build.infrastructure.persistence import apply_migrations, open_database
 
 
@@ -127,6 +127,25 @@ def test_failure_metrics_are_bounded() -> None:
         == 3
     )
     assert "synthetic secret/error/prompt" not in text
+
+
+def test_metrics_service_accepts_shared_runtime_recorder(tmp_path: Path) -> None:
+    database = tmp_path / "shared-recorder.sqlite3"
+    with open_database(database) as connection:
+        apply_migrations(connection)
+
+    def connect() -> sqlite3.Connection:
+        return sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+
+    health = OperationalHealth(Sampler(), ResourceThresholdConfig())
+    recorder = PrometheusRecorder()
+    service = MetricsService(
+        connect,
+        health,
+        WorkerCapacity(SchedulerConfig().worker_class_limits()),
+        recorder=recorder,
+    )
+    assert service.recorder is recorder
 
 
 def test_database_unavailable_is_bounded_and_not_ready(tmp_path: Path) -> None:
@@ -336,3 +355,39 @@ def test_representative_aggregates_histograms_and_sensitive_exclusion(
         "credential-like-xyz",
     ):
         assert sensitive not in text
+
+
+def test_histogram_uses_one_sql_aggregate_row_not_history_rows() -> None:
+    from collections.abc import Iterator
+    from typing import cast
+
+    class AggregateCursor:
+        def fetchone(self) -> tuple[int | float, ...]:
+            return (2, 16.0, 0, 1, 1, 2, 2, 2, 2, 2)
+
+        def __iter__(self) -> Iterator[object]:
+            raise AssertionError("collector must not iterate completed history rows")
+
+    class AggregateConnection:
+        calls = 0
+
+        def execute(self, sql: str, parameters: object = ()) -> AggregateCursor:
+            self.calls += 1
+            assert "SUM(CASE WHEN" in sql
+            assert "COUNT(*)" in sql
+            assert parameters == tuple(BUCKETS)
+            return AggregateCursor()
+
+    from syntra_build.infrastructure.metrics import BUCKETS
+
+    connection = AggregateConnection()
+    lines: list[str] = []
+    MetricsService._histogram(
+        lines,
+        cast(sqlite3.Connection, connection),
+        "codex_runs",
+        "syntra_build_codex_run_duration_seconds",
+    )
+    assert connection.calls == 1
+    assert "syntra_build_codex_run_duration_seconds_count 2" in lines
+    assert "syntra_build_codex_run_duration_seconds_sum 16" in lines

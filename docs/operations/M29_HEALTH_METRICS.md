@@ -17,6 +17,9 @@ state, worker capacity, disk and artifact bytes, persisted Codex/Architect/CI to
 state transitions, duration histograms, API failures, and resource-guard denials.
 Labels never include IDs, names, repositories, paths, URLs, SHAs, prompts, errors, or
 secrets. Scrapes use short-lived SQLite read connections and make no provider calls.
+Persisted duration histograms use one SQLite aggregate query per family; completed-run
+rows are not materialized or repeatedly rescanned in Python. Runtime composition may
+inject one shared `PrometheusRecorder` into metrics, scheduler, and provider adapters.
 
 Prometheus configuration (default local bind):
 

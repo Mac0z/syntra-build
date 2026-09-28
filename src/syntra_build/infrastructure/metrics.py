@@ -6,7 +6,6 @@ import sqlite3
 from collections import Counter
 from collections.abc import Callable
 from contextlib import closing
-from datetime import datetime
 from threading import Lock
 
 from syntra_build.application.metrics import (
@@ -81,13 +80,14 @@ class MetricsService:
         connection_factory: Callable[[], sqlite3.Connection],
         health: OperationalHealth,
         capacity: WorkerCapacity,
+        recorder: PrometheusRecorder | None = None,
     ) -> None:
         self._connections, self._health, self._capacity = (
             connection_factory,
             health,
             capacity,
         )
-        self.recorder = PrometheusRecorder()
+        self.recorder = recorder or PrometheusRecorder()
 
     def render(self) -> bytes:
         projection = self._health.projection()
@@ -238,23 +238,27 @@ class MetricsService:
         lines: list[str], connection: sqlite3.Connection, table: str, name: str
     ) -> None:
         lines.append(f"# TYPE {name} histogram")
-        durations = [
-            (
-                datetime.fromisoformat(done) - datetime.fromisoformat(start)
-            ).total_seconds()
-            for start, done in connection.execute(
-                f"SELECT started_at,completed_at FROM {table} "
-                "WHERE completed_at IS NOT NULL"
-            )
-        ]
-        for bound in BUCKETS:
+        duration = "(unixepoch(completed_at,'subsec')-unixepoch(started_at,'subsec'))"
+        bucket_sql = ",".join(
+            f"COALESCE(SUM(CASE WHEN {duration}<=? THEN 1 ELSE 0 END),0)"
+            for _ in BUCKETS
+        )
+        row = connection.execute(
+            f"SELECT COUNT(*),COALESCE(SUM({duration}),0),{bucket_sql} "
+            f"FROM {table} WHERE completed_at IS NOT NULL",
+            BUCKETS,
+        ).fetchone()
+        if row is None:  # Aggregate SELECT always returns one row; fail closed if not.
+            raise RuntimeError("histogram aggregate query returned no row")
+        count, total, *bucket_counts = row
+        for bound, bucket_count in zip(BUCKETS, bucket_counts, strict=True):
             lines.append(
                 _sample(
                     f"{name}_bucket",
-                    sum(value <= bound for value in durations),
+                    bucket_count,
                     {"le": str(bound)},
                 )
             )
-        lines.append(_sample(f"{name}_bucket", len(durations), {"le": "+Inf"}))
-        lines.append(_sample(f"{name}_count", len(durations)))
-        lines.append(_sample(f"{name}_sum", sum(durations)))
+        lines.append(_sample(f"{name}_bucket", count, {"le": "+Inf"}))
+        lines.append(_sample(f"{name}_count", count))
+        lines.append(_sample(f"{name}_sum", total))

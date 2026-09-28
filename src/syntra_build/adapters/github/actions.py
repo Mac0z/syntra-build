@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from enum import StrEnum
+from typing import TypeVar
 from urllib.parse import quote, urlencode
 from urllib.request import Request
 
@@ -28,6 +29,7 @@ from syntra_build.domain.ci import (
 from syntra_build.infrastructure.config import ApplicationConfig
 
 _API_ROOT = "https://api.github.com"
+_T = TypeVar("_T")
 
 
 class CIProviderFailure(StrEnum):
@@ -62,23 +64,6 @@ class GitHubActionsAdapter:
         self._metrics = metrics or NoOpMetricsRecorder()
 
     def _request(self, method: str, path: str) -> Mapping[str, object] | None:
-        try:
-            return self._request_unrecorded(method, path)
-        except CIProviderError as error:
-            classifications = {
-                CIProviderFailure.AUTHENTICATION: APIFailureClassification.AUTHENTICATION,
-                CIProviderFailure.REJECTION: APIFailureClassification.REJECTION,
-                CIProviderFailure.TRANSIENT: APIFailureClassification.TRANSIENT,
-                CIProviderFailure.MALFORMED: APIFailureClassification.MALFORMED,
-            }
-            self._metrics.api_failure(
-                APIProvider.GITHUB, classifications[error.failure]
-            )
-            raise
-
-    def _request_unrecorded(
-        self, method: str, path: str
-    ) -> Mapping[str, object] | None:
         request = Request(
             f"{_API_ROOT}{path}",
             method=method,
@@ -131,6 +116,13 @@ class GitHubActionsAdapter:
         return payload
 
     def observe(
+        self, repository_full_name: str, pull_request_number: int, head_sha: str
+    ) -> CIObservation:
+        return self._recorded(
+            lambda: self._observe(repository_full_name, pull_request_number, head_sha)
+        )
+
+    def _observe(
         self, repository_full_name: str, pull_request_number: int, head_sha: str
     ) -> CIObservation:
         repo = quote(repository_full_name, safe="/")
@@ -208,10 +200,29 @@ class GitHubActionsAdapter:
         return CIObservation(tuple(unique.values()), tuple(run_ids))
 
     def rerun(self, repository_full_name: str, workflow_run_id: str) -> None:
+        self._recorded(lambda: self._rerun(repository_full_name, workflow_run_id))
+
+    def _rerun(self, repository_full_name: str, workflow_run_id: str) -> None:
         """Start one trusted GitHub re-run after persisted retry intent."""
         repo = quote(repository_full_name, safe="/")
         run_id = quote(workflow_run_id, safe="")
         self._request("POST", f"/repos/{repo}/actions/runs/{run_id}/rerun")
+
+    def _recorded(self, operation: Callable[[], _T]) -> _T:
+        """Record one already-normalized failure per public GitHub operation."""
+        try:
+            return operation()
+        except CIProviderError as error:
+            classifications = {
+                CIProviderFailure.AUTHENTICATION: APIFailureClassification.AUTHENTICATION,
+                CIProviderFailure.REJECTION: APIFailureClassification.REJECTION,
+                CIProviderFailure.TRANSIENT: APIFailureClassification.TRANSIENT,
+                CIProviderFailure.MALFORMED: APIFailureClassification.MALFORMED,
+            }
+            self._metrics.api_failure(
+                APIProvider.GITHUB, classifications[error.failure]
+            )
+            raise
 
     @staticmethod
     def _normalize_job(job: Mapping[str, object]) -> CICheck:
