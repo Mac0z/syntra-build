@@ -17,8 +17,6 @@ from syntra_build.application.operational_health import (
     LocalResourceSampler,
     OperationalHealth,
 )
-from syntra_build.application.recovery import RecoveryCoordinator, RecoveryServices
-from syntra_build.application.scheduler import Scheduler, WorkerCapacity
 from syntra_build.application.status import SQLiteStatusService
 from syntra_build.infrastructure.backup import (
     BackupReason,
@@ -29,7 +27,6 @@ from syntra_build.infrastructure.backup import (
 from syntra_build.infrastructure.config.host import DEFAULT_HOST_CONFIG_PATH
 from syntra_build.infrastructure.config.loader import load_config
 from syntra_build.infrastructure.config.models import ApplicationConfig
-from syntra_build.infrastructure.persistence.jobs import SQLiteJobRepository
 from syntra_build.infrastructure.persistence.migrations import (
     MIGRATIONS,
     applied_migrations,
@@ -67,8 +64,7 @@ def parser() -> argparse.ArgumentParser:
     )
     restore = commands.add_parser("restore-verify")
     restore.add_argument("backup", type=Path)
-    reconcile = commands.add_parser("reconcile")
-    reconcile.add_argument("--apply", action="store_true")
+    commands.add_parser("reconcile")
     return result
 
 
@@ -172,25 +168,6 @@ def main(argv: list[str] | None = None) -> int:
                         f"uncertain_external_side_effect={str(uncertain).lower()} "
                         "required_path=M27_RECOVERY"
                     )
-                if args.apply:
-                    connection.close()
-                    connection = sqlite3.connect(config.database.sqlite_path)
-                    connection.row_factory = sqlite3.Row
-                    connection.execute("PRAGMA foreign_keys=ON")
-                    scheduler = Scheduler(
-                        SQLiteJobRepository(connection, lambda: str(uuid4())),
-                        WorkerCapacity(config.scheduler.worker_class_limits()),
-                        {},
-                    )
-                    try:
-                        run_id = RecoveryCoordinator(
-                            connection,
-                            scheduler,
-                            services=RecoveryServices(),
-                        ).recover()
-                        print(f"Applied trusted M27 recovery run={run_id}")
-                    finally:
-                        scheduler.close(wait=False)
             return 0
         finally:
             connection.close()

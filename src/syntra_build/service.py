@@ -215,9 +215,10 @@ class ServiceRuntime:
                         self.stop_event.wait(self._loop_interval)
                 scheduler.wait_for_wake(self._loop_interval)
             loop.stop()
-            # One final harvest during the grace opportunity; never claim while drained.
-            scheduler.enter_drain()
-            scheduler.run_once()
+            scheduler.drain_until_idle(
+                self._shutdown_grace,
+                poll_interval_seconds=min(self._loop_interval, 0.1),
+            )
         except Exception:
             self.health.recovery_failed()
             self.failed_event.set()

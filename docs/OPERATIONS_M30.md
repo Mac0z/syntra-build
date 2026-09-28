@@ -12,10 +12,10 @@ project orchestration or new worker executors.
 All commands accept `--config /etc/syntra-build/config.json` before the
 subcommand. Use `version`, `health`, `projects [--active|--waiting]`,
 `status PROJECT`, `integrity`, `backup [--reason manual]`,
-`restore-verify FILE`, and `reconcile [--apply]`. Health exits zero when ready
-(including usable degraded health) and nonzero otherwise. Reconcile defaults
-to observation only; apply fails closed when trusted provider composition is
-not available and cannot set workflow evidence or state directly. Read commands
+`restore-verify FILE`, and `reconcile`. Health exits zero when ready
+(including usable degraded health) and nonzero otherwise. Reconcile is
+observation-only; restarting the managed service is the sole trusted M30 apply
+path and runs the complete configured M27 composition. Read commands
 open the database without bootstrapping or migrating it and fail closed unless
 its migration history exactly matches the running code. Service startup is the
 documented migration path; manual backup can preserve an older supported schema.
@@ -23,7 +23,10 @@ documented migration path; manual backup can preserve an older supported schema.
 Backups use SQLite's online backup API, are verified before atomic publication,
 and are named with UTC time, schema, and a bounded reason. Automatic scheduling
 checks hourly and creates at most the backup needed for a rolling 24-hour
-period. Retention deletes recognised, non-symlink backups strictly older than
+period. Only the most recent successful `AUTOMATIC` backup satisfies that
+schedule; manual and safety backups never suppress it. Backup creation is
+serialized across host processes with a lock inside `backup_root`. Retention
+deletes recognised, non-symlink backups strictly older than
 `retention_days`; the boundary and new backup are retained. Setting
 `backups.enabled=false` disables only automatic backups. Manual,
 pre-migration, and pre-upgrade safety backups remain available. `restore-verify`
@@ -66,9 +69,12 @@ STARTING/RECOVERING, keeps the scheduler drained, and runs M27 reconciliation.
 GitHub-enabled hosts compose the released PR, CI, Gatekeeper, and workspace
 observers; human-gate restoration is always composed. Provider paths that are
 not configured remain unavailable and therefore fail closed. Only after recovery
-does dispatch begin. SIGTERM/SIGINT immediately
-sets DRAINING, stops new claims and backup checks, gives threads a bounded unit
-stop window, closes HTTP/SQLite, and leaves durable uncertain work for M27.
+does dispatch begin. SIGTERM/SIGINT immediately sets DRAINING, stops new claims,
+Telegram poll cycles, and backup checks, then cooperatively harvests running
+workers for the bounded shutdown grace. Completed outcomes are persisted and
+capacity released; work still running at the deadline retains its durable
+uncertain state for M27 restart recovery. HTTP and SQLite ownership are then
+closed without fabricating worker completion.
 
 For rollback, stop the service, preserve the current database, identify and
 `restore-verify` the pre-upgrade backup, and install the prior exact revision.

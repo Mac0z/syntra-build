@@ -31,6 +31,7 @@ def test_admin_parser_has_no_authority_escape_hatches() -> None:
         "pass-human",
         "force-merge",
         "complete-milestone",
+        "--apply",
         " sql",
     ):
         assert forbidden not in help_text

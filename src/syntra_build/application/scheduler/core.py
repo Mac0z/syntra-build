@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -183,6 +184,12 @@ class Scheduler:
     def is_draining(self) -> bool:
         with self._lock:
             return self._draining
+
+    @property
+    def active_execution_count(self) -> int:
+        """Return the bounded in-process executions still awaiting harvest."""
+        with self._lock:
+            return len(self._active)
 
     def enter_drain(self) -> None:
         with self._lock:
@@ -491,6 +498,23 @@ class Scheduler:
     def wake(self) -> None:
         """Wake a cooperative loop, without changing drain or stop state."""
         self._wake.set()
+
+    def drain_until_idle(
+        self, timeout_seconds: float, *, poll_interval_seconds: float = 0.1
+    ) -> bool:
+        """Harvest running work until idle or a monotonic bounded deadline."""
+        if timeout_seconds < 0 or poll_interval_seconds <= 0:
+            raise ValueError("drain timing must be non-negative with positive polling")
+        self.enter_drain()
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            self.run_once()
+            if self.active_execution_count == 0:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self.wait_for_wake(min(poll_interval_seconds, remaining))
 
     def close(self, *, wait: bool = True) -> None:
         """Release thread resources without changing any durable queued job."""

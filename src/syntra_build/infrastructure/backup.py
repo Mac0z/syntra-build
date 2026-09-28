@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import shutil
@@ -91,8 +92,22 @@ class SQLiteBackupService:
         if not self._lock.acquire(blocking=False):
             raise BackupError("backup already running")
         partial: Path | None = None
+        lock_fd: int | None = None
         try:
             self.root.mkdir(parents=True, exist_ok=True)
+            lock_path = self.root / ".backup.lock"
+            try:
+                lock_fd = os.open(
+                    lock_path,
+                    os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError) as error:
+                if lock_fd is not None:
+                    os.close(lock_fd)
+                    lock_fd = None
+                raise BackupError("backup already running") from error
             version = self._source_version()
             stem = f"syntra-{now:%Y%m%dT%H%M%SZ}-schema{version}-{reason.value}"
             destination = self.root / f"{stem}.sqlite3"
@@ -100,7 +115,11 @@ class SQLiteBackupService:
             while destination.exists():
                 destination = self.root / f"{stem}-{sequence}.sqlite3"
                 sequence += 1
-            partial = self.root / f".{destination.name}.partial"
+            descriptor, partial_name = tempfile.mkstemp(
+                prefix=".syntra-backup-", suffix=".partial", dir=self.root
+            )
+            os.close(descriptor)
+            partial = Path(partial_name)
             source = sqlite3.connect(f"file:{self.source.as_posix()}?mode=ro", uri=True)
             target = sqlite3.connect(partial)
             try:
@@ -118,6 +137,9 @@ class SQLiteBackupService:
         finally:
             if partial is not None:
                 partial.unlink(missing_ok=True)
+            if lock_fd is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
             self._lock.release()
 
     def _source_version(self) -> int:
@@ -127,13 +149,18 @@ class SQLiteBackupService:
         finally:
             connection.close()
 
-    def latest(self) -> BackupMetadata | None:
+    def latest(self, reason: BackupReason | None = None) -> BackupMetadata | None:
         candidates: list[BackupMetadata] = []
         if not self.root.is_dir():
             return None
         for path in self.root.iterdir():
             match = _NAME.fullmatch(path.name)
-            if match and path.is_file() and not path.is_symlink():
+            if (
+                match
+                and (reason is None or match[3] == reason.value)
+                and path.is_file()
+                and not path.is_symlink()
+            ):
                 created = datetime.strptime(match[1], "%Y%m%dT%H%M%SZ").replace(
                     tzinfo=UTC
                 )
@@ -145,7 +172,7 @@ class SQLiteBackupService:
         )
 
     def automatic_due(self, now: datetime) -> bool:
-        latest = self.latest()
+        latest = self.latest(BackupReason.AUTOMATIC)
         return latest is None or now.astimezone(UTC) - latest.created_at >= timedelta(
             hours=24
         )
