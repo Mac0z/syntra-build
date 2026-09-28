@@ -116,6 +116,18 @@ def bootstrap_database(config: ApplicationConfig) -> sqlite3.Connection:
     """Open, migrate, validate, and return a caller-owned database connection."""
     connection = open_database(config.database.sqlite_path)
     try:
+        version = current_schema_version(connection)
+        if version and version < len(MIGRATIONS):
+            connection.close()
+            from syntra_build.infrastructure.backup import (  # avoid module cycle
+                BackupReason,
+                SQLiteBackupService,
+            )
+
+            SQLiteBackupService(
+                config.database.sqlite_path, config.filesystem.backup_root
+            ).create(BackupReason.PRE_MIGRATION)
+            connection = open_database(config.database.sqlite_path)
         apply_migrations(connection)
         check_database_integrity(connection)
     except BaseException:
