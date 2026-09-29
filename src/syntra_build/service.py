@@ -6,7 +6,7 @@ import argparse
 import logging
 import signal
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Thread
@@ -23,16 +23,25 @@ from syntra_build.application.ci_handoff import PullRequestCIHandoff
 from syntra_build.application.ci_monitor import CIMonitor
 from syntra_build.application.gatekeeper import Gatekeeper
 from syntra_build.application.human_intervention import HumanInterventionService
+from syntra_build.application.lifecycle import JobTypeDispatcher, LifecycleCoordinator
 from syntra_build.application.operational_health import (
     LocalResourceSampler,
     OperationalHealth,
 )
 from syntra_build.application.pull_requests import PullRequestLifecycleService
 from syntra_build.application.recovery import RecoveryCoordinator, RecoveryServices
-from syntra_build.application.scheduler import Scheduler, SchedulerLoop, WorkerCapacity
+from syntra_build.application.scheduler import (
+    JobExecutionDisposition,
+    JobExecutionResult,
+    Scheduler,
+    SchedulerLoop,
+    WorkerCapacity,
+)
 from syntra_build.application.security import SecurityPolicy
 from syntra_build.application.workspaces import WorkspaceService
+from syntra_build.domain.jobs import WorkerClass
 from syntra_build.infrastructure.backup import BackupReason, SQLiteBackupService
+from syntra_build.infrastructure.codex_runner import SudoCodexLauncher
 from syntra_build.infrastructure.config.host import (
     DEFAULT_HOST_CONFIG_PATH,
     load_host_config,
@@ -53,6 +62,34 @@ from syntra_build.smoke import build_host_router, run_telegram_once
 _LOGGER = logging.getLogger(__name__)
 
 
+class _DisabledProductionOperation:
+    """Fail closed when a released operation has no configured provider factory."""
+
+    def __init__(self, job_type: str) -> None:
+        self.job_type = job_type
+
+    def __call__(self, job: object) -> JobExecutionResult:
+        del job
+        return JobExecutionResult(
+            JobExecutionDisposition.FAILED,
+            result={"failure": "required production provider is disabled"},
+        )
+
+
+_M32_JOB_TYPES = {
+    WorkerClass.ARCHITECT: (
+        "ARCHITECT_DESIGN",
+        "SPECIFICATION_DRAFT",
+        "ARCHITECT_TASK",
+        "ARCHITECT_REVIEW",
+    ),
+    WorkerClass.CODEX: ("CODEX_RUN", "CODEX_REVIEW_REWORK"),
+    WorkerClass.GIT: ("WORKSPACE_PREPARE", "CHANGE_VALIDATE", "GIT_COMMIT", "GIT_PUSH"),
+    WorkerClass.GITHUB: ("REPOSITORY_PROVISION", "PR_CREATE", "PR_MERGE"),
+    WorkerClass.CI: ("CI_RECONCILE",),
+}
+
+
 class ServiceRuntime:
     """Own all mutation on one control thread; HTTP and backup open their own DBs."""
 
@@ -69,6 +106,8 @@ class ServiceRuntime:
         backup_interval: float = 3600.0,
         shutdown_grace: float = 30.0,
         configure_runtime_logging: bool = True,
+        executor_factory: Callable[[ApplicationConfig], Mapping[WorkerClass, object]]
+        | None = None,
     ) -> None:
         self.config = config_loader(config_path)
         if configure_runtime_logging:
@@ -100,6 +139,20 @@ class ServiceRuntime:
         self._loop_interval = loop_interval
         self._backup_interval = backup_interval
         self._shutdown_grace = shutdown_grace
+        self._executor_factory = executor_factory
+        # The production identity boundary is explicit and inspectable. Tests may
+        # inject fake executors, but production never constructs DirectProcessLauncher.
+        self.codex_launcher = SudoCodexLauncher()
+
+    def _production_executors(self) -> Mapping[WorkerClass, object]:
+        if self._executor_factory is not None:
+            return self._executor_factory(self.config)
+        return {
+            worker: JobTypeDispatcher(
+                {name: _DisabledProductionOperation(name) for name in names}
+            )
+            for worker, names in _M32_JOB_TYPES.items()
+        }
 
     def _database_available(self) -> bool:
         try:
@@ -138,10 +191,16 @@ class ServiceRuntime:
 
     def _control_loop(self) -> None:
         connection = open_database(self.config.database.sqlite_path)
+        lifecycle = LifecycleCoordinator(connection)
+
+        def enqueue_due(_now: datetime) -> None:
+            lifecycle.enqueue_due()
+
         scheduler = Scheduler(
             SQLiteJobRepository(connection, lambda: str(uuid4())),
             self.capacity,
-            {},
+            self._production_executors(),  # type: ignore[arg-type]
+            due_work_enqueuer=enqueue_due,
             metrics=self.recorder,
         )
         self.scheduler = scheduler

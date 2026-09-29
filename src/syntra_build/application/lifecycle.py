@@ -60,11 +60,19 @@ class JobTypeDispatcher:
     def __init__(self, routes: Mapping[str, Callable[[Job], object]]) -> None:
         self._routes = dict(routes)
 
-    def __call__(self, job: Job) -> object:
+    @property
+    def job_types(self) -> frozenset[str]:
+        """Expose the closed, trusted routing vocabulary for composition checks."""
+        return frozenset(self._routes)
+
+    def execute(self, job: Job) -> object:
         executor = self._routes.get(job.job_type)
         if executor is None:
             raise RuntimeError(f"unsupported trusted job type: {job.job_type}")
         return executor(job)
+
+    def __call__(self, job: Job) -> object:
+        return self.execute(job)
 
 
 class LifecycleCoordinator:
@@ -90,6 +98,12 @@ class LifecycleCoordinator:
         ).fetchall():
             project_id = ProjectId.from_string(project["id"])
             if project["state"] == "DESIGNING":
+                # A historical/manual fixture is not generated-project provenance.
+                if not self._db.execute(
+                    "SELECT 1 FROM project_creation_context WHERE project_id=?",
+                    (project["id"],),
+                ).fetchone():
+                    continue
                 mode = self._latest_design_mode(project["id"])
                 if mode == "PROPOSE_DESIGN":
                     count += self._enqueue(
@@ -226,7 +240,11 @@ class LifecycleCoordinator:
             "SELECT id,state FROM milestones WHERE project_id=? ORDER BY sequence_number",
             (str(project_id),),
         ).fetchall()
-        if rows and all(row["state"] == "COMPLETE" for row in rows):
+        if (
+            rows
+            and all(row["state"] == "COMPLETE" for row in rows)
+            and self._completion_unblocked(project_id)
+        ):
             now = self._clock()
             with transaction_scope(self._db):
                 self._projects.apply_transition(
@@ -313,3 +331,21 @@ class LifecycleCoordinator:
             )
             return 1
         return 0
+
+    def _completion_unblocked(self, project_id: ProjectId) -> bool:
+        """Require resolved human/security evidence before project completion."""
+        unresolved_gate = self._db.execute(
+            """SELECT 1 FROM human_gates WHERE project_id=?
+               AND state NOT IN ('RESOLVED','EXPIRED','CANCELLED') LIMIT 1""",
+            (str(project_id),),
+        ).fetchone()
+        blocking_security = self._db.execute(
+            """SELECT 1 FROM security_events e
+               WHERE e.project_id=? AND e.blocking=1
+                 AND e.severity IN ('HIGH','CRITICAL')
+                 AND NOT EXISTS (SELECT 1 FROM security_event_resolutions r
+                                 WHERE r.security_event_id=e.id)
+               LIMIT 1""",
+            (str(project_id),),
+        ).fetchone()
+        return unresolved_gate is None and blocking_security is None
