@@ -21,9 +21,12 @@ from syntra_build.adapters.telegram import (
 )
 from syntra_build.application.ci_handoff import PullRequestCIHandoff
 from syntra_build.application.ci_monitor import CIMonitor
+from syntra_build.application.ci_scheduler import CIReconciliationExecutor
+from syntra_build.application.codex import BoundCodexRunner
 from syntra_build.application.gatekeeper import Gatekeeper
 from syntra_build.application.human_intervention import HumanInterventionService
 from syntra_build.application.lifecycle import JobTypeDispatcher, LifecycleCoordinator
+from syntra_build.application.m32_executors import InitialCodexExecutor
 from syntra_build.application.operational_health import (
     LocalResourceSampler,
     OperationalHealth,
@@ -41,7 +44,10 @@ from syntra_build.application.security import SecurityPolicy
 from syntra_build.application.workspaces import WorkspaceService
 from syntra_build.domain.jobs import WorkerClass
 from syntra_build.infrastructure.backup import BackupReason, SQLiteBackupService
-from syntra_build.infrastructure.codex_runner import SudoCodexLauncher
+from syntra_build.infrastructure.codex_runner import (
+    LocalCodexCliRunner,
+    SudoCodexLauncher,
+)
 from syntra_build.infrastructure.config.host import (
     DEFAULT_HOST_CONFIG_PATH,
     load_host_config,
@@ -147,12 +153,65 @@ class ServiceRuntime:
     def _production_executors(self) -> Mapping[WorkerClass, object]:
         if self._executor_factory is not None:
             return self._executor_factory(self.config)
-        return {
+        routes = {
             worker: JobTypeDispatcher(
                 {name: _DisabledProductionOperation(name) for name in names}
             )
             for worker, names in _M32_JOB_TYPES.items()
         }
+        executable = self._approved_codex_executable()
+        if executable is not None:
+
+            def runner_factory(connection: sqlite3.Connection) -> BoundCodexRunner:
+                workspace = WorkspaceService(
+                    connection,
+                    trusted_git_from_host_config(
+                        self.config, self.config.filesystem.data_root
+                    ),
+                    self.config.filesystem.data_root,
+                )
+                provider = LocalCodexCliRunner(
+                    connection,
+                    executable=executable,
+                    worker_identity=self.config.codex.worker_identity,
+                    artifact_root=self.config.filesystem.data_root / "artifacts",
+                    launcher=SudoCodexLauncher(),
+                )
+                return BoundCodexRunner(workspace, provider)
+
+            codex = InitialCodexExecutor(
+                self.config.database.sqlite_path,
+                runner_factory,
+                timeout_seconds=self.config.codex.execution_timeout_seconds,
+            )
+            routes[WorkerClass.CODEX] = JobTypeDispatcher(
+                {
+                    "CODEX_RUN": codex.execute,
+                    "CODEX_REVIEW_REWORK": _DisabledProductionOperation(
+                        "CODEX_REVIEW_REWORK"
+                    ),
+                }
+            )
+        if self.config.github.enabled:
+            ci = CIReconciliationExecutor(
+                self.config.database.sqlite_path,
+                lambda connection: CIMonitor(
+                    connection,
+                    GitHubPullRequestAdapter(self.config),
+                    GitHubActionsAdapter(self.config, metrics=self.recorder),
+                ),
+            )
+            routes[WorkerClass.CI] = JobTypeDispatcher({"CI_RECONCILE": ci.execute})
+        return routes
+
+    def _approved_codex_executable(self) -> str | None:
+        configured = self.config.codex.executable
+        approved = (Path("/usr/bin/codex"), Path("/usr/local/bin/codex"))
+        if configured in {str(item) for item in approved}:
+            return configured if Path(configured).is_file() else None
+        if configured == "codex":
+            return next((str(item) for item in approved if item.is_file()), None)
+        return None
 
     def _database_available(self) -> bool:
         try:

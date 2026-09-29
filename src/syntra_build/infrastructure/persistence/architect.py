@@ -200,6 +200,20 @@ class SQLiteArchitectInteractionRepository:
             raise PersistenceError("accepted Architect task does not exist")
         return ArchitectTask.from_dict(json.loads(row[0]))
 
+    def accepted_task_for_milestone(
+        self, project_id: str, milestone_id: str
+    ) -> ArchitectTask:
+        row = self._connection.execute(
+            """SELECT s.normalised_payload_json FROM architect_requests q
+               JOIN architect_responses s ON s.architect_request_id=q.id
+               WHERE q.project_id=? AND q.milestone_id=? AND q.request_type='TASK'
+                 AND q.status='SUCCEEDED' ORDER BY q.completed_at DESC,q.id DESC LIMIT 1""",
+            (project_id, milestone_id),
+        ).fetchone()
+        if row is None:
+            raise PersistenceError("accepted Architect task does not exist")
+        return ArchitectTask.from_dict(json.loads(row[0]))
+
     def succeed(
         self,
         *,
