@@ -10,8 +10,10 @@ ExecStart=/opt/syntra-build/venv/bin/python -m syntra_build.service --config /et
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=45s
-NoNewPrivileges=true
+# Deliberately omitted: the trusted service may invoke exactly one sudoers-
+# constrained identity-transition helper. The worker itself uses no_new_privs.
 PrivateTmp=true
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

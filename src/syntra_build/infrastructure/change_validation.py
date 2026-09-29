@@ -218,6 +218,8 @@ class RegexSecretScanner:
             re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
         ),
         ("AWS_ACCESS_KEY", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
+        ("TELEGRAM_BOT_TOKEN", re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{30,}\b")),
+        ("OPENAI_API_KEY", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b")),
         (
             "CONNECTION_CREDENTIAL",
             re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s:/]+:[^\s/@]+@", re.I),

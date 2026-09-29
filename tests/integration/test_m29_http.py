@@ -32,7 +32,7 @@ class Sampler:
 def test_real_http_endpoints_and_observation_only_metrics(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     connection = open_database(database)
-    assert apply_migrations(connection) == 25
+    assert apply_migrations(connection) == 26
     before = connection.total_changes
     observed_tables = (
         "projects",

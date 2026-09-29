@@ -84,7 +84,7 @@ def test_024_to_025_preserves_active_work_and_adds_append_only_audit(
         is None
     )
     apply_migrations(db)
-    assert current_schema_version(db) == 25
+    assert current_schema_version(db) == 26
     assert db.execute("SELECT state FROM projects").fetchone()[0] == "BUILDING"
     assert tuple(db.execute("SELECT * FROM projects").fetchone()) == before
     names = {
@@ -263,7 +263,7 @@ def test_024_to_025_preserves_m25_m26_and_active_attempt_history(
         ).fetchone()[0]
         == "REQUESTED"
     )
-    assert current_schema_version(db) == 25
+    assert current_schema_version(db) == 26
     assert db.execute("PRAGMA foreign_key_check").fetchall() == []
     db.close()
 
