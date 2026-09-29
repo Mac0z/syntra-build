@@ -1,5 +1,11 @@
 """Provider-independent core domain records for Syntra Build."""
 
+from syntra_build.domain.architect_tasks import (
+    ARCHITECT_TASK_INTERFACE_VERSION,
+    ArchitectTask,
+    ArchitectTaskRequest,
+    ArchitectTaskType,
+)
 from syntra_build.domain.design import (
     ARCHITECT_INTERFACE_VERSION,
     ArchitectDesignMode,
@@ -118,6 +124,10 @@ from syntra_build.domain.specification import (
 )
 
 __all__ = [
+    "ARCHITECT_TASK_INTERFACE_VERSION",
+    "ArchitectTask",
+    "ArchitectTaskRequest",
+    "ArchitectTaskType",
     "ARCHITECT_INTERFACE_VERSION",
     "ArchitectDesignMode",
     "ArchitectHumanGateRequest",

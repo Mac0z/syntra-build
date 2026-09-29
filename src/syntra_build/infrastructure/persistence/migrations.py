@@ -1239,6 +1239,34 @@ MIGRATIONS: tuple[Migration, ...] = (
                 BEGIN SELECT RAISE(ABORT,'security resolutions are preservation-oriented'); END""",
         ),
     ),
+    Migration(
+        version=27,
+        name="027_m32_orchestration",
+        statements=(
+            # SQLite cannot ALTER a CHECK constraint. Editing the canonical CREATE
+            # SQL is the only preservation-safe option here: recreating this parent
+            # would rewrite the foreign-key targets of all M17/M24 evidence tables.
+            "PRAGMA writable_schema=ON",
+            """UPDATE sqlite_master SET sql=replace(sql,
+                'request_type IN (''DESIGN'',''SPECIFICATION_DRAFT'',''REVIEW'')',
+                'request_type IN (''DESIGN'',''SPECIFICATION_DRAFT'',''REVIEW'',''TASK'')')
+                WHERE type='table' AND name='architect_requests'""",
+            """UPDATE sqlite_master SET sql=replace(sql,
+                'response_type IN (''DESIGN'',''SPECIFICATION_DRAFT'',''REVIEW'')',
+                'response_type IN (''DESIGN'',''SPECIFICATION_DRAFT'',''REVIEW'',''TASK'')')
+                WHERE type='table' AND name='architect_responses'""",
+            "PRAGMA writable_schema=OFF",
+            # Expire this connection's parsed schema so TASK is accepted without
+            # requiring a daemon restart immediately after migration.
+            "PRAGMA schema_version=27",
+            """CREATE UNIQUE INDEX one_active_m32_project_job ON jobs(project_id,job_type)
+                WHERE milestone_id IS NULL AND job_type IN ('ARCHITECT_DESIGN','SPECIFICATION_DRAFT','REPOSITORY_PROVISION')
+                AND state IN ('QUEUED','DISPATCHED','RUNNING','WAITING_EXTERNAL','RETRY_WAIT')""",
+            """CREATE UNIQUE INDEX one_active_m32_milestone_job ON jobs(milestone_id,job_type)
+                WHERE milestone_id IS NOT NULL AND job_type IN ('ARCHITECT_TASK','WORKSPACE_PREPARE','CODEX_RUN','CHANGE_VALIDATE','GIT_COMMIT','GIT_PUSH','PR_CREATE','ARCHITECT_REVIEW','PR_MERGE')
+                AND state IN ('QUEUED','DISPATCHED','RUNNING','WAITING_EXTERNAL','RETRY_WAIT')""",
+        ),
+    ),
 )
 
 

@@ -14,7 +14,7 @@ def test_m29_probe_loads_real_host_configuration(tmp_path: Path) -> None:
     data.mkdir()
     database = data / "state.sqlite3"
     with open_database(database) as connection:
-        assert apply_migrations(connection) == 26
+        assert apply_migrations(connection) == 27
     config = tmp_path / "config.json"
     config.write_text(
         json.dumps(

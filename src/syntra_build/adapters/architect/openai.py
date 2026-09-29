@@ -21,6 +21,8 @@ from syntra_build.domain import (
     ArchitectDesignResponse,
     ArchitectReview,
     ArchitectReviewRequest,
+    ArchitectTask,
+    ArchitectTaskRequest,
     SpecificationDraft,
     SpecificationDraftRequest,
 )
@@ -215,6 +217,60 @@ REVIEW_SCHEMA: dict[str, object] = {
         },
     },
 }
+TASK_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "interface_version",
+        "correlation_id",
+        "project_id",
+        "milestone_id",
+        "task_type",
+        "objective",
+        "requirements",
+        "acceptance_criteria",
+        "constraints",
+        "tests_required",
+        "explicit_exclusions",
+        "files_of_interest",
+        "architecture_notes",
+        "prior_failure_summary",
+        "prior_review_findings",
+        "human_feedback",
+        "recommended_commands",
+    ],
+    "properties": {
+        "interface_version": {"type": "string", "const": "1.0"},
+        "correlation_id": {"type": "string", "minLength": 1},
+        "project_id": {"type": "string", "minLength": 1},
+        "milestone_id": {"type": "string", "minLength": 1},
+        "task_type": {
+            "type": "string",
+            "enum": ["IMPLEMENT", "CI_REWORK", "REVIEW_REWORK", "HUMAN_TEST_REWORK"],
+        },
+        "objective": {"type": "string", "minLength": 1},
+        **{
+            name: {"type": "array", "items": {"type": "string", "minLength": 1}}
+            for name in (
+                "requirements",
+                "acceptance_criteria",
+                "constraints",
+                "tests_required",
+                "explicit_exclusions",
+                "files_of_interest",
+                "architecture_notes",
+                "prior_review_findings",
+                "recommended_commands",
+            )
+        },
+        "prior_failure_summary": {
+            "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]
+        },
+        "human_feedback": {
+            "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]
+        },
+    },
+}
 Transport = Callable[[dict[str, object], str, float], dict[str, object]]
 _T = TypeVar("_T")
 
@@ -393,6 +449,41 @@ class OpenAIArchitectProvider:
 
     def review(self, request: ArchitectReviewRequest) -> ArchitectReview:
         return self._recorded(lambda: self._review(request))
+
+    def task(self, request: ArchitectTaskRequest) -> ArchitectTask:
+        return self._recorded(lambda: self._task(request))
+
+    def _task(self, request: ArchitectTaskRequest) -> ArchitectTask:
+        payload: dict[str, object] = {
+            "model": self.model,
+            "reasoning": {"effort": self._reasoning_effort},
+            "instructions": (
+                "Create only the requested advisory coding task from the supplied authoritative "
+                "state. Do not use tools, mutate workflow state, commit, push, create PRs, or merge."
+            ),
+            "input": json.dumps(
+                request.to_dict(), sort_keys=True, separators=(",", ":")
+            ),
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "architect_task",
+                    "strict": True,
+                    "schema": TASK_SCHEMA,
+                }
+            },
+            "store": False,
+        }
+        raw = self._send(payload)
+        try:
+            result = ArchitectTask.from_dict(self._output(raw))
+        except (DomainValidationError, TypeError, ValueError) as error:
+            raise ArchitectError(
+                ArchitectFailureKind.MALFORMED_RESPONSE,
+                "Architect provider returned malformed task output",
+            ) from error
+        self._capture_usage(raw)
+        return result
 
     def _review(self, request: ArchitectReviewRequest) -> ArchitectReview:
         """Review supplied evidence only; the provider receives no GitHub capability."""
