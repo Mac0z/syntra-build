@@ -16,7 +16,14 @@ from syntra_build.application.provisioning import (
     RemoteRepository,
     RepositoryProvisioningService,
 )
+from syntra_build.application.security import SecurityPolicy
 from syntra_build.domain import ProjectId, ProjectState, RepositoryVisibility
+from syntra_build.domain.security import (
+    SecurityActorType,
+    SecurityEventType,
+    SecurityResolutionCode,
+    SecuritySeverity,
+)
 from syntra_build.infrastructure.persistence import (
     SQLiteProjectRepository,
     SQLiteProvisioningRepository,
@@ -44,6 +51,9 @@ def _hash(content: str) -> str:
 def _approved_project(
     connection: sqlite3.Connection,
     visibility: RepositoryVisibility = RepositoryVisibility.PUBLIC,
+    *,
+    spec_content: str = SPEC,
+    agents_content: str = AGENTS,
 ) -> None:
     now = NOW.isoformat()
     connection.execute(
@@ -62,8 +72,8 @@ def _approved_project(
         ),
     )
     for document_id, kind, content in (
-        (SPEC_ID, "SPEC", SPEC),
-        (AGENTS_ID, "AGENTS", AGENTS),
+        (SPEC_ID, "SPEC", spec_content),
+        (AGENTS_ID, "AGENTS", agents_content),
     ):
         connection.execute(
             """INSERT INTO project_documents
@@ -707,3 +717,88 @@ def test_restart_reuses_identified_repository_and_durable_baseline(
         (str(PID),),
     ).fetchone()[0]
     assert transition_count == 1
+
+
+@pytest.mark.parametrize("document_type", ["SPEC", "AGENTS"])
+def test_approved_design_secret_blocks_before_repository_mutation(
+    tmp_path: Path, document_type: str
+) -> None:
+    synthetic = "api_key = 'sk-proj-SYNTHETIC0123456789abcdefghijk'\n"
+    database = open_database(tmp_path / "secret-state.db")
+    apply_migrations(database)
+    _approved_project(
+        database,
+        spec_content=synthetic if document_type == "SPEC" else SPEC,
+        agents_content=synthetic if document_type == "AGENTS" else AGENTS,
+    )
+    service, github, git = _service(database)
+
+    with pytest.raises(ProvisioningError) as raised:
+        service.provision(PID, NOW, "design-secret")
+
+    assert raised.value.failure is ProvisioningFailure.SECURITY_BLOCKED
+    assert github.create_calls == git.commit_calls == git.push_calls == 0
+    event = database.execute(
+        "SELECT safe_details_json FROM security_events WHERE correlation_id=?",
+        ("design-secret",),
+    ).fetchone()
+    assert event is not None
+    assert synthetic.strip() not in event["safe_details_json"]
+
+
+def test_persisted_security_condition_blocks_all_provisioning_mutations(
+    database: sqlite3.Connection,
+) -> None:
+    service, github, git = _service(database)
+    policy = SecurityPolicy(database)
+    event = policy.record(
+        SecurityEventType.PROTECTED_PATH_CHANGE,
+        SecuritySeverity.HIGH,
+        project_id=PID,
+        source_component="test_policy",
+        correlation_id="block-provisioning",
+        blocking=True,
+        created_at=NOW,
+    )
+
+    with pytest.raises(ProvisioningError, match="security policy"):
+        service.provision(PID, NOW, "blocked")
+    assert (github.create_calls, github.configure_calls, git.push_calls) == (0, 0, 0)
+
+    policy.resolve(
+        event.id,
+        SecurityResolutionCode.CLEAN_REVALIDATION,
+        "trusted-resolution",
+        SecurityActorType.SYSTEM,
+        resolved_at=NOW,
+    )
+    assert service.provision(PID, NOW, "allowed").verified
+
+
+def test_security_condition_appearing_after_discovery_blocks_create(
+    database: sqlite3.Connection,
+) -> None:
+    class BlockingLookup(FakeGitHub):
+        def get_repository(self, owner: str, name: str) -> RemoteRepository | None:
+            result = super().get_repository(owner, name)
+            if self.lookup_calls == 1:
+                SecurityPolicy(self.connection).record(
+                    SecurityEventType.REPOSITORY_IDENTITY_MISMATCH,
+                    SecuritySeverity.CRITICAL,
+                    project_id=PID,
+                    source_component="test_race",
+                    correlation_id="race",
+                    blocking=True,
+                    created_at=NOW,
+                )
+            return result
+
+    blocking_github = BlockingLookup(database)
+    service, observed_github, git = _service(database, blocking_github)
+    with pytest.raises(ProvisioningError, match="security policy"):
+        service.provision(PID, NOW, "race")
+    assert (
+        observed_github.create_calls,
+        observed_github.configure_calls,
+        git.push_calls,
+    ) == (0, 0, 0)

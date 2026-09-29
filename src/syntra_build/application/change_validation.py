@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from syntra_build.application.security import SecurityPolicy
 from syntra_build.domain.change_validation import (
     ChangedFile,
     ChangeSet,
@@ -20,6 +21,7 @@ from syntra_build.domain.change_validation import (
     ValidationFinding,
 )
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
+from syntra_build.domain.security import SecurityEventType, SecuritySeverity
 from syntra_build.domain.workspaces import WorkspaceError
 from syntra_build.infrastructure.change_validation import (
     ChangeCollector,
@@ -37,7 +39,10 @@ _PROTECTED = (
     ".github/workflows/**",
     ".github/actions/**",
     "deployment/**",
-    "scripts/install*",
+    "scripts/host/**",
+    "docs/SECURITY.md",
+    "docs/security/**",
+    "authentication/**",
     "**/release/**",
     "**/signing/**",
     "SECURITY.md",
@@ -83,6 +88,7 @@ class ChangeValidationService:
         self.collector = collector or ChangeCollector()
         self.scanner = scanner or RegexSecretScanner()
         self.protected_paths = protected_paths or ProtectedPathPolicy()
+        self.security = SecurityPolicy(connection)
 
     def validate(
         self,
@@ -282,8 +288,69 @@ class ChangeValidationService:
             self.protected_paths.version,
             now,
         )
+        security_map = {
+            FindingCode.SECRET_DETECTED: (
+                SecurityEventType.SECRET_DETECTED,
+                SecuritySeverity.HIGH,
+            ),
+            FindingCode.WORKSPACE_ESCAPE_ATTEMPT: (
+                SecurityEventType.WORKSPACE_ESCAPE_ATTEMPT,
+                SecuritySeverity.CRITICAL,
+            ),
+            FindingCode.PROTECTED_PATH_CHANGE: (
+                SecurityEventType.PROTECTED_PATH_CHANGE,
+                SecuritySeverity.HIGH,
+            ),
+            FindingCode.REPOSITORY_IDENTITY_MISMATCH: (
+                SecurityEventType.REPOSITORY_IDENTITY_MISMATCH,
+                SecuritySeverity.CRITICAL,
+            ),
+            FindingCode.UNEXPECTED_GIT_HISTORY_CHANGE: (
+                SecurityEventType.UNEXPECTED_GIT_HISTORY_CHANGE,
+                SecuritySeverity.CRITICAL,
+            ),
+            FindingCode.TEXT_SCAN_LIMIT_EXCEEDED: (
+                SecurityEventType.TEXT_SCAN_LIMIT_EXCEEDED,
+                SecuritySeverity.HIGH,
+            ),
+        }
+        active_types = {
+            security_map[item.code][0]
+            for item in findings
+            if item.blocking and item.code in security_map
+        }
         with transaction(self.connection):
             self.records.save(result)
+            self.security.resolve_clean_revalidation(
+                project_id=project_id,
+                milestone_id=milestone_id,
+                source_reference=str(workspace.id),
+                active_types=active_types,
+                correlation_id=correlation_id,
+                resolved_at=now,
+            )
+            for finding_item in findings:
+                mapped = security_map.get(finding_item.code)
+                if mapped is None or not finding_item.blocking:
+                    continue
+                event_type, severity = mapped
+                self.security.record(
+                    event_type,
+                    severity,
+                    project_id=project_id,
+                    milestone_id=milestone_id,
+                    source_component="change_validation",
+                    source_reference=str(workspace.id),
+                    correlation_id=correlation_id,
+                    safe_details={
+                        "finding_id": finding_item.id,
+                        "path": finding_item.path,
+                        "location": finding_item.location,
+                        "fingerprint": finding_item.fingerprint,
+                    },
+                    blocking=True,
+                    created_at=now,
+                )
         counts = Counter(
             f"{item.code.value}:{item.severity.value}" for item in findings
         )

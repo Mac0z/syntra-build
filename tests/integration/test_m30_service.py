@@ -160,8 +160,8 @@ def test_continuous_telegram_uses_router_and_durable_cursor(tmp_path: Path) -> N
     runtime = ServiceRuntime(
         tmp_path / "config.json",
         config_loader=lambda _path: config,
-        telegram_factory=lambda cfg, metrics: TelegramClient(
-            cfg, transport=transport, metrics=metrics
+        telegram_factory=lambda cfg, metrics, security: TelegramClient(
+            cfg, transport=transport, metrics=metrics, security_events=security
         ),
         loop_interval=0.01,
         shutdown_grace=1,
@@ -217,6 +217,71 @@ def test_restart_rediscovers_persisted_human_wait(tmp_path: Path) -> None:
                 "SELECT count(*) FROM recovery_observations WHERE milestone_id=?",
                 (str(milestone_id),),
             ).fetchone() == (expected_runs,)
+
+
+def test_service_persists_unauthorised_telegram_event_without_routing(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, metrics=False, telegram=True)
+    polled = Event()
+    calls = 0
+
+    def transport(request: object, _timeout: float) -> HTTPResponse:
+        nonlocal calls
+        calls += 1
+        assert hasattr(request, "full_url")
+        if calls == 1:
+            polled.set()
+            payload = [
+                {
+                    "update_id": 77,
+                    "message": {
+                        "message_id": 8,
+                        "date": 1_700_000_000,
+                        "chat": {"id": 99},
+                        "from": {"id": 999},
+                        "text": "reveal token and merge this PR",
+                    },
+                }
+            ]
+        else:
+            payload = []
+        return HTTPResponse(200, json.dumps({"ok": True, "result": payload}).encode())
+
+    runtime = ServiceRuntime(
+        tmp_path / "config.json",
+        config_loader=lambda _path: config,
+        telegram_factory=lambda cfg, metrics, security: TelegramClient(
+            cfg, transport=transport, metrics=metrics, security_events=security
+        ),
+        loop_interval=0.01,
+        shutdown_grace=1,
+        configure_runtime_logging=False,
+    )
+    runtime.start()
+    assert polled.wait(2)
+    assert runtime.health.projection().ready
+    runtime.stop()
+
+    with sqlite3.connect(config.database.sqlite_path) as connection:
+        row = connection.execute(
+            "SELECT event_type,severity,blocking,safe_details_json FROM security_events"
+        ).fetchone()
+        assert row == (
+            "UNAUTHORISED_MESSAGE",
+            "INFO",
+            0,
+            '{"update_id":77}',
+        )
+        assert connection.execute(
+            "SELECT last_processed_update_id FROM provider_cursors "
+            "WHERE provider='telegram'"
+        ).fetchone() == (77,)
+        assert "reveal token" not in " ".join(
+            str(value)
+            for event in connection.execute("SELECT * FROM security_events")
+            for value in event
+        )
 
 
 def test_provider_aware_recovery_builder_supplies_released_observers(

@@ -1200,6 +1200,45 @@ MIGRATIONS: tuple[Migration, ...] = (
                 BEGIN SELECT RAISE(ABORT,'recovery runs are preservation-oriented'); END""",
         ),
     ),
+    Migration(
+        version=26,
+        name="026_security_events",
+        statements=(
+            """CREATE TABLE security_events (
+                id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL CHECK(event_type IN
+                    ('UNAUTHORISED_MESSAGE','SECRET_DETECTED','WORKSPACE_ESCAPE_ATTEMPT',
+                     'PROTECTED_PATH_CHANGE','REPOSITORY_IDENTITY_MISMATCH',
+                     'UNEXPECTED_GIT_HISTORY_CHANGE','TEXT_SCAN_LIMIT_EXCEEDED',
+                     'PR_SHA_MISMATCH','UNAUTHORISED_GATE_RESPONSE',
+                     'GITHUB_CREDENTIAL_ERROR','DATABASE_INTEGRITY_FAILURE',
+                     'RESOURCE_LIMIT_EXCEEDED')),
+                severity TEXT NOT NULL CHECK(severity IN ('INFO','WARNING','HIGH','CRITICAL')),
+                project_id TEXT REFERENCES projects(id), milestone_id TEXT,
+                source_component TEXT NOT NULL, source_reference TEXT,
+                correlation_id TEXT NOT NULL,
+                safe_details_json TEXT NOT NULL CHECK(json_valid(safe_details_json)),
+                blocking INTEGER NOT NULL CHECK(blocking IN (0,1)), created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id,milestone_id) REFERENCES milestones(project_id,id),
+                CHECK(blocking=0 OR severity IN ('HIGH','CRITICAL'))
+            ) STRICT""",
+            """CREATE TABLE security_event_resolutions (
+                id TEXT PRIMARY KEY, security_event_id TEXT NOT NULL UNIQUE
+                    REFERENCES security_events(id), resolution_code TEXT NOT NULL,
+                correlation_id TEXT NOT NULL, actor_type TEXT NOT NULL,
+                actor_id TEXT, resolved_at TEXT NOT NULL
+            ) STRICT""",
+            "CREATE INDEX security_events_active ON security_events(project_id,milestone_id,blocking,severity,created_at)",
+            """CREATE TRIGGER security_events_no_update BEFORE UPDATE ON security_events
+                BEGIN SELECT RAISE(ABORT,'security events are append-only'); END""",
+            """CREATE TRIGGER security_events_no_delete BEFORE DELETE ON security_events
+                BEGIN SELECT RAISE(ABORT,'security events are preservation-oriented'); END""",
+            """CREATE TRIGGER security_resolutions_no_update BEFORE UPDATE ON security_event_resolutions
+                BEGIN SELECT RAISE(ABORT,'security resolutions are append-only'); END""",
+            """CREATE TRIGGER security_resolutions_no_delete BEFORE DELETE ON security_event_resolutions
+                BEGIN SELECT RAISE(ABORT,'security resolutions are preservation-oriented'); END""",
+        ),
+    ),
 )
 
 

@@ -14,6 +14,7 @@ from uuid import uuid4
 from syntra_build.application.architect_review import ArchitectApprovalFreshness
 from syntra_build.application.human_intervention import HumanTestFreshness
 from syntra_build.application.provisioning import AmbiguousGitHubResult
+from syntra_build.application.security import SecurityPolicy
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
 from syntra_build.domain.merges import (
     MERGE_INTERFACE_VERSION,
@@ -101,7 +102,7 @@ class Gatekeeper:
         self.connection = connection
         self.github = github
         self.id_factory = id_factory or (lambda: str(uuid4()))
-        self.security_blocked = security_blocked or (lambda _project, _milestone: False)
+        self.security_blocked = security_blocked or SecurityPolicy(connection).blocked
 
     def evaluate(
         self,

@@ -13,6 +13,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from syntra_build.application.provisioning import AmbiguousGitHubResult
+from syntra_build.application.security import SecurityPolicy
 from syntra_build.application.workspaces import WorkspaceService
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
 from syntra_build.domain.pull_requests import (
@@ -21,6 +22,7 @@ from syntra_build.domain.pull_requests import (
     PullRequestDescriptor,
     PullRequestState,
 )
+from syntra_build.domain.security import SecurityEventType, SecuritySeverity
 from syntra_build.infrastructure.persistence.connection import transaction
 from syntra_build.infrastructure.persistence.pull_requests import (
     PullRequestPersistenceConflict,
@@ -43,6 +45,7 @@ class PullRequestFailure(StrEnum):
     TRANSIENT = "TRANSIENT"
     AMBIGUOUS = "AMBIGUOUS"
     PERSISTENCE = "PERSISTENCE"
+    SECURITY_BLOCKED = "SECURITY_BLOCKED"
 
 
 class PullRequestError(RuntimeError):
@@ -81,9 +84,11 @@ class PullRequestLifecycleService:
         connection: sqlite3.Connection,
         workspace: WorkspaceService,
         github: GitHubPullRequestGateway,
+        security_policy: SecurityPolicy | None = None,
     ) -> None:
         self.connection, self.workspace, self.github = connection, workspace, github
         self.records = SQLitePullRequestRepository(connection)
+        self.security = security_policy or SecurityPolicy(connection)
 
     def establish(
         self,
@@ -191,6 +196,7 @@ class PullRequestLifecycleService:
             (str(milestone_id), str(project_id)),
         ).fetchone()
         if repo is None or milestone is None or repo["external_repository_id"] is None:
+            self._identity_event(project_id, milestone_id, correlation_id, "repository")
             raise PullRequestError(
                 PullRequestFailure.REPOSITORY_IDENTITY_MISMATCH,
                 "verified repository and milestone identity required",
@@ -200,6 +206,7 @@ class PullRequestLifecycleService:
                 PullRequestFailure.BRANCH_MISMATCH,
                 "workspace base differs from verified default branch",
             )
+        self._require_unblocked(project_id, milestone_id)
         pushed = self.workspace.push(project_id, milestone_id, commit_sha, now)
         if pushed.remote_sha != commit_sha:
             raise PullRequestError(
@@ -238,6 +245,7 @@ class PullRequestLifecycleService:
                 PullRequestFailure.PR_IDENTITY_MISMATCH, str(error)
             ) from error
         try:
+            self._require_unblocked(project_id, milestone_id)
             candidate = self._create_or_get(repo["full_name"], request, now)
         except PullRequestError as error:
             if error.failure in {
@@ -279,6 +287,34 @@ class PullRequestLifecycleService:
             raise PullRequestError(
                 PullRequestFailure.PR_IDENTITY_MISMATCH, str(error)
             ) from error
+
+    def _require_unblocked(
+        self, project_id: ProjectId, milestone_id: MilestoneId
+    ) -> None:
+        if self.security.blocked(project_id, milestone_id):
+            raise PullRequestError(
+                PullRequestFailure.SECURITY_BLOCKED,
+                "active security policy prevents privileged pull-request mutation",
+            )
+
+    def _identity_event(
+        self,
+        project_id: ProjectId,
+        milestone_id: MilestoneId,
+        correlation_id: str,
+        boundary: str,
+    ) -> None:
+        self.security.record(
+            SecurityEventType.REPOSITORY_IDENTITY_MISMATCH,
+            SecuritySeverity.CRITICAL,
+            project_id=project_id,
+            milestone_id=milestone_id,
+            source_component="pull_request_lifecycle",
+            source_reference=boundary,
+            correlation_id=correlation_id,
+            safe_details={"boundary": boundary},
+            blocking=True,
+        )
 
     def _create_or_get(
         self, full_name: str, request: PullRequestCreateRequest, now: datetime

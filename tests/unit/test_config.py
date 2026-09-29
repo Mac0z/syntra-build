@@ -14,6 +14,7 @@ from syntra_build.infrastructure.config import (
     SecretValue,
     TelegramConfig,
     load_config,
+    read_protected_secret_file,
 )
 
 
@@ -47,6 +48,23 @@ def test_default_configuration_loads_without_credentials() -> None:
         WorkerClass.RECOVERY: 2,
         WorkerClass.INTERNAL: 4,
     }
+
+
+def test_protected_secret_requires_regular_owner_only_file(tmp_path: Path) -> None:
+    secret = tmp_path / "credential"
+    secret.write_text("synthetic-only")
+    secret.chmod(0o600)
+    assert read_protected_secret_file(secret, "test") == SecretValue("synthetic-only")
+    secret.chmod(0o640)
+    with pytest.raises(RuntimeError, match="permissions"):
+        read_protected_secret_file(secret, "test")
+    secret.unlink()
+    target = tmp_path / "target"
+    target.write_text("synthetic-only")
+    target.chmod(0o600)
+    secret.symlink_to(target)
+    with pytest.raises(RuntimeError, match="symlink"):
+        read_protected_secret_file(secret, "test")
 
 
 def test_development_paths_are_canonical_and_derived(tmp_path: Path) -> None:

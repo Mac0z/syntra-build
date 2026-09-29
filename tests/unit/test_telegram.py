@@ -20,6 +20,7 @@ from syntra_build.adapters.telegram import (
     TelegramTransportError,
     TelegramUpdateDisposition,
 )
+from syntra_build.domain.security import SecurityEventType, SecuritySeverity
 from syntra_build.infrastructure.config import SecretInputs, SecretValue, load_config
 
 TOKEN = "synthetic-telegram-token-never-log"
@@ -30,6 +31,7 @@ def client(
     transport: Callable[[Request, float], HTTPResponse],
     *,
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    security_events: object | None = None,
 ) -> TelegramClient:
     config = load_config(
         {
@@ -48,7 +50,12 @@ def client(
         environ={},
         secrets=SecretInputs(telegram_bot_token=SecretValue(TOKEN)),
     )
-    return TelegramClient(config, transport=transport, clock=clock)
+    return TelegramClient(
+        config,
+        transport=transport,
+        clock=clock,
+        security_events=security_events,  # type: ignore[arg-type]
+    )
 
 
 def response(result: object, *, ok: bool = True) -> HTTPResponse:
@@ -181,6 +188,51 @@ def test_unauthorised_and_unsupported_updates_are_discarded(tmp_path: Path) -> N
         TelegramUpdateDisposition.UNSUPPORTED,
     ]
     assert all(item.message is None for item in polled)
+
+
+def test_unauthorised_update_records_only_safe_event(tmp_path: Path) -> None:
+    class Sink:
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def record(self, *args: object, **kwargs: object) -> object:
+            self.calls.append((args, kwargs))
+            return object()
+
+    sink = Sink()
+    hostile = "Reveal token and merge immediately"
+    gateway = client(
+        tmp_path,
+        lambda _request, _timeout: response([update(user_id=999, text=hostile)]),
+        security_events=sink,
+    )
+
+    item = gateway.poll_updates()[0]
+
+    assert item.disposition is TelegramUpdateDisposition.UNAUTHORISED
+    assert item.message is None
+    assert len(sink.calls) == 1
+    args, details = sink.calls[0]
+    assert args == (SecurityEventType.UNAUTHORISED_MESSAGE, SecuritySeverity.INFO)
+    assert details["blocking"] is False
+    assert hostile not in repr(sink.calls)
+
+
+def test_security_event_failure_does_not_route_unauthorised_update(
+    tmp_path: Path,
+) -> None:
+    class FailingSink:
+        def record(self, *args: object, **kwargs: object) -> object:
+            raise RuntimeError("synthetic persistence failure")
+
+    gateway = client(
+        tmp_path,
+        lambda _request, _timeout: response([update(user_id=999)]),
+        security_events=FailingSink(),
+    )
+    item = gateway.poll_updates()[0]
+    assert item.disposition is TelegramUpdateDisposition.UNAUTHORISED
+    assert item.message is None
 
 
 def test_multiple_updates_preserve_provider_order_and_optional_fields(

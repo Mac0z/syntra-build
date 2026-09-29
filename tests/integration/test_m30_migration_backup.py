@@ -54,11 +54,11 @@ def test_old_schema_is_verified_before_migration(tmp_path: Path) -> None:
     apply_migrations(connection, MIGRATIONS[:-1])
     connection.close()
     migrated = bootstrap_database(config)
-    assert current_schema_version(migrated) == 25
+    assert current_schema_version(migrated) == 26
     migrated.close()
     backups = tuple(config.filesystem.backup_root.glob("*-pre-migration.sqlite3"))
     assert len(backups) == 1
-    assert verify_database(backups[0]) == 24
+    assert verify_database(backups[0]) == 25
 
 
 def test_failed_backup_prevents_migration(
@@ -76,14 +76,14 @@ def test_failed_backup_prevents_migration(
     with pytest.raises(BackupError):
         bootstrap_database(config)
     connection = open_database(config.database.sqlite_path)
-    assert current_schema_version(connection) == 24
+    assert current_schema_version(connection) == 25
     connection.close()
 
 
 def test_schema_ahead_fails_closed(tmp_path: Path) -> None:
     config = _config(tmp_path)
     connection = bootstrap_database(config)
-    connection.execute("INSERT INTO schema_migrations VALUES (26, 'unknown')")
+    connection.execute("INSERT INTO schema_migrations VALUES (27, 'unknown')")
     connection.close()
     with pytest.raises(MigrationError):
         bootstrap_database(config)

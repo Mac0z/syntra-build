@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -28,9 +29,16 @@ from syntra_build.infrastructure.config.models import (
 
 def read_protected_secret_file(path: Path, label: str) -> SecretValue | None:
     """Read an optional deployed secret after enforcing private file permissions."""
+    if path.is_symlink():
+        raise RuntimeError(f"{label} file must not be a symlink")
     if not path.exists():
         return None
-    if path.stat().st_mode & 0o077:
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"{label} file must be regular")
+    if metadata.st_uid != os.geteuid():
+        raise RuntimeError(f"{label} file owner is unsafe")
+    if metadata.st_mode & 0o077:
         raise RuntimeError(f"{label} file permissions are too broad")
     return SecretValue(path.read_text(encoding="utf-8").strip())
 

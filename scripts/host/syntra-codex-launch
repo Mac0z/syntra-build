@@ -86,7 +86,8 @@ setfacl -Rm "u:$worker:rX" "$repository"
 trap 'remove_worker_acl "$workspace"' EXIT
 
 cd -- "$workspace"
-/usr/bin/setpriv --reuid="$worker" --regid="$worker" --init-groups --no-new-privs \
+/usr/bin/prlimit --nproc=128 --nofile=1024 --fsize=104857600 \
+  /usr/bin/setpriv --reuid="$worker" --regid="$worker" --init-groups --no-new-privs \
   /usr/bin/env -i HOME="$home" USER="$worker" LOGNAME="$worker" \
   XDG_CONFIG_HOME="$home/.config" PATH=/usr/local/bin:/usr/bin:/bin \
   LANG=C.UTF-8 LC_ALL=C.UTF-8 TMPDIR=/tmp \

@@ -18,6 +18,7 @@ from syntra_build.application.gatekeeper import (
     MergeIdentityError,
 )
 from syntra_build.application.provisioning import AmbiguousGitHubResult
+from syntra_build.application.security import SecurityPolicy
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
 from syntra_build.domain.merges import (
     MERGE_INTERFACE_VERSION,
@@ -32,6 +33,7 @@ from syntra_build.domain.pull_requests import (
     PullRequestDescriptor,
     PullRequestState,
 )
+from syntra_build.domain.security import SecurityEventType, SecuritySeverity
 from syntra_build.infrastructure.persistence import apply_migrations, open_database
 
 NOW = datetime(2026, 9, 27, 12, tzinfo=UTC)
@@ -514,6 +516,23 @@ def test_security_policy_blocks(db) -> None:
     assert not guard(result, "security_policy")
 
 
+def test_persisted_security_policy_blocks_evaluation(db) -> None:
+    seed, github = seed_eligible(db)
+    SecurityPolicy(db).record(
+        SecurityEventType.SECRET_DETECTED,
+        SecuritySeverity.HIGH,
+        project_id=seed.project,
+        milestone_id=seed.milestone,
+        source_component="test_policy",
+        correlation_id="before-evaluate",
+        blocking=True,
+        created_at=NOW,
+    )
+    result = Gatekeeper(db, github).evaluate(seed.request, now=NOW)
+    assert not result.eligible
+    assert not guard(result, "security_policy")
+
+
 def test_mismatched_request_identity_is_rejected_and_audited_without_fk_error(
     db,
 ) -> None:
@@ -677,6 +696,22 @@ def test_security_block_activated_after_prepare_prevents_put(db) -> None:
     keeper = Gatekeeper(db, github, security_blocked=lambda _p, _m: blocked)
     attempt, request = keeper.prepare(seed.request, now=NOW)
     blocked = True
+    assert keeper.execute(attempt, request, now=NOW).status is MergeStatus.REJECTED
+    assert github.merge_calls == []
+
+
+def test_persisted_security_event_after_prepare_prevents_put(db) -> None:
+    seed, github, keeper, attempt, request = prepared(db)
+    SecurityPolicy(db).record(
+        SecurityEventType.REPOSITORY_IDENTITY_MISMATCH,
+        SecuritySeverity.CRITICAL,
+        project_id=seed.project,
+        milestone_id=seed.milestone,
+        source_component="test_policy",
+        correlation_id="after-prepare",
+        blocking=True,
+        created_at=NOW,
+    )
     assert keeper.execute(attempt, request, now=NOW).status is MergeStatus.REJECTED
     assert github.merge_calls == []
 

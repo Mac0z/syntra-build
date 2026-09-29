@@ -25,6 +25,11 @@ jobs:
       - name: Run unit tests
         run: python -m pytest
 
+      - name: Validate host shell syntax
+        run: |
+          bash -n scripts/host/*.sh
+          bash -n scripts/host/syntra-codex-launch
+
       - name: Run lint checks
         run: ruff check .
 
