@@ -21,12 +21,8 @@ from syntra_build.adapters.telegram import (
 )
 from syntra_build.application.ci_handoff import PullRequestCIHandoff
 from syntra_build.application.ci_monitor import CIMonitor
-from syntra_build.application.ci_scheduler import CIReconciliationExecutor
-from syntra_build.application.codex import BoundCodexRunner
 from syntra_build.application.gatekeeper import Gatekeeper
 from syntra_build.application.human_intervention import HumanInterventionService
-from syntra_build.application.lifecycle import JobTypeDispatcher, LifecycleCoordinator
-from syntra_build.application.m32_executors import InitialCodexExecutor
 from syntra_build.application.operational_health import (
     LocalResourceSampler,
     OperationalHealth,
@@ -34,8 +30,6 @@ from syntra_build.application.operational_health import (
 from syntra_build.application.pull_requests import PullRequestLifecycleService
 from syntra_build.application.recovery import RecoveryCoordinator, RecoveryServices
 from syntra_build.application.scheduler import (
-    JobExecutionDisposition,
-    JobExecutionResult,
     Scheduler,
     SchedulerLoop,
     WorkerCapacity,
@@ -44,10 +38,6 @@ from syntra_build.application.security import SecurityPolicy
 from syntra_build.application.workspaces import WorkspaceService
 from syntra_build.domain.jobs import WorkerClass
 from syntra_build.infrastructure.backup import BackupReason, SQLiteBackupService
-from syntra_build.infrastructure.codex_runner import (
-    LocalCodexCliRunner,
-    SudoCodexLauncher,
-)
 from syntra_build.infrastructure.config.host import (
     DEFAULT_HOST_CONFIG_PATH,
     load_host_config,
@@ -66,34 +56,6 @@ from syntra_build.m22_smoke import trusted_git_from_host_config
 from syntra_build.smoke import build_host_router, run_telegram_once
 
 _LOGGER = logging.getLogger(__name__)
-
-
-class _DisabledProductionOperation:
-    """Fail closed when a released operation has no configured provider factory."""
-
-    def __init__(self, job_type: str) -> None:
-        self.job_type = job_type
-
-    def __call__(self, job: object) -> JobExecutionResult:
-        del job
-        return JobExecutionResult(
-            JobExecutionDisposition.FAILED,
-            result={"failure": "required production provider is disabled"},
-        )
-
-
-_M32_JOB_TYPES = {
-    WorkerClass.ARCHITECT: (
-        "ARCHITECT_DESIGN",
-        "SPECIFICATION_DRAFT",
-        "ARCHITECT_TASK",
-        "ARCHITECT_REVIEW",
-    ),
-    WorkerClass.CODEX: ("CODEX_RUN", "CODEX_REVIEW_REWORK"),
-    WorkerClass.GIT: ("WORKSPACE_PREPARE", "CHANGE_VALIDATE", "GIT_COMMIT", "GIT_PUSH"),
-    WorkerClass.GITHUB: ("REPOSITORY_PROVISION", "PR_CREATE", "PR_MERGE"),
-    WorkerClass.CI: ("CI_RECONCILE",),
-}
 
 
 class ServiceRuntime:
@@ -146,72 +108,12 @@ class ServiceRuntime:
         self._backup_interval = backup_interval
         self._shutdown_grace = shutdown_grace
         self._executor_factory = executor_factory
-        # The production identity boundary is explicit and inspectable. Tests may
-        # inject fake executors, but production never constructs DirectProcessLauncher.
-        self.codex_launcher = SudoCodexLauncher()
 
     def _production_executors(self) -> Mapping[WorkerClass, object]:
+        """Expose only explicitly supplied, reviewed executor composition."""
         if self._executor_factory is not None:
             return self._executor_factory(self.config)
-        routes = {
-            worker: JobTypeDispatcher(
-                {name: _DisabledProductionOperation(name) for name in names}
-            )
-            for worker, names in _M32_JOB_TYPES.items()
-        }
-        executable = self._approved_codex_executable()
-        if executable is not None:
-
-            def runner_factory(connection: sqlite3.Connection) -> BoundCodexRunner:
-                workspace = WorkspaceService(
-                    connection,
-                    trusted_git_from_host_config(
-                        self.config, self.config.filesystem.data_root
-                    ),
-                    self.config.filesystem.data_root,
-                )
-                provider = LocalCodexCliRunner(
-                    connection,
-                    executable=executable,
-                    worker_identity=self.config.codex.worker_identity,
-                    artifact_root=self.config.filesystem.data_root / "artifacts",
-                    launcher=SudoCodexLauncher(),
-                )
-                return BoundCodexRunner(workspace, provider)
-
-            codex = InitialCodexExecutor(
-                self.config.database.sqlite_path,
-                runner_factory,
-                timeout_seconds=self.config.codex.execution_timeout_seconds,
-            )
-            routes[WorkerClass.CODEX] = JobTypeDispatcher(
-                {
-                    "CODEX_RUN": codex.execute,
-                    "CODEX_REVIEW_REWORK": _DisabledProductionOperation(
-                        "CODEX_REVIEW_REWORK"
-                    ),
-                }
-            )
-        if self.config.github.enabled:
-            ci = CIReconciliationExecutor(
-                self.config.database.sqlite_path,
-                lambda connection: CIMonitor(
-                    connection,
-                    GitHubPullRequestAdapter(self.config),
-                    GitHubActionsAdapter(self.config, metrics=self.recorder),
-                ),
-            )
-            routes[WorkerClass.CI] = JobTypeDispatcher({"CI_RECONCILE": ci.execute})
-        return routes
-
-    def _approved_codex_executable(self) -> str | None:
-        configured = self.config.codex.executable
-        approved = (Path("/usr/bin/codex"), Path("/usr/local/bin/codex"))
-        if configured in {str(item) for item in approved}:
-            return configured if Path(configured).is_file() else None
-        if configured == "codex":
-            return next((str(item) for item in approved if item.is_file()), None)
-        return None
+        return {}
 
     def _database_available(self) -> bool:
         try:
@@ -250,16 +152,12 @@ class ServiceRuntime:
 
     def _control_loop(self) -> None:
         connection = open_database(self.config.database.sqlite_path)
-        lifecycle = LifecycleCoordinator(connection)
-
-        def enqueue_due(_now: datetime) -> None:
-            lifecycle.enqueue_due()
-
         scheduler = Scheduler(
             SQLiteJobRepository(connection, lambda: str(uuid4())),
             self.capacity,
             self._production_executors(),  # type: ignore[arg-type]
-            due_work_enqueuer=enqueue_due,
+            # M32.0 keeps autonomous orchestration dormant until concrete routes exist.
+            due_work_enqueuer=None,
             metrics=self.recorder,
         )
         self.scheduler = scheduler

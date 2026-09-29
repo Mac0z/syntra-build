@@ -1,5 +1,11 @@
 # M32 End-to-End Generated-Project Acceptance
 
+> **Implementation status:** M32.0 provides provider-neutral orchestration,
+> persistence, and deterministic test foundations only. Production scheduler
+> adapters will be enabled incrementally in later M32.x work. M32.0 intentionally
+> leaves unfinished production workflow routes dormant; the full M32 milestone
+> remains incomplete until every original acceptance criterion below is demonstrated.
+
 M32 acceptance uses a **new, isolated database and configuration**. Never reuse the
 historical development or M30/M31 acceptance database.
 

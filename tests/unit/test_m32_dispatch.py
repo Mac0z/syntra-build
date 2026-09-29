@@ -33,6 +33,11 @@ def test_dispatcher_routes_only_registered_job_type() -> None:
 
 
 def test_dispatcher_fails_closed_for_unknown_job_type() -> None:
-    dispatcher = JobTypeDispatcher({"ARCHITECT_TASK": lambda _job: object()})
-    with pytest.raises(RuntimeError, match="unsupported trusted job type"):
-        dispatcher.execute(_job("USER_CONTROLLED"))
+    calls: list[str] = []
+    dispatcher = JobTypeDispatcher(
+        {"ARCHITECT_TASK": lambda job: calls.append(job.job_type)}
+    )
+    for untrusted in ("USER_CONTROLLED", "__getattribute__", "ARCHITECT_TASK "):
+        with pytest.raises(RuntimeError, match="unsupported trusted job type"):
+            dispatcher.execute(_job(untrusted))
+    assert calls == []
