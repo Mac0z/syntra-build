@@ -24,6 +24,7 @@ from syntra_build.application.pull_requests import (
     PullRequestLifecycleService,
 )
 from syntra_build.application.scheduler import Scheduler, WorkerCapacity
+from syntra_build.application.security import SecurityPolicy
 from syntra_build.application.workspaces import WorkspaceService
 from syntra_build.domain.ci import CICheck, CICheckStatus, CIObservation
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
@@ -34,6 +35,12 @@ from syntra_build.domain.pull_requests import (
     PullRequestCreateRequest,
     PullRequestDescriptor,
     PullRequestState,
+)
+from syntra_build.domain.security import (
+    SecurityActorType,
+    SecurityEventType,
+    SecurityResolutionCode,
+    SecuritySeverity,
 )
 from syntra_build.domain.workspaces import (
     TrustedCommit,
@@ -365,6 +372,74 @@ def test_initial_lifecycle_persists_intent_before_create_and_recovers_commit(
         second = lifecycle.establish(project, milestone, CHANGE_SET, "retry", now=NOW)
         assert second.id == first.id
         assert workspaces.commit_calls == 1 and github.create_calls == 1
+
+
+def test_persisted_security_condition_blocks_push_and_pr_then_resolves(
+    tmp_path: Path,
+) -> None:
+    with open_database(tmp_path / "security.db") as connection:
+        apply_migrations(connection)
+        lifecycle, workspaces, github, project, milestone = service(connection)
+        policy = SecurityPolicy(connection)
+        event = policy.record(
+            SecurityEventType.SECRET_DETECTED,
+            SecuritySeverity.HIGH,
+            project_id=project,
+            milestone_id=milestone,
+            source_component="test_policy",
+            correlation_id="block-pr",
+            blocking=True,
+            created_at=NOW,
+        )
+        with pytest.raises(PullRequestError, match="security policy"):
+            lifecycle.establish(project, milestone, CHANGE_SET, "blocked", now=NOW)
+        assert workspaces.push_calls == github.create_calls == 0
+
+        policy.resolve(
+            event.id,
+            SecurityResolutionCode.CLEAN_REVALIDATION,
+            "trusted-resolution",
+            SecurityActorType.SYSTEM,
+            resolved_at=NOW,
+        )
+        assert (
+            lifecycle.establish(
+                project, milestone, CHANGE_SET, "allowed", now=NOW
+            ).external_pr_number
+            == 12
+        )
+
+
+def test_security_condition_after_push_blocks_pr_post(tmp_path: Path) -> None:
+    with open_database(tmp_path / "security-race.db") as connection:
+        apply_migrations(connection)
+        lifecycle, workspaces, github, project, milestone = service(connection)
+        original_push = workspaces.push
+
+        def push_then_block(
+            project_id: ProjectId,
+            milestone_id: MilestoneId,
+            expected_commit_sha: str,
+            now: datetime,
+        ) -> TrustedPushResult:
+            result = original_push(project_id, milestone_id, expected_commit_sha, now)
+            SecurityPolicy(connection).record(
+                SecurityEventType.REPOSITORY_IDENTITY_MISMATCH,
+                SecuritySeverity.CRITICAL,
+                project_id=project,
+                milestone_id=milestone,
+                source_component="test_race",
+                correlation_id="after-push",
+                blocking=True,
+                created_at=NOW,
+            )
+            return result
+
+        workspaces.push = push_then_block  # type: ignore[method-assign]
+        with pytest.raises(PullRequestError, match="security policy"):
+            lifecycle.establish(project, milestone, CHANGE_SET, "race", now=NOW)
+        assert workspaces.push_calls == 1
+        assert github.create_calls == 0
 
 
 def test_verified_pr_handoff_bootstraps_and_schedules_real_ci_reconciliation(

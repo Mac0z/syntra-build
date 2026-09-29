@@ -312,13 +312,6 @@ def load_config(
                 ),
             ),
             worker_identity=str(codex.get("worker_identity", "syntra-codex")),
-            max_processes=_int("codex.max_processes", codex.get("max_processes", 128)),
-            max_open_files=_int(
-                "codex.max_open_files", codex.get("max_open_files", 1024)
-            ),
-            max_file_bytes=_int(
-                "codex.max_file_bytes", codex.get("max_file_bytes", 104857600)
-            ),
         ),
         github=GitHubConfig(
             enabled=_bool(

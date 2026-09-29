@@ -25,6 +25,7 @@ _UNSAFE_VALUE = re.compile(
     r"(?:gh[pousr]_|github_pat_|-----BEGIN .*PRIVATE KEY-----|https?://[^\s/:]+:[^\s/@]+@)",
     re.I,
 )
+_COMPONENT = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 
 
 class UnsafeSecurityDetails(ValueError):
@@ -51,6 +52,14 @@ class SecurityPolicy:
                 raise UnsafeSecurityDetails("security details must be non-sensitive")
         return json.dumps(dict(details), sort_keys=True, separators=(",", ":"))
 
+    @classmethod
+    def _safe_metadata(cls, name: str, value: str | None) -> None:
+        if value is None:
+            return
+        if not value or len(value) > 256 or any(ord(char) < 32 for char in value):
+            raise UnsafeSecurityDetails(f"{name} must be a bounded identifier")
+        cls._safe({"value": value})
+
     def record(
         self,
         event_type: SecurityEventType,
@@ -70,6 +79,10 @@ class SecurityPolicy:
             SecuritySeverity.CRITICAL,
         }:
             raise ValueError("only HIGH or CRITICAL events may be blocking")
+        if _COMPONENT.fullmatch(source_component) is None:
+            raise UnsafeSecurityDetails("source_component must be a bounded component")
+        self._safe_metadata("source_reference", source_reference)
+        self._safe_metadata("correlation_id", correlation_id)
         created_at = created_at or datetime.now(UTC)
         event = SecurityEvent(
             self.id_factory(),
@@ -122,6 +135,7 @@ class SecurityPolicy:
             raise ValueError("security actor type is not permitted")
         if actor_id is not None:
             self._safe({"actor_id": actor_id})
+        self._safe_metadata("correlation_id", correlation_id)
         resolved_at = resolved_at or datetime.now(UTC)
         if (
             self.connection.execute(

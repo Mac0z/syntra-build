@@ -218,6 +218,23 @@ def test_unauthorised_update_records_only_safe_event(tmp_path: Path) -> None:
     assert hostile not in repr(sink.calls)
 
 
+def test_security_event_failure_does_not_route_unauthorised_update(
+    tmp_path: Path,
+) -> None:
+    class FailingSink:
+        def record(self, *args: object, **kwargs: object) -> object:
+            raise RuntimeError("synthetic persistence failure")
+
+    gateway = client(
+        tmp_path,
+        lambda _request, _timeout: response([update(user_id=999)]),
+        security_events=FailingSink(),
+    )
+    item = gateway.poll_updates()[0]
+    assert item.disposition is TelegramUpdateDisposition.UNAUTHORISED
+    assert item.message is None
+
+
 def test_multiple_updates_preserve_provider_order_and_optional_fields(
     tmp_path: Path,
 ) -> None:

@@ -122,3 +122,30 @@ def test_resolution_rejects_unknown_duplicate_and_unbounded_semantics(
             "corr",
             SecurityActorType.SYSTEM,
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("source_component", "provider supplied prose\nnext-line"),
+        ("source_reference", "https://user:synthetic-password@example.test/repo"),
+        ("correlation_id", "ghp_SYNTHETIC0123456789ABCDE"),
+    ),
+)
+def test_security_event_metadata_rejects_untrusted_or_credential_text(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    db = _db(tmp_path)
+    kwargs = {
+        "source_component": "test",
+        "source_reference": "safe-reference",
+        "correlation_id": "safe-correlation",
+    }
+    kwargs[field] = value
+    with pytest.raises(UnsafeSecurityDetails):
+        SecurityPolicy(db).record(
+            SecurityEventType.UNAUTHORISED_MESSAGE,
+            SecuritySeverity.INFO,
+            **kwargs,  # type: ignore[arg-type]
+        )
+    assert db.execute("SELECT count(*) FROM security_events").fetchone()[0] == 0

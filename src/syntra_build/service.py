@@ -30,6 +30,7 @@ from syntra_build.application.operational_health import (
 from syntra_build.application.pull_requests import PullRequestLifecycleService
 from syntra_build.application.recovery import RecoveryCoordinator, RecoveryServices
 from syntra_build.application.scheduler import Scheduler, SchedulerLoop, WorkerCapacity
+from syntra_build.application.security import SecurityPolicy
 from syntra_build.application.workspaces import WorkspaceService
 from syntra_build.infrastructure.backup import BackupReason, SQLiteBackupService
 from syntra_build.infrastructure.config.host import (
@@ -61,7 +62,7 @@ class ServiceRuntime:
         *,
         config_loader: Callable[[Path], ApplicationConfig] = load_host_config,
         telegram_factory: Callable[
-            [ApplicationConfig, PrometheusRecorder], TelegramClient
+            [ApplicationConfig, PrometheusRecorder, SecurityPolicy], TelegramClient
         ]
         | None = None,
         loop_interval: float = 1.0,
@@ -92,7 +93,9 @@ class ServiceRuntime:
         self._control_thread: Thread | None = None
         self._backup_thread: Thread | None = None
         self._telegram_factory = telegram_factory or (
-            lambda config, metrics: TelegramClient(config, metrics=metrics)
+            lambda config, metrics, security: TelegramClient(
+                config, metrics=metrics, security_events=security
+            )
         )
         self._loop_interval = loop_interval
         self._backup_interval = backup_interval
@@ -166,7 +169,9 @@ class ServiceRuntime:
                 health_sink=self.health,
             ).recover()
             telegram = (
-                self._telegram_factory(self.config, self.recorder)
+                self._telegram_factory(
+                    self.config, self.recorder, SecurityPolicy(connection)
+                )
                 if self.config.telegram.enabled
                 else None
             )

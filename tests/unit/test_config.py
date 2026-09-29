@@ -6,7 +6,6 @@ import pytest
 
 from syntra_build.domain import WorkerClass
 from syntra_build.infrastructure.config import (
-    CodexConfig,
     ConfigurationError,
     FilesystemConfig,
     ResourceThresholdConfig,
@@ -49,19 +48,6 @@ def test_default_configuration_loads_without_credentials() -> None:
         WorkerClass.RECOVERY: 2,
         WorkerClass.INTERNAL: 4,
     }
-
-
-def test_codex_resource_limits_are_bounded() -> None:
-    assert CodexConfig().max_processes == 128
-    assert CodexConfig().max_open_files == 1024
-    assert CodexConfig().max_file_bytes == 104_857_600
-    for kwargs in (
-        {"max_processes": 0},
-        {"max_open_files": 1_000_000},
-        {"max_file_bytes": -1},
-    ):
-        with pytest.raises(ConfigurationError):
-            CodexConfig(**kwargs)  # type: ignore[arg-type]
 
 
 def test_protected_secret_requires_regular_owner_only_file(tmp_path: Path) -> None:
