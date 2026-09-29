@@ -17,7 +17,7 @@ from syntra_build.application.architect import (
     ArchitectProvider,
     ArchitectTaskService,
 )
-from syntra_build.application.codex import CodexRunner
+from syntra_build.application.codex import WorkspaceBoundCodexRunner
 from syntra_build.application.provisioning import (
     ProvisioningError,
     ProvisioningFailure,
@@ -52,6 +52,7 @@ from syntra_build.domain.workspaces import WorkspaceError, WorkspaceState
 from syntra_build.infrastructure.persistence.architect import (
     SQLiteArchitectInteractionRepository,
 )
+from syntra_build.infrastructure.persistence.codex import SQLiteCodexRunRepository
 from syntra_build.infrastructure.persistence.connection import open_database
 from syntra_build.infrastructure.persistence.design import (
     SQLiteProjectDocumentRepository,
@@ -555,60 +556,163 @@ class SpecificationDraftExecutor:
 
 
 class InitialCodexExecutor:
-    """Load accepted TASK evidence on the worker thread, then invoke M20."""
+    """Execute the initial IMPLEMENT task and durably advance its milestone."""
 
     def __init__(
         self,
         database_path: Path,
-        runner_factory: Callable[[sqlite3.Connection], CodexRunner],
+        runner_factory: Callable[[sqlite3.Connection], WorkspaceBoundCodexRunner],
         *,
         timeout_seconds: float,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
     ) -> None:
         self.database_path = database_path
         self.runner_factory = runner_factory
         self.timeout_seconds = timeout_seconds
+        self.clock = clock
         self.connection_factory = connection_factory
 
     def execute(self, job: Job) -> JobExecutionResult:
-        if job.worker_class is not WorkerClass.CODEX or job.milestone_id is None:
-            raise ValueError("CODEX_RUN requires a Codex milestone job")
+        if job.job_type != "CODEX_RUN":
+            raise ValueError("initial Codex execution requires a CODEX_RUN job")
+        if job.worker_class is not WorkerClass.CODEX:
+            raise ValueError("initial Codex execution requires a Codex worker")
+        if job.milestone_id is None:
+            raise ValueError("initial Codex execution requires a milestone-scoped job")
+        if job.payload:
+            raise ValueError("initial Codex execution does not accept workflow payload")
         with closing(self.connection_factory(self.database_path)) as connection:
+            milestones = SQLiteMilestoneRepository(connection, lambda: str(uuid4()))
+            milestone = milestones.get(job.milestone_id, job.project_id)
+            project = SQLiteProjectRepository(connection, lambda: str(uuid4())).get(
+                job.project_id
+            )
+            if project.state is not ProjectState.BUILDING:
+                raise ValueError("initial Codex project must be BUILDING")
+            if milestone.state not in {
+                MilestoneState.CODING,
+                MilestoneState.VALIDATING_CHANGES,
+            }:
+                raise ValueError("initial Codex milestone has an inconsistent state")
             task = SQLiteArchitectInteractionRepository(
                 connection
             ).accepted_task_for_milestone(str(job.project_id), str(job.milestone_id))
+            if (
+                task.project_id != job.project_id
+                or task.milestone_id != job.milestone_id
+                or task.task_type is not ArchitectTaskType.IMPLEMENT
+            ):
+                raise ValueError("accepted Architect IMPLEMENT task is inconsistent")
             row = connection.execute(
-                """SELECT w.worktree_path,d.content FROM git_workspaces w
-                   JOIN design_packages p ON p.project_id=w.project_id AND p.status='APPROVED'
+                """SELECT w.worktree_path,w.state AS workspace_state,d.content,
+                          d.project_id AS document_project_id,
+                          d.document_type,d.status AS document_status
+                   FROM git_workspaces w
+                   JOIN design_packages p ON p.project_id=w.project_id
+                     AND p.status='APPROVED'
                    JOIN project_documents d ON d.id=p.agents_document_id
-                   WHERE w.project_id=? AND w.milestone_id=? AND w.state='READY'""",
+                   WHERE w.project_id=? AND w.milestone_id=?
+                   ORDER BY p.approved_at DESC,p.id DESC LIMIT 1""",
                 (str(job.project_id), str(job.milestone_id)),
             ).fetchone()
             if row is None:
                 raise ValueError("accepted AGENTS or assigned workspace is unavailable")
-            result = self.runner_factory(connection).run(
-                CodexRunRequest(
-                    "1.0",
-                    job.correlation_id,
-                    job.project_id,
-                    job.milestone_id,
-                    job.id,
-                    job.attempt_number + 1,
-                    Path(row["worktree_path"]),
-                    task.to_dict(),
-                    row["content"],
-                    self.timeout_seconds,
-                )
+            if (
+                row["document_project_id"] != str(job.project_id)
+                or row["document_type"] != DocumentType.AGENTS.value
+                or row["document_status"] != DocumentStatus.APPROVED.value
+            ):
+                raise ValueError("approved AGENTS identity is inconsistent")
+            request = CodexRunRequest(
+                "1.0",
+                job.correlation_id,
+                job.project_id,
+                job.milestone_id,
+                job.id,
+                job.attempt_number + 1,
+                Path(row["worktree_path"]),
+                task.to_dict(),
+                row["content"],
+                self.timeout_seconds,
             )
-        disposition = (
-            JobExecutionDisposition.SUCCEEDED
-            if result.process_status is CodexProcessStatus.SUCCEEDED
-            else JobExecutionDisposition.FAILED
-        )
+            runner = self.runner_factory(connection)
+            runs = SQLiteCodexRunRepository(connection)
+            result = runs.completed_for_request(request)
+            if result is None and row["workspace_state"] != WorkspaceState.READY.value:
+                raise ValueError("assigned workspace is not READY for Codex")
+            # Replay permits expected uncommitted Codex output; a new untrusted
+            # process additionally requires a clean READY workspace.
+            runner.validate_workspace(request, require_clean=result is None)
+            if result is None:
+                if milestone.state is not MilestoneState.CODING:
+                    raise ValueError(
+                        "advanced milestone has no successful Codex evidence"
+                    )
+                result = runner.run(request)
+                persisted = runs.completed_for_request(request)
+                if persisted is None:
+                    raise RuntimeError("Codex result was not durably persisted")
+                self._require_result_identity(request, result)
+                self._require_result_identity(request, persisted)
+                if persisted.process_status is not result.process_status:
+                    raise ValueError("Codex result disagrees with durable run evidence")
+                result = persisted
+            else:
+                self._require_result_identity(request, result)
+
+            if result.process_status is CodexProcessStatus.SUCCEEDED:
+                if milestone.state is MilestoneState.CODING:
+                    occurred_at = self.clock()
+                    if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+                        raise ValueError(
+                            "initial Codex clock must return a UTC timestamp"
+                        )
+                    milestones.apply_transition(
+                        MilestoneTransitionRequest(
+                            job.milestone_id,
+                            job.project_id,
+                            MilestoneState.CODING,
+                            MilestoneState.VALIDATING_CHANGES,
+                            "successful Codex run durably recorded",
+                            "SYSTEM",
+                            "initial-codex-executor",
+                            job.correlation_id,
+                            occurred_at.astimezone(UTC),
+                        )
+                    )
+                disposition = JobExecutionDisposition.SUCCEEDED
+                classification = None
+            else:
+                if milestone.state is not MilestoneState.CODING:
+                    raise ValueError(
+                        "unsuccessful Codex run cannot accompany advancement"
+                    )
+                disposition = JobExecutionDisposition.FAILED
+                classification = {
+                    CodexProcessStatus.TIMED_OUT: FailureClassification.TRANSIENT,
+                    CodexProcessStatus.CANCELLED: FailureClassification.CANCELLED,
+                }.get(result.process_status, FailureClassification.PERMANENT)
         return JobExecutionResult(
             disposition,
             exit_code=result.exit_code,
             logs_reference=result.stdout_reference
             if disposition is JobExecutionDisposition.SUCCEEDED
             else result.stderr_reference,
+            failure_classification=classification,
         )
+
+    @staticmethod
+    def _require_result_identity(request: CodexRunRequest, result: object) -> None:
+        if not all(
+            getattr(result, field) == getattr(request, field)
+            for field in (
+                "interface_version",
+                "correlation_id",
+                "project_id",
+                "milestone_id",
+                "job_id",
+                "attempt_number",
+            )
+        ):
+            raise ValueError("Codex result identity does not match request")

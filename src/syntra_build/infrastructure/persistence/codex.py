@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
-from syntra_build.domain.codex import CodexRunRequest, CodexRunResult, ReportedTest
+from syntra_build.domain.codex import (
+    CodexProcessStatus,
+    CodexRunRequest,
+    CodexRunResult,
+    ReportedTest,
+)
+from syntra_build.domain.identifiers import JobId, MilestoneId, ProjectId
 
 
 class SQLiteCodexRunRepository:
@@ -83,6 +90,50 @@ class SQLiteCodexRunRepository:
         for report in result.tests_run:
             self._test(run_id, report)
         self.connection.commit()
+
+    def completed_for_request(self, request: CodexRunRequest) -> CodexRunResult | None:
+        """Return exact durable terminal evidence, rejecting mismatched identity."""
+        row = self.connection.execute(
+            """SELECT r.*,w.worktree_path FROM codex_runs r
+               JOIN git_workspaces w ON w.id=r.worktree_id
+               WHERE r.job_id=? AND r.attempt_number=?""",
+            (str(request.job_id), request.attempt_number),
+        ).fetchone()
+        if row is None:
+            return None
+        expected_task = json.dumps(request.task, sort_keys=True, separators=(",", ":"))
+        if (
+            row["project_id"] != str(request.project_id)
+            or row["milestone_id"] != str(request.milestone_id)
+            or row["correlation_id"] != request.correlation_id
+            or row["interface_version"] != request.interface_version
+            or row["task_payload_json"] != expected_task
+            or Path(row["worktree_path"]).resolve(strict=False)
+            != request.worktree_path.resolve(strict=False)
+            or row["timeout_seconds"] != request.timeout_seconds
+        ):
+            raise ValueError("durable Codex run identity does not match request")
+        if row["completed_at"] is None:
+            raise ValueError("existing Codex run attempt is not terminal")
+        return CodexRunResult(
+            row["interface_version"],
+            row["correlation_id"],
+            ProjectId.from_string(row["project_id"]),
+            MilestoneId.from_string(row["milestone_id"]),
+            JobId.from_string(row["job_id"]),
+            row["attempt_number"],
+            CodexProcessStatus(row["process_status"]),
+            datetime.fromisoformat(row["started_at"]).astimezone(UTC),
+            datetime.fromisoformat(row["completed_at"]).astimezone(UTC),
+            row["worker_identity"],
+            row["timeout_seconds"],
+            row["process_id"],
+            row["exit_code"],
+            row["stdout_reference"],
+            row["stderr_reference"],
+            row["summary"] or "",
+            known_issues=tuple(json.loads(row["known_issues_json"])),
+        )
 
     def _test(self, run_id: str, report: ReportedTest) -> None:
         self.connection.execute(
