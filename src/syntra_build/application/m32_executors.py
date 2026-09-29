@@ -6,6 +6,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
+from datetime import UTC, datetime
 from pathlib import Path
 
 from syntra_build.application.architect import (
@@ -14,18 +15,77 @@ from syntra_build.application.architect import (
     ArchitectFailureKind,
 )
 from syntra_build.application.codex import CodexRunner
+from syntra_build.application.provisioning import (
+    ProvisioningError,
+    ProvisioningFailure,
+    RepositoryProvisioningService,
+)
 from syntra_build.application.scheduler import (
     JobExecutionDisposition,
     JobExecutionResult,
 )
 from syntra_build.application.specification import SpecificationDraftService
-from syntra_build.domain import Job, WorkerClass
+from syntra_build.domain import Job, ProjectState, WorkerClass
 from syntra_build.domain.codex import CodexProcessStatus, CodexRunRequest
 from syntra_build.domain.failures import FailureClassification
 from syntra_build.infrastructure.persistence.architect import (
     SQLiteArchitectInteractionRepository,
 )
 from syntra_build.infrastructure.persistence.connection import open_database
+
+
+class RepositoryProvisioningExecutor:
+    """Run released M18 provisioning on a worker-owned connection."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        service_factory: Callable[[sqlite3.Connection], RepositoryProvisioningService],
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
+    ) -> None:
+        self.database_path = database_path
+        self.service_factory = service_factory
+        self.clock = clock
+        self.connection_factory = connection_factory
+
+    def execute(self, job: Job) -> JobExecutionResult:
+        if job.job_type != "REPOSITORY_PROVISION":
+            raise ValueError(
+                "Repository provisioning requires a REPOSITORY_PROVISION job"
+            )
+        if job.worker_class is not WorkerClass.GITHUB:
+            raise ValueError("Repository provisioning requires a GitHub worker")
+        if job.milestone_id is not None:
+            raise ValueError("Repository provisioning requires a project-scoped job")
+
+        occurred_at = self.clock()
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError(
+                "Repository provisioning clock must return a UTC timestamp"
+            )
+        occurred_at = occurred_at.astimezone(UTC)
+        try:
+            with closing(self.connection_factory(self.database_path)) as connection:
+                result = self.service_factory(connection).provision(
+                    job.project_id, occurred_at, job.correlation_id
+                )
+        except ProvisioningError as error:
+            return JobExecutionResult(
+                JobExecutionDisposition.FAILED,
+                error_id=f"repository-provision-{error.failure.value.casefold()}",
+                failure_classification=(
+                    FailureClassification.TRANSIENT
+                    if error.failure is ProvisioningFailure.TRANSIENT
+                    else FailureClassification.PERMANENT
+                ),
+            )
+        if not result.verified or result.project_state is not ProjectState.READY:
+            raise RuntimeError(
+                "repository provisioning returned without durable READY verification"
+            )
+        return JobExecutionResult(JobExecutionDisposition.SUCCEEDED)
 
 
 class ArchitectDesignExecutor:
