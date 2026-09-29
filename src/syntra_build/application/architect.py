@@ -15,6 +15,8 @@ from syntra_build.domain import (
     ArchitectDesignResponse,
     ArchitectReview,
     ArchitectReviewRequest,
+    ArchitectTask,
+    ArchitectTaskRequest,
     ProjectDesignContext,
     ProjectId,
     SpecificationDraft,
@@ -49,6 +51,7 @@ class ArchitectProvider(Protocol):
         self, request: SpecificationDraftRequest
     ) -> SpecificationDraft: ...
     def review(self, request: ArchitectReviewRequest) -> ArchitectReview: ...
+    def task(self, request: ArchitectTaskRequest) -> ArchitectTask: ...
     def telemetry(self) -> dict[str, int | str | None]: ...
 
 
@@ -190,6 +193,92 @@ class ArchitectDesignService:
             usage = self._provider.telemetry()
             response_id = usage.get("provider_response_id")
             self._store.succeed(
+                request_id=request_id,
+                response=response,
+                provider_response_id=response_id
+                if isinstance(response_id, str)
+                else None,
+                usage=usage,
+                completed_at=self._clock(),
+            )
+            return response
+        except ArchitectError as error:
+            self._store.fail(
+                request_id=request_id, kind=error.kind, completed_at=self._clock()
+            )
+            raise
+
+
+class ArchitectTaskStore(Protocol):
+    def begin_task(
+        self,
+        *,
+        request_id: str,
+        request: ArchitectTaskRequest,
+        provider: str,
+        model: str,
+        reasoning_effort: str,
+        created_at: datetime,
+    ) -> None: ...
+    def succeed_task(
+        self,
+        *,
+        request_id: str,
+        response: ArchitectTask,
+        provider_response_id: str | None,
+        usage: dict[str, int | str | None],
+        completed_at: datetime,
+    ) -> None: ...
+    def fail(
+        self, *, request_id: str, kind: ArchitectFailureKind, completed_at: datetime
+    ) -> None: ...
+
+
+class ArchitectTaskService:
+    """Persist-before-I/O service that accepts only an exactly bound task response."""
+
+    def __init__(
+        self,
+        store: ArchitectTaskStore,
+        provider: ArchitectProvider,
+        *,
+        reasoning_effort: str = "high",
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        id_factory: Callable[[], str] = lambda: str(uuid4()),
+    ) -> None:
+        self._store, self._provider = store, provider
+        self._reasoning_effort, self._clock, self._ids = (
+            reasoning_effort,
+            clock,
+            id_factory,
+        )
+
+    def create(self, request: ArchitectTaskRequest) -> ArchitectTask:
+        request_id = self._ids()
+        self._store.begin_task(
+            request_id=request_id,
+            request=request,
+            provider=self._provider.provider_name,
+            model=self._provider.model,
+            reasoning_effort=self._reasoning_effort,
+            created_at=self._clock(),
+        )
+        try:
+            response = self._provider.task(request)
+            if (
+                response.interface_version != request.interface_version
+                or response.correlation_id != request.correlation_id
+                or response.project_id != request.project_id
+                or response.milestone_id != request.milestone_id
+                or response.task_type != request.task_type
+            ):
+                raise ArchitectError(
+                    ArchitectFailureKind.MALFORMED_RESPONSE,
+                    "Architect task identity does not match request",
+                )
+            usage = self._provider.telemetry()
+            response_id = usage.get("provider_response_id")
+            self._store.succeed_task(
                 request_id=request_id,
                 response=response,
                 provider_response_id=response_id

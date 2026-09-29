@@ -12,6 +12,8 @@ from uuid import uuid4
 from syntra_build.domain import (
     ArchitectDesignRequest,
     ArchitectDesignResponse,
+    ArchitectTask,
+    ArchitectTaskRequest,
     SpecificationDraft,
     SpecificationDraftRequest,
 )
@@ -94,6 +96,123 @@ class SQLiteArchitectInteractionRepository:
             raise PersistenceError(
                 "Architect request could not be persisted"
             ) from error
+
+    def begin_task(
+        self,
+        *,
+        request_id: str,
+        request: ArchitectTaskRequest,
+        provider: str,
+        model: str,
+        reasoning_effort: str,
+        created_at: datetime,
+    ) -> None:
+        """Persist TASK intent, including its exact milestone and durable job identity."""
+        try:
+            self._connection.execute(
+                """INSERT INTO architect_requests
+                (id,project_id,milestone_id,job_id,request_type,provider,model,
+                 reasoning_level,request_schema_version,request_payload_json,
+                 correlation_id,started_at,status)
+                VALUES (?,?,?,?,'TASK',?,?,?,?,?,?,?,'STARTED')""",
+                (
+                    request_id,
+                    str(request.project_id),
+                    str(request.milestone_id),
+                    str(request.job_id),
+                    provider,
+                    model,
+                    reasoning_effort,
+                    request.interface_version,
+                    json.dumps(
+                        request.to_dict(), sort_keys=True, separators=(",", ":")
+                    ),
+                    request.correlation_id,
+                    _time(created_at),
+                ),
+            )
+        except sqlite3.Error as error:
+            raise PersistenceError(
+                "Architect task request could not be persisted"
+            ) from error
+
+    def succeed_task(
+        self,
+        *,
+        request_id: str,
+        response: ArchitectTask,
+        provider_response_id: str | None,
+        usage: dict[str, int | str | None],
+        completed_at: datetime,
+    ) -> None:
+        try:
+            row = self._connection.execute(
+                "SELECT provider,model,status FROM architect_requests WHERE id=? AND request_type='TASK'",
+                (request_id,),
+            ).fetchone()
+            if row is None or row["status"] != "STARTED":
+                raise PersistenceError(
+                    "Architect task request is unavailable or completed"
+                )
+            self._connection.execute("BEGIN")
+            self._connection.execute(
+                """INSERT INTO architect_responses
+                (id,architect_request_id,response_type,response_schema_version,
+                 normalised_payload_json,status,created_at,validation_status,provider,model,
+                 input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,total_tokens)
+                VALUES (?,?,'TASK',?,?,'ACCEPTED',?,'VALID',?,?,?,?,?,?,?)""",
+                (
+                    str(uuid4()),
+                    request_id,
+                    response.interface_version,
+                    json.dumps(
+                        response.to_dict(), sort_keys=True, separators=(",", ":")
+                    ),
+                    _time(completed_at),
+                    row["provider"],
+                    row["model"],
+                    usage.get("input_tokens"),
+                    usage.get("cached_input_tokens"),
+                    usage.get("output_tokens"),
+                    usage.get("reasoning_tokens"),
+                    usage.get("total_tokens"),
+                ),
+            )
+            self._connection.execute(
+                "UPDATE architect_requests SET status='SUCCEEDED',completed_at=?,external_request_id=? WHERE id=? AND status='STARTED'",
+                (_time(completed_at), provider_response_id, request_id),
+            )
+            self._connection.commit()
+        except sqlite3.Error, PersistenceError:
+            if self._connection.in_transaction:
+                self._connection.rollback()
+            raise
+
+    def accepted_task_for_job(self, job_id: str) -> ArchitectTask:
+        row = self._connection.execute(
+            """SELECT s.normalised_payload_json FROM architect_requests q
+               JOIN architect_responses s ON s.architect_request_id=q.id
+               WHERE q.job_id=? AND q.request_type='TASK' AND q.status='SUCCEEDED'
+               ORDER BY q.completed_at DESC,q.id DESC LIMIT 1""",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise PersistenceError("accepted Architect task does not exist")
+        return ArchitectTask.from_dict(json.loads(row[0]))
+
+    def accepted_task_for_milestone(
+        self, project_id: str, milestone_id: str
+    ) -> ArchitectTask:
+        row = self._connection.execute(
+            """SELECT s.normalised_payload_json FROM architect_requests q
+               JOIN architect_responses s ON s.architect_request_id=q.id
+               WHERE q.project_id=? AND q.milestone_id=? AND q.request_type='TASK'
+                 AND q.status='SUCCEEDED' ORDER BY q.completed_at DESC,q.id DESC LIMIT 1""",
+            (project_id, milestone_id),
+        ).fetchone()
+        if row is None:
+            raise PersistenceError("accepted Architect task does not exist")
+        return ArchitectTask.from_dict(json.loads(row[0]))
 
     def succeed(
         self,

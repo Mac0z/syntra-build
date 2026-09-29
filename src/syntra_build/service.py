@@ -6,7 +6,7 @@ import argparse
 import logging
 import signal
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Thread
@@ -29,9 +29,14 @@ from syntra_build.application.operational_health import (
 )
 from syntra_build.application.pull_requests import PullRequestLifecycleService
 from syntra_build.application.recovery import RecoveryCoordinator, RecoveryServices
-from syntra_build.application.scheduler import Scheduler, SchedulerLoop, WorkerCapacity
+from syntra_build.application.scheduler import (
+    Scheduler,
+    SchedulerLoop,
+    WorkerCapacity,
+)
 from syntra_build.application.security import SecurityPolicy
 from syntra_build.application.workspaces import WorkspaceService
+from syntra_build.domain.jobs import WorkerClass
 from syntra_build.infrastructure.backup import BackupReason, SQLiteBackupService
 from syntra_build.infrastructure.config.host import (
     DEFAULT_HOST_CONFIG_PATH,
@@ -69,6 +74,8 @@ class ServiceRuntime:
         backup_interval: float = 3600.0,
         shutdown_grace: float = 30.0,
         configure_runtime_logging: bool = True,
+        executor_factory: Callable[[ApplicationConfig], Mapping[WorkerClass, object]]
+        | None = None,
     ) -> None:
         self.config = config_loader(config_path)
         if configure_runtime_logging:
@@ -100,6 +107,13 @@ class ServiceRuntime:
         self._loop_interval = loop_interval
         self._backup_interval = backup_interval
         self._shutdown_grace = shutdown_grace
+        self._executor_factory = executor_factory
+
+    def _production_executors(self) -> Mapping[WorkerClass, object]:
+        """Expose only explicitly supplied, reviewed executor composition."""
+        if self._executor_factory is not None:
+            return self._executor_factory(self.config)
+        return {}
 
     def _database_available(self) -> bool:
         try:
@@ -141,7 +155,9 @@ class ServiceRuntime:
         scheduler = Scheduler(
             SQLiteJobRepository(connection, lambda: str(uuid4())),
             self.capacity,
-            {},
+            self._production_executors(),  # type: ignore[arg-type]
+            # M32.0 keeps autonomous orchestration dormant until concrete routes exist.
+            due_work_enqueuer=None,
             metrics=self.recorder,
         )
         self.scheduler = scheduler
