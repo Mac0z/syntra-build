@@ -19,6 +19,30 @@ def test_deployment_security_contract() -> None:
         assert group in policy
 
 
+def test_service_installer_preserves_m31_private_roots_and_installs_unit() -> None:
+    installer = (ROOT / "scripts/host/install-service.sh").read_text()
+    policy = (ROOT / "scripts/host/enforce-security-policy.sh").read_text()
+    assert (
+        "install -m 0644 deployment/systemd/syntra-build.service "
+        "/etc/systemd/system/syntra-build.service"
+    ) in installer
+    assert "install -d -o syntra-build -g syntra-build -m 0750" not in installer
+    for root in (
+        "/var/lib/syntra-build",
+        "/var/lib/syntra-build/backups",
+        "/var/lib/syntra-build/artifacts",
+        "/var/lib/syntra-build/workspaces",
+        "/var/lib/syntra-build/repositories",
+        "/var/log/syntra-build",
+    ):
+        assert root in installer
+        assert root in policy
+    assert "install -d -o syntra-build -g syntra-build -m 0700" in installer
+    assert "install -d -o syntra-build -g syntra-build -m 0700" in policy
+    assert "chmod -R" not in installer and "chmod -R" not in policy
+    assert "chown -R" not in installer and "chown -R" not in policy
+
+
 def test_expanded_protected_paths_are_deterministic() -> None:
     policy = ProtectedPathPolicy()
     for path in (

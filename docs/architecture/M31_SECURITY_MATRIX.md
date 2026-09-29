@@ -51,13 +51,25 @@ limits provide the initial bounded model.
 
 ## Raspberry Pi host acceptance
 
-After review, install the assets and run the production-path smoke against an isolated
-acceptance database and two disposable registered M19 workspaces:
+After review, install the exact approved application revision, then apply the host
+assets in the order below. `install-service.sh` copies the reviewed M31 unit into
+`/etc/systemd/system`; enforcement then idempotently confirms the final private root
+modes without recursively altering worktrees, repositories, ACLs, or Git content.
+Only after inspecting the effective unit and permissions should the service restart.
+Run the production-path smoke against an isolated acceptance database and two
+disposable registered M19 workspaces:
 
 ```bash
 sudo scripts/host/setup-codex-worker.sh
+sudo scripts/host/install-service.sh
 sudo scripts/host/enforce-security-policy.sh
-sudo systemctl daemon-reload && sudo systemctl restart syntra-build
+sudo systemctl daemon-reload
+systemctl cat syntra-build.service
+systemctl show syntra-build.service -p User -p Group -p UMask -p NoNewPrivileges
+stat -c '%U:%G:%a %n' /var/lib/syntra-build \
+  /var/lib/syntra-build/{backups,artifacts,workspaces,repositories} \
+  /var/log/syntra-build
+sudo systemctl restart syntra-build
 sudo -u syntra-build python -m syntra_build.m20_smoke --help
 namei -l /opt/syntra-build /etc/syntra-build /var/lib/syntra-build/syntra.db
 stat -c '%U:%G:%a %n' /opt/syntra-build /etc/syntra-build \

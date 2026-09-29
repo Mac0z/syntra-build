@@ -20,7 +20,8 @@ done
 install -d -o root -g syntra-build -m 0750 /opt/syntra-build /etc/syntra-build
 install -d -o syntra-build -g syntra-build -m 0700 \
   /var/lib/syntra-build /var/lib/syntra-build/backups \
-  /var/lib/syntra-build/artifacts /var/log/syntra-build
+  /var/lib/syntra-build/artifacts /var/lib/syntra-build/workspaces \
+  /var/lib/syntra-build/repositories /var/log/syntra-build
 find /var/lib/syntra-build -maxdepth 1 -type f \
   \( -name '*.db' -o -name '*.db-wal' -o -name '*.db-shm' \) \
   -exec chown syntra-build:syntra-build {} + -exec chmod 0600 {} +
