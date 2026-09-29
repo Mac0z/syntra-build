@@ -106,6 +106,38 @@ def test_ready_milestone_queues_one_implementation_task(tmp_path: Path) -> None:
     assert json.loads(row[2]) == {"task_type": "IMPLEMENT"}
 
 
+def test_project_scoped_design_job_is_idempotent(tmp_path: Path) -> None:
+    db = _db(tmp_path)
+    project = _project(db, ProjectState.DESIGNING)
+    db.execute(
+        """INSERT INTO project_creation_context
+           (project_id,owner_id,initial_request,messaging_platform,conversation_id,
+            thread_id,source_update_id,source_message_id,created_at)
+           VALUES (?,?,?,'telegram','chat',NULL,'update','message',?)""",
+        (str(project), "owner", "Build a generated project", TS),
+    )
+    lifecycle = LifecycleCoordinator(db, clock=lambda: NOW)
+
+    assert lifecycle.enqueue_due() == 1
+    row = db.execute(
+        """SELECT job_type,milestone_id,worker_class FROM jobs
+           WHERE project_id=? AND job_type='ARCHITECT_DESIGN'""",
+        (str(project),),
+    ).fetchone()
+    assert tuple(row) == ("ARCHITECT_DESIGN", None, "ARCHITECT")
+
+    assert lifecycle.enqueue_due() == 0
+    assert (
+        db.execute(
+            """SELECT COUNT(*) FROM jobs WHERE project_id=?
+           AND milestone_id IS NULL AND job_type='ARCHITECT_DESIGN'
+           AND state IN ('QUEUED','DISPATCHED','RUNNING','WAITING_EXTERNAL','RETRY_WAIT')""",
+            (str(project),),
+        ).fetchone()[0]
+        == 1
+    )
+
+
 def test_materialises_approved_milestones_once_in_sequence(tmp_path: Path) -> None:
     db = _db(tmp_path)
     project = _project(db, ProjectState.READY)
