@@ -11,6 +11,7 @@ from hashlib import sha256
 from typing import Protocol
 from uuid import uuid4
 
+from syntra_build.application.security import SecurityPolicy
 from syntra_build.domain import (
     DesignPackageStatus,
     DocumentStatus,
@@ -26,6 +27,8 @@ from syntra_build.domain.provisioning import (
     RepositoryBaseline,
     RepositoryProvisioningStatus,
 )
+from syntra_build.domain.security import SecurityEventType, SecuritySeverity
+from syntra_build.infrastructure.change_validation import RegexSecretScanner
 from syntra_build.infrastructure.persistence.connection import transaction
 from syntra_build.infrastructure.persistence.design import (
     SQLiteProjectDocumentRepository,
@@ -52,6 +55,7 @@ class ProvisioningFailure(StrEnum):
     DOCUMENT_MISMATCH = "DOCUMENT_MISMATCH"
     LOCAL_GIT = "LOCAL_GIT"
     PERSISTENCE = "PERSISTENCE"
+    SECURITY_BLOCKED = "SECURITY_BLOCKED"
 
 
 class ProvisioningError(RuntimeError):
@@ -121,9 +125,13 @@ class RepositoryProvisioningService:
         git: InitialBaselineGit,
         *,
         owner: str,
+        security_policy: SecurityPolicy | None = None,
+        secret_scanner: RegexSecretScanner | None = None,
     ) -> None:
         self.connection = connection
         self.github, self.git, self.owner = github, git, owner
+        self.security = security_policy or SecurityPolicy(connection)
+        self.secret_scanner = secret_scanner or RegexSecretScanner()
 
     def provision(
         self, project_id: ProjectId, occurred_at: datetime, correlation_id: str
@@ -162,6 +170,51 @@ class RepositoryProvisioningService:
         )
         self._validate_document(spec, DocumentType.SPEC)
         self._validate_document(agents, DocumentType.AGENTS)
+        # The project/package lookup above proves these are the currently approved
+        # bytes. A later approved revision therefore supersedes this same scan scope.
+        design_reference = "approved-design"
+        matches = [
+            (path, match)
+            for path, content in (
+                ("SPEC.md", spec.content),
+                ("AGENTS.md", agents.content),
+            )
+            for match in self.secret_scanner.scan(content.encode())
+        ]
+        with transaction(self.connection):
+            if matches:
+                for path, match in matches:
+                    self.security.record(
+                        SecurityEventType.SECRET_DETECTED,
+                        SecuritySeverity.HIGH,
+                        project_id=project_id,
+                        source_component="approved_design_scan",
+                        source_reference=design_reference,
+                        correlation_id=correlation_id,
+                        safe_details={
+                            "rule_id": match.rule_id,
+                            "path": path,
+                            "location": f"line:{match.line}",
+                            "fingerprint": match.fingerprint,
+                        },
+                        blocking=True,
+                        created_at=occurred_at,
+                    )
+            else:
+                self.security.resolve_source_conditions(
+                    project_id=project_id,
+                    milestone_id=None,
+                    source_component="approved_design_scan",
+                    source_reference=design_reference,
+                    event_type=SecurityEventType.SECRET_DETECTED,
+                    correlation_id=correlation_id,
+                    resolved_at=occurred_at,
+                )
+        if matches or self.security.blocked(project_id):
+            raise ProvisioningError(
+                ProvisioningFailure.SECURITY_BLOCKED,
+                "active security policy prevents repository provisioning",
+            )
 
         # This commit is the mandatory persist-before-create boundary.
         with transaction(self.connection):
@@ -194,6 +247,7 @@ class RepositoryProvisioningService:
                     "recorded repository is absent",
                 )
             try:
+                self._require_unblocked(project_id)
                 live = self.github.create_repository(
                     repository.repository_name, repository.visibility
                 )
@@ -205,6 +259,7 @@ class RepositoryProvisioningService:
                 )
                 if live is None:
                     # Confirmed absence makes one bounded retry safe.
+                    self._require_unblocked(project_id)
                     live = self.github.create_repository(
                         repository.repository_name, repository.visibility
                     )
@@ -258,6 +313,7 @@ class RepositoryProvisioningService:
         remote_sha = self.github.main_sha(repository.owner, repository.repository_name)
         if remote_sha is None:
             try:
+                self._require_unblocked(project_id)
                 self.git.push_main(
                     project_id,
                     f"https://github.com/{repository.full_name}.git",
@@ -273,6 +329,7 @@ class RepositoryProvisioningService:
                 ProvisioningFailure.REMOTE_MISMATCH,
                 "remote main does not match approved baseline",
             )
+        self._require_unblocked(project_id)
         self.github.configure_repository(repository.owner, repository.repository_name)
         live = self.github.get_repository(repository.owner, repository.repository_name)
         if live is None:
@@ -364,4 +421,11 @@ class RepositoryProvisioningService:
             raise ProvisioningError(
                 ProvisioningFailure.VISIBILITY_MISMATCH,
                 "live repository visibility differs",
+            )
+
+    def _require_unblocked(self, project_id: ProjectId) -> None:
+        if self.security.blocked(project_id):
+            raise ProvisioningError(
+                ProvisioningFailure.SECURITY_BLOCKED,
+                "active security policy prevents privileged repository mutation",
             )

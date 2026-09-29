@@ -10,22 +10,22 @@ Gatekeeper at both evaluation and immediate pre-merge execution.
 
 | Requirement / threat | Control | Automated evidence | Host-only acceptance | Status |
 |---|---|---|---|---|
-| SEC-001 separate identities | systemd service user and root-owned identity-transition helper | `test_m30_operational_assets.py`, `test_m31_security_assets.py` | M31 smoke below | automated + host |
-| SEC-002 credential/database isolation | rebuilt allowlist environment; 0700 data root; 0600 DB | M20 runner tests; `test_m31_security_assets.py` | M31 smoke | automated + host |
-| SEC-003 Architect advisory only | strict response contracts; no GitHub capability | M24 Architect review tests | none | automated |
-| SEC-004 secret scan | exact-byte offline scanner and durable HIGH condition | M21 validation tests; `test_m31_security_assets.py` | none | automated |
-| SEC-005 credential-free remotes | repository identity validation | M19/M21 workspace tests | none | automated |
-| SEC-006 repository/worktree identity | M19/M21/M22/M26 deterministic checks | their integration suites | none | automated |
-| SEC-007 prompt injection | capability separation, strict schemas, protected scope supplied only by trusted caller | Architect contract and protected-path tests | M31 smoke | automated + host |
-| SEC-008 gate correlation | authorised responder and exact durable gate binding | M25 human-intervention tests | none | automated |
-| SEC-009 stale SHA | current-head CI, Architect and human evidence guards; pre-PUT recheck | M26 Gatekeeper tests | none | automated |
-| SEC-010 running install isolation | `/opt/syntra-build` root:syntra-build 0750 | static policy test | M31 smoke | host required |
-| SEC-011 project isolation | serialized per-workspace ACL grant and cleanup | M20 helper tests | two-project M31 smoke | host required |
-| SEC-012 auditable blocking | migration 026, bounded enums, append-only events/resolutions, Gatekeeper policy | `test_m31_security.py`, M26 tests | none | automated |
-| SECURITY §§5–18 identity/credentials | identities, minimal environment, deterministic adapters | M18–M24 suites | M31 smoke | covered |
-| SECURITY §§19–38 source/workspace/Git/GitHub | exact identities, scan, protected paths, Gatekeeper | M19/M21/M22/M26 suites | ACL inspection | covered |
-| SECURITY §§39–45 availability/data/logging | timeouts, process group kill, rlimits, WAL/backup, redaction | M20/M29/M30 suites and static M31 test | resource smoke | covered |
-| SECURITY §§46–54 recovery/testing | reconcile-before-replay and negative paths | M27 recovery and this matrix | recovery operator smoke | covered |
+| SEC-001 separate identities | systemd user plus root-owned transition helper | `test_m30_operational_assets.py::test_systemd_unit_is_hardened`; `test_m31_security_assets.py::test_systemd_and_launcher_security_contract` | distinct UID and sudo checks below | HOST_ACCEPTANCE_REQUIRED |
+| SEC-002 credential/database isolation | allowlisted environment and private control data | `test_m20_codex_runner.py::test_environment_allowlist_excludes_parent_secrets`; static host-policy test | real read-denial smoke below | HOST_ACCEPTANCE_REQUIRED |
+| SEC-003 Architect advisory only | strict response schema and deterministic Gatekeeper | M24 contract/review tests; M26 eligibility tests | none | AUTOMATED |
+| SEC-004 secret scan | exact-byte scanner, durable HIGH event, pre-provision design scan | `test_m21_change_validation.py::test_security_finding_is_atomic_and_clean_revalidation_resolves_only_scope`; `test_m18_provisioning_service.py::test_approved_design_secret_blocks_before_repository_mutation` | none | AUTOMATED |
+| SEC-005 credential-free remotes | validated remote URLs and Git authentication boundary | M19 workspace and M21 identity tests | inspect deployed remotes | AUTOMATED |
+| SEC-006 repository/worktree identity | M19/M21/M22/M26 exact identity checks | respective integration suites | none | AUTOMATED |
+| SEC-007 prompt injection | no AI capabilities; strict schemas; trusted protected scope | M24 response-schema tests; M21 protected-scope tests | OS capability smoke | PARTIAL — explicit M31 hostile-content cases remain review evidence |
+| SEC-008 gate correlation | authorised responder and exact durable gate binding | M25 unauthorised/duplicate/stale tests | none | AUTOMATED |
+| SEC-009 stale SHA | SHA-bound CI/review/human evidence plus pre-PUT recheck | M26 Gatekeeper stale-evidence and race tests | none | AUTOMATED |
+| SEC-010 running install isolation | `/opt/syntra-build` root:syntra-build 0750 | static policy asset test | real read/write denial | HOST_ACCEPTANCE_REQUIRED |
+| SEC-011 project isolation | serialized exact-workspace ACL grant/cleanup | M20 launcher contract tests | two-project smoke | HOST_ACCEPTANCE_REQUIRED |
+| SEC-012 auditable blocking | migration 026, security policy, immutable history | `test_m31_security.py::test_migration_26_and_active_resolution_history`; M26 security race test | none | AUTOMATED |
+| SECURITY §§5–18 identity/credentials | early Telegram rejection, service identities, empty worker environment | `test_telegram.py::test_unauthorised_update_records_only_safe_event`; M20 tests | identity/ACL smoke | HOST_ACCEPTANCE_REQUIRED |
+| SECURITY §§19–38 source/workspace/Git/GitHub | exact identity, scan, protected paths, privileged guards | M18/M19/M21/M22/M26 integration suites | ACL inspection | AUTOMATED except Unix ACL behavior |
+| SECURITY §§39–45 availability/data/logging | timeout/process-group kill, fixed rlimits, WAL/backup, redaction | M20/M29/M30 suites; `test_config.py::test_codex_resource_limits_are_bounded` | resource smoke | PARTIAL — no Codex network namespace or hard memory limit |
+| SECURITY §§46–54 recovery/testing | reconcile-before-replay and negative paths | M27 recovery suites; CI shell syntax step | recovery operator smoke | AUTOMATED except live provider/host behavior |
 
 The matrix references existing tests where they already prove an invariant; it does
 not claim that Unix users, ACLs, sudo or systemd can be proven in unprivileged CI.
@@ -33,7 +33,9 @@ not claim that Unix users, ACLs, sudo or systemd can be proven in unprivileged C
 ## Filesystem and resource policy
 
 `/opt/syntra-build` and `/etc/syntra-build` are root-owned, group-readable only by
-`syntra-build` (0750); configuration and secret files are 0640. State, logs,
+`syntra-build` (0750); `config.json` is root:syntra-build 0640. Credential files
+are syntra-build:syntra-build 0600 and the loader rejects symlinks, non-regular
+files, foreign owners, and any group/other access. State, logs,
 artifacts and backups are `syntra-build:syntra-build` 0700, while SQLite DB/WAL/SHM
 are 0600. The service uses `UMask=0077`. The worker home is 0700. The reviewed
 enforcement script normalizes existing control data without recursively changing
@@ -81,5 +83,5 @@ the command via `systemd-run --uid=syntra-build --wait` additionally proves the
 service identity can traverse the narrow helper after removal of control-plane
 `NoNewPrivileges`. Never print protected file contents or environment values.
 
-Credential rotation does not change this model: rotate the root-owned 0640 secret,
+Credential rotation does not change this model: rotate the service-owned 0600 secret,
 restart the service, and verify the worker continues to observe only ABSENT/DENIED.

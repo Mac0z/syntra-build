@@ -8,7 +8,7 @@ import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Final, TypeVar
+from typing import Final, Protocol, TypeVar
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -33,6 +33,8 @@ from syntra_build.application.metrics import (
     MetricsRecorder,
     NoOpMetricsRecorder,
 )
+from syntra_build.domain.identifiers import MilestoneId, ProjectId
+from syntra_build.domain.security import SecurityEventType, SecuritySeverity
 from syntra_build.infrastructure.config import ApplicationConfig
 
 _LOGGER = logging.getLogger("syntra_build.adapters.telegram")
@@ -50,6 +52,23 @@ class HTTPResponse:
 
 HTTPTransport = Callable[[Request, float], HTTPResponse]
 _T = TypeVar("_T")
+
+
+class SecurityEventSink(Protocol):
+    def record(
+        self,
+        event_type: SecurityEventType,
+        severity: SecuritySeverity,
+        *,
+        source_component: str,
+        correlation_id: str,
+        project_id: ProjectId | None,
+        milestone_id: MilestoneId | None,
+        source_reference: str | None,
+        safe_details: Mapping[str, str | int | bool | None],
+        blocking: bool,
+        created_at: datetime | None,
+    ) -> object: ...
 
 
 def _stdlib_transport(request: Request, timeout: float) -> HTTPResponse:
@@ -70,6 +89,7 @@ class TelegramClient:
         transport: HTTPTransport = _stdlib_transport,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         metrics: MetricsRecorder | None = None,
+        security_events: SecurityEventSink | None = None,
     ) -> None:
         token = config.secrets.telegram_bot_token
         if not config.telegram.enabled:
@@ -82,6 +102,7 @@ class TelegramClient:
         self._transport = transport
         self._clock = clock
         self._metrics = metrics or NoOpMetricsRecorder()
+        self._security_events = security_events
 
     def poll_updates(
         self, *, offset: int | None = None
@@ -117,6 +138,28 @@ class TelegramClient:
                 )
                 continue
             if payload.user_id not in self._authorised_user_ids:
+                if self._security_events is not None:
+                    try:
+                        self._security_events.record(
+                            SecurityEventType.UNAUTHORISED_MESSAGE,
+                            SecuritySeverity.INFO,
+                            source_component="telegram_transport",
+                            source_reference=str(payload.update_id),
+                            correlation_id=f"telegram-update:{payload.update_id}",
+                            project_id=None,
+                            milestone_id=None,
+                            safe_details={"update_id": payload.update_id},
+                            blocking=False,
+                            created_at=self._clock(),
+                        )
+                    except Exception:  # persistence must not weaken early rejection
+                        _LOGGER.error(
+                            "Telegram security event persistence failed",
+                            extra={
+                                "event": "security_event_persistence_failed",
+                                "metadata": {"event_type": "UNAUTHORISED_MESSAGE"},
+                            },
+                        )
                 _LOGGER.warning(
                     "Telegram update ignored",
                     extra={

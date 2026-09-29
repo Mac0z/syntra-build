@@ -13,9 +13,11 @@ from uuid import UUID, uuid4
 import pytest
 
 from syntra_build.application.change_validation import ChangeValidationService
+from syntra_build.application.security import SecurityPolicy
 from syntra_build.application.workspaces import WorkspaceService
 from syntra_build.domain.change_validation import FindingCode, ValidationDecision
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
+from syntra_build.domain.security import SecurityEventType, SecuritySeverity
 from syntra_build.domain.workspaces import (
     ManagedRepository,
     Workspace,
@@ -246,6 +248,58 @@ def test_secrets_are_rework_and_never_persisted_or_logged(
     )
     assert payload.strip() not in persisted
     assert payload.strip() not in caplog.text
+
+
+def test_security_finding_is_atomic_and_clean_revalidation_resolves_only_scope(
+    validation_workspace: tuple[
+        sqlite3.Connection, Path, TrustedGit, ChangeValidationService
+    ],
+) -> None:
+    db, worktree, _git, service = validation_workspace
+    unsafe = worktree / "config.env"
+    unsafe.write_text("token=ghp_SYNTHETIC0123456789ABCDE\n")
+
+    result = service.validate(PID, MID, "unsafe")
+    policy = SecurityPolicy(db)
+    event = db.execute(
+        "SELECT * FROM security_events WHERE correlation_id='unsafe'"
+    ).fetchone()
+    assert result.decision is ValidationDecision.REWORK_REQUIRED
+    assert event["event_type"] == "SECRET_DETECTED"
+    assert event["blocking"] == 1
+    assert "ghp_SYNTHETIC" not in event["safe_details_json"]
+    assert policy.blocked(PID, MID)
+
+    unsafe.unlink()
+    service.validate(PID, MID, "clean")
+
+    assert db.execute(
+        "SELECT 1 FROM security_events WHERE id=?", (event["id"],)
+    ).fetchone()
+    assert db.execute(
+        "SELECT 1 FROM security_event_resolutions WHERE security_event_id=?",
+        (event["id"],),
+    ).fetchone()
+    assert not policy.blocked(PID, MID)
+    unrelated = policy.record(
+        SecurityEventType.PROTECTED_PATH_CHANGE,
+        SecuritySeverity.HIGH,
+        project_id=PID,
+        milestone_id=MID,
+        source_component="operator_policy",
+        source_reference="independent",
+        correlation_id="other",
+        blocking=True,
+        created_at=NOW,
+    )
+    assert (
+        db.execute(
+            "SELECT 1 FROM security_event_resolutions WHERE security_event_id=?",
+            (unrelated.id,),
+        ).fetchone()
+        is None
+    )
+    assert policy.blocked(PID, MID)
 
 
 def test_validation_hash_is_bound_to_trusted_commit_and_untracked_bytes(

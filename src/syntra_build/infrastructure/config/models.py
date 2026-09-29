@@ -184,6 +184,9 @@ class CodexConfig:
     executable: str = "codex"
     execution_timeout_seconds: float = 3600.0
     worker_identity: str = "syntra-codex"
+    max_processes: int = 128
+    max_open_files: int = 1024
+    max_file_bytes: int = 104_857_600
 
     def __post_init__(self) -> None:
         _positive("codex.execution_timeout_seconds", self.execution_timeout_seconds)
@@ -191,6 +194,16 @@ class CodexConfig:
             raise ConfigurationError("codex.executable must not be empty")
         if not self.worker_identity.strip():
             raise ConfigurationError("codex.worker_identity must not be empty")
+        limits = (
+            ("max_processes", self.max_processes, 16, 512),
+            ("max_open_files", self.max_open_files, 64, 4096),
+            ("max_file_bytes", self.max_file_bytes, 1_048_576, 1_073_741_824),
+        )
+        for name, value, minimum, maximum in limits:
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ConfigurationError(
+                    f"codex.{name} must be between {minimum} and {maximum}"
+                )
 
 
 @dataclass(frozen=True, slots=True)

@@ -32,6 +32,15 @@ class SecurityEventType(StrEnum):
     RESOURCE_LIMIT_EXCEEDED = "RESOURCE_LIMIT_EXCEEDED"
 
 
+class SecurityResolutionCode(StrEnum):
+    CLEAN_REVALIDATION = "CLEAN_REVALIDATION"
+
+
+class SecurityActorType(StrEnum):
+    SYSTEM = "SYSTEM"
+    OPERATOR = "OPERATOR"
+
+
 @dataclass(frozen=True, slots=True)
 class SecurityEvent:
     id: str
@@ -51,8 +60,8 @@ class SecurityEvent:
 class SecurityEventResolution:
     id: str
     security_event_id: str
-    resolution_code: str
+    resolution_code: SecurityResolutionCode
     correlation_id: str
-    actor_type: str
+    actor_type: SecurityActorType
     actor_id: str | None
     resolved_at: datetime

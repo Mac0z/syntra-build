@@ -6,7 +6,12 @@ import pytest
 
 from syntra_build.application.security import SecurityPolicy, UnsafeSecurityDetails
 from syntra_build.domain import Project, ProjectId, ProjectState
-from syntra_build.domain.security import SecurityEventType, SecuritySeverity
+from syntra_build.domain.security import (
+    SecurityActorType,
+    SecurityEventType,
+    SecurityResolutionCode,
+    SecuritySeverity,
+)
 from syntra_build.infrastructure.config import load_config
 from syntra_build.infrastructure.persistence import (
     bootstrap_database,
@@ -57,7 +62,13 @@ def test_migration_26_and_active_resolution_history(tmp_path: Path) -> None:
         created_at=NOW,
     )
     assert policy.blocked(project.id)
-    policy.resolve(event.id, "CLEAN_REVALIDATION", "corr-2", "SYSTEM", resolved_at=NOW)
+    policy.resolve(
+        event.id,
+        SecurityResolutionCode.CLEAN_REVALIDATION,
+        "corr-2",
+        SecurityActorType.SYSTEM,
+        resolved_at=NOW,
+    )
     assert not policy.blocked(project.id)
     assert db.execute("SELECT count(*) FROM security_events").fetchone()[0] == 1
     with pytest.raises(Exception):
@@ -77,3 +88,37 @@ def test_security_details_fail_closed_without_persisting_secret(tmp_path: Path) 
             blocking=True,
         )
     assert db.execute("SELECT count(*) FROM security_events").fetchone()[0] == 0
+
+
+def test_resolution_rejects_unknown_duplicate_and_unbounded_semantics(
+    tmp_path: Path,
+) -> None:
+    db = _db(tmp_path)
+    policy = SecurityPolicy(db, iter(("event", "resolution", "duplicate")).__next__)
+    with pytest.raises(ValueError, match="does not exist"):
+        policy.resolve(
+            "missing",
+            SecurityResolutionCode.CLEAN_REVALIDATION,
+            "corr",
+            SecurityActorType.SYSTEM,
+        )
+    event = policy.record(
+        SecurityEventType.SECRET_DETECTED,
+        SecuritySeverity.HIGH,
+        source_component="test",
+        correlation_id="corr",
+        blocking=True,
+    )
+    policy.resolve(
+        event.id,
+        SecurityResolutionCode.CLEAN_REVALIDATION,
+        "corr",
+        SecurityActorType.SYSTEM,
+    )
+    with pytest.raises(Exception):
+        policy.resolve(
+            event.id,
+            SecurityResolutionCode.CLEAN_REVALIDATION,
+            "corr",
+            SecurityActorType.SYSTEM,
+        )

@@ -24,8 +24,17 @@ install -d -o syntra-build -g syntra-build -m 0700 \
 find /var/lib/syntra-build -maxdepth 1 -type f \
   \( -name '*.db' -o -name '*.db-wal' -o -name '*.db-shm' \) \
   -exec chown syntra-build:syntra-build {} + -exec chmod 0600 {} +
-find /etc/syntra-build -maxdepth 1 -type f -exec chown root:syntra-build {} + \
-  -exec chmod 0640 {} +
+if [[ -f /etc/syntra-build/config.json ]]; then
+  chown root:syntra-build /etc/syntra-build/config.json
+  chmod 0640 /etc/syntra-build/config.json
+fi
+for secret in telegram-token github-token openai-api-key; do
+  if [[ -e /etc/syntra-build/$secret ]]; then
+    [[ ! -L /etc/syntra-build/$secret ]] || { echo "$secret must not be a symlink" >&2; exit 1; }
+    chown syntra-build:syntra-build "/etc/syntra-build/$secret"
+    chmod 0600 "/etc/syntra-build/$secret"
+  fi
+done
 worker_home=$(getent passwd syntra-codex | cut -d: -f6)
 chown syntra-codex:syntra-codex "$worker_home"
 chmod 0700 "$worker_home"

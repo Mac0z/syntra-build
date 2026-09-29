@@ -44,6 +44,9 @@ def _hash(content: str) -> str:
 def _approved_project(
     connection: sqlite3.Connection,
     visibility: RepositoryVisibility = RepositoryVisibility.PUBLIC,
+    *,
+    spec_content: str = SPEC,
+    agents_content: str = AGENTS,
 ) -> None:
     now = NOW.isoformat()
     connection.execute(
@@ -62,8 +65,8 @@ def _approved_project(
         ),
     )
     for document_id, kind, content in (
-        (SPEC_ID, "SPEC", SPEC),
-        (AGENTS_ID, "AGENTS", AGENTS),
+        (SPEC_ID, "SPEC", spec_content),
+        (AGENTS_ID, "AGENTS", agents_content),
     ):
         connection.execute(
             """INSERT INTO project_documents
@@ -707,3 +710,30 @@ def test_restart_reuses_identified_repository_and_durable_baseline(
         (str(PID),),
     ).fetchone()[0]
     assert transition_count == 1
+
+
+@pytest.mark.parametrize("document_type", ["SPEC", "AGENTS"])
+def test_approved_design_secret_blocks_before_repository_mutation(
+    tmp_path: Path, document_type: str
+) -> None:
+    synthetic = "api_key = 'sk-proj-SYNTHETIC0123456789abcdefghijk'\n"
+    database = open_database(tmp_path / "secret-state.db")
+    apply_migrations(database)
+    _approved_project(
+        database,
+        spec_content=synthetic if document_type == "SPEC" else SPEC,
+        agents_content=synthetic if document_type == "AGENTS" else AGENTS,
+    )
+    service, github, git = _service(database)
+
+    with pytest.raises(ProvisioningError) as raised:
+        service.provision(PID, NOW, "design-secret")
+
+    assert raised.value.failure is ProvisioningFailure.SECURITY_BLOCKED
+    assert github.create_calls == git.commit_calls == git.push_calls == 0
+    event = database.execute(
+        "SELECT safe_details_json FROM security_events WHERE correlation_id=?",
+        ("design-secret",),
+    ).fetchone()
+    assert event is not None
+    assert synthetic.strip() not in event["safe_details_json"]
