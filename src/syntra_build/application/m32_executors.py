@@ -18,6 +18,7 @@ from syntra_build.application.scheduler import (
     JobExecutionDisposition,
     JobExecutionResult,
 )
+from syntra_build.application.specification import SpecificationDraftService
 from syntra_build.domain import Job, WorkerClass
 from syntra_build.domain.codex import CodexProcessStatus, CodexRunRequest
 from syntra_build.domain.failures import FailureClassification
@@ -64,6 +65,52 @@ class ArchitectDesignExecutor:
             return JobExecutionResult(
                 JobExecutionDisposition.FAILED,
                 error_id=f"architect-design-{error.kind.value.casefold()}",
+                failure_classification=(
+                    FailureClassification.TRANSIENT
+                    if error.kind in transient
+                    else FailureClassification.PERMANENT
+                ),
+            )
+        return JobExecutionResult(JobExecutionDisposition.SUCCEEDED)
+
+
+class SpecificationDraftExecutor:
+    """Generate one project specification on a worker-owned connection."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        service_factory: Callable[[sqlite3.Connection], SpecificationDraftService],
+        connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
+    ) -> None:
+        self.database_path = database_path
+        self.service_factory = service_factory
+        self.connection_factory = connection_factory
+
+    def execute(self, job: Job) -> JobExecutionResult:
+        if job.job_type != "SPECIFICATION_DRAFT":
+            raise ValueError(
+                "Specification drafting requires a SPECIFICATION_DRAFT job"
+            )
+        if job.worker_class is not WorkerClass.ARCHITECT:
+            raise ValueError("Specification drafting requires an Architect worker")
+        if job.milestone_id is not None:
+            raise ValueError("Specification drafting requires a project-scoped job")
+
+        try:
+            with closing(self.connection_factory(self.database_path)) as connection:
+                self.service_factory(connection).generate(
+                    job.project_id, job.correlation_id
+                )
+        except ArchitectError as error:
+            transient = {
+                ArchitectFailureKind.TIMEOUT,
+                ArchitectFailureKind.TRANSIENT_PROVIDER,
+                ArchitectFailureKind.THROTTLED,
+            }
+            return JobExecutionResult(
+                JobExecutionDisposition.FAILED,
+                error_id=f"specification-draft-{error.kind.value.casefold()}",
                 failure_classification=(
                     FailureClassification.TRANSIENT
                     if error.kind in transient
