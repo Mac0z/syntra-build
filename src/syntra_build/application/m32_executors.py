@@ -8,11 +8,14 @@ from collections.abc import Callable
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 from syntra_build.application.architect import (
     ArchitectDesignService,
     ArchitectError,
     ArchitectFailureKind,
+    ArchitectProvider,
+    ArchitectTaskService,
 )
 from syntra_build.application.codex import CodexRunner
 from syntra_build.application.provisioning import (
@@ -25,13 +28,249 @@ from syntra_build.application.scheduler import (
     JobExecutionResult,
 )
 from syntra_build.application.specification import SpecificationDraftService
-from syntra_build.domain import Job, ProjectState, WorkerClass
+from syntra_build.domain import (
+    ARCHITECT_TASK_INTERFACE_VERSION,
+    ArchitectTaskRequest,
+    ArchitectTaskType,
+    DesignPackageId,
+    DesignPackageStatus,
+    DocumentStatus,
+    DocumentType,
+    Job,
+    Milestone,
+    MilestoneId,
+    MilestoneState,
+    MilestoneTransitionRequest,
+    ProjectState,
+    RepositoryProvisioningStatus,
+    WorkerClass,
+)
 from syntra_build.domain.codex import CodexProcessStatus, CodexRunRequest
 from syntra_build.domain.failures import FailureClassification
 from syntra_build.infrastructure.persistence.architect import (
     SQLiteArchitectInteractionRepository,
 )
 from syntra_build.infrastructure.persistence.connection import open_database
+from syntra_build.infrastructure.persistence.design import (
+    SQLiteProjectDocumentRepository,
+)
+from syntra_build.infrastructure.persistence.design_packages import (
+    SQLiteDesignPackageRepository,
+)
+from syntra_build.infrastructure.persistence.errors import PersistenceError
+from syntra_build.infrastructure.persistence.milestones import SQLiteMilestoneRepository
+from syntra_build.infrastructure.persistence.projects import SQLiteProjectRepository
+from syntra_build.infrastructure.persistence.provisioning import (
+    SQLiteProvisioningRepository,
+)
+
+_TRANSIENT_ARCHITECT_FAILURES = {
+    ArchitectFailureKind.TIMEOUT,
+    ArchitectFailureKind.TRANSIENT_PROVIDER,
+    ArchitectFailureKind.THROTTLED,
+}
+
+
+class ArchitectTaskExecutor:
+    """Reconstruct and execute one initial Architect task from durable truth."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        provider: ArchitectProvider,
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
+    ) -> None:
+        self.database_path = database_path
+        self.provider = provider
+        self.clock = clock
+        self.connection_factory = connection_factory
+
+    def execute(self, job: Job) -> JobExecutionResult:
+        if job.job_type != "ARCHITECT_TASK":
+            raise ValueError("Architect task execution requires an ARCHITECT_TASK job")
+        if job.worker_class is not WorkerClass.ARCHITECT:
+            raise ValueError("Architect task execution requires an Architect worker")
+        if job.milestone_id is None:
+            raise ValueError("Architect task execution requires a milestone-scoped job")
+        if job.payload != {"task_type": ArchitectTaskType.IMPLEMENT.value}:
+            raise ValueError("Architect task payload must be exactly IMPLEMENT")
+
+        with closing(self.connection_factory(self.database_path)) as connection:
+            interactions = SQLiteArchitectInteractionRepository(connection)
+            milestones = SQLiteMilestoneRepository(connection, lambda: str(uuid4()))
+            milestone = milestones.get(job.milestone_id, job.project_id)
+            project = SQLiteProjectRepository(connection, lambda: str(uuid4())).get(
+                job.project_id
+            )
+            if project.state is not ProjectState.BUILDING:
+                raise ValueError("Architect task project must be BUILDING")
+
+            if self._accepted_for_job(interactions, job):
+                if milestone.state is MilestoneState.PREPARING_TASK:
+                    self._advance(milestones, job)
+                elif milestone.state is not MilestoneState.PREPARING_WORKSPACE:
+                    raise ValueError(
+                        "accepted Architect task has an inconsistent milestone state"
+                    )
+                return JobExecutionResult(JobExecutionDisposition.SUCCEEDED)
+
+            if milestone.state is not MilestoneState.PREPARING_TASK:
+                raise ValueError("Architect task milestone must be PREPARING_TASK")
+            request = self._request(connection, job, milestone)
+            service = ArchitectTaskService(
+                interactions, self.provider, clock=self.clock
+            )
+            try:
+                service.create(request)
+            except ArchitectError as error:
+                return JobExecutionResult(
+                    JobExecutionDisposition.FAILED,
+                    error_id=f"architect-task-{error.kind.value.casefold()}",
+                    failure_classification=(
+                        FailureClassification.TRANSIENT
+                        if error.kind in _TRANSIENT_ARCHITECT_FAILURES
+                        else FailureClassification.PERMANENT
+                    ),
+                )
+            self._advance(milestones, job)
+        return JobExecutionResult(JobExecutionDisposition.SUCCEEDED)
+
+    @staticmethod
+    def _accepted_for_job(
+        interactions: SQLiteArchitectInteractionRepository, job: Job
+    ) -> bool:
+        try:
+            task = interactions.accepted_task_for_job(str(job.id))
+        except PersistenceError:
+            return False
+        if (
+            task.project_id != job.project_id
+            or task.milestone_id != job.milestone_id
+            or task.correlation_id != job.correlation_id
+            or task.task_type is not ArchitectTaskType.IMPLEMENT
+        ):
+            raise ValueError(
+                "accepted Architect task identity does not match Scheduler job"
+            )
+        return True
+
+    def _request(
+        self, connection: sqlite3.Connection, job: Job, milestone: Milestone
+    ) -> ArchitectTaskRequest:
+        row = connection.execute(
+            """SELECT id FROM design_packages
+               WHERE project_id=? AND status='APPROVED'
+               ORDER BY approved_at DESC,id DESC LIMIT 1""",
+            (str(job.project_id),),
+        ).fetchone()
+        if row is None:
+            raise ValueError("approved design package is unavailable")
+        package = SQLiteDesignPackageRepository(connection).get(
+            DesignPackageId.from_string(row["id"])
+        )
+        if (
+            package.project_id != job.project_id
+            or package.status is not DesignPackageStatus.APPROVED
+        ):
+            raise ValueError("approved design package identity is inconsistent")
+
+        documents = SQLiteProjectDocumentRepository(connection)
+        spec = documents.get(job.project_id, package.spec_document_id)
+        agents = documents.get(job.project_id, package.agents_document_id)
+        if (
+            spec.document_type is not DocumentType.SPEC
+            or agents.document_type is not DocumentType.AGENTS
+            or spec.status is not DocumentStatus.APPROVED
+            or agents.status is not DocumentStatus.APPROVED
+        ):
+            raise ValueError(
+                "design package does not reference approved SPEC and AGENTS"
+            )
+
+        if milestone.sequence_number >= len(package.planned_milestones):
+            raise ValueError("milestone is absent from approved planning evidence")
+        planned = package.planned_milestones[milestone.sequence_number]
+        if (planned.code, planned.title) != (milestone.code, milestone.title):
+            raise ValueError("milestone does not match approved planning evidence")
+
+        provisioning = SQLiteProvisioningRepository(connection)
+        repository = provisioning.for_project(job.project_id)
+        baseline = provisioning.baseline(job.project_id)
+        if (
+            repository is None
+            or repository.status is not RepositoryProvisioningStatus.VERIFIED
+            or repository.verified_at is None
+            or repository.external_repository_id is None
+            or repository.default_branch is None
+            or baseline is None
+            or baseline.verified_at is None
+            or baseline.github_repository_id != repository.id
+            or baseline.spec_document_id != spec.id
+            or baseline.agents_document_id != agents.id
+            or baseline.spec_revision != spec.revision
+            or baseline.agents_revision != agents.revision
+            or baseline.spec_content_hash != spec.content_hash
+            or baseline.agents_content_hash != agents.content_hash
+        ):
+            raise ValueError(
+                "verified repository baseline is unavailable or inconsistent"
+            )
+
+        # No released durable milestone-summary artifact exists yet.  An empty
+        # tuple is safer than synthesising history from milestone titles.
+        return ArchitectTaskRequest(
+            ARCHITECT_TASK_INTERFACE_VERSION,
+            job.correlation_id,
+            job.project_id,
+            MilestoneId.from_string(str(job.milestone_id)),
+            job.id,
+            ArchitectTaskType.IMPLEMENT,
+            str(spec.revision),
+            spec.content,
+            str(agents.revision),
+            agents.content,
+            {
+                "id": str(milestone.id),
+                "code": milestone.code,
+                "title": milestone.title,
+                "sequence_number": milestone.sequence_number,
+                "state": milestone.state.value,
+            },
+            {
+                "provider": repository.provider,
+                "owner": repository.owner,
+                "repository_name": repository.repository_name,
+                "full_name": repository.full_name,
+                "default_branch": repository.default_branch,
+                "visibility": repository.visibility.value,
+                "external_repository_id": repository.external_repository_id,
+                "provisioning_status": repository.status.value,
+                "baseline_commit_sha": baseline.commit_sha,
+            },
+            (),
+            None,
+        )
+
+    def _advance(self, milestones: SQLiteMilestoneRepository, job: Job) -> None:
+        occurred_at = self.clock()
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError("Architect task clock must return a UTC timestamp")
+        assert job.milestone_id is not None
+        milestones.apply_transition(
+            MilestoneTransitionRequest(
+                job.milestone_id,
+                job.project_id,
+                MilestoneState.PREPARING_TASK,
+                MilestoneState.PREPARING_WORKSPACE,
+                "accepted implementation task persisted",
+                "SYSTEM",
+                "architect-task-executor",
+                job.correlation_id,
+                occurred_at.astimezone(UTC),
+            )
+        )
 
 
 class RepositoryProvisioningExecutor:
