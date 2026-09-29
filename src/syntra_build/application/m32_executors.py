@@ -8,6 +8,11 @@ from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 
+from syntra_build.application.architect import (
+    ArchitectDesignService,
+    ArchitectError,
+    ArchitectFailureKind,
+)
 from syntra_build.application.codex import CodexRunner
 from syntra_build.application.scheduler import (
     JobExecutionDisposition,
@@ -15,10 +20,57 @@ from syntra_build.application.scheduler import (
 )
 from syntra_build.domain import Job, WorkerClass
 from syntra_build.domain.codex import CodexProcessStatus, CodexRunRequest
+from syntra_build.domain.failures import FailureClassification
 from syntra_build.infrastructure.persistence.architect import (
     SQLiteArchitectInteractionRepository,
 )
 from syntra_build.infrastructure.persistence.connection import open_database
+
+
+class ArchitectDesignExecutor:
+    """Run one persisted project design request on a worker-owned connection."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        service_factory: Callable[[sqlite3.Connection], ArchitectDesignService],
+        connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
+    ) -> None:
+        self.database_path = database_path
+        self.service_factory = service_factory
+        self.connection_factory = connection_factory
+
+    def execute(self, job: Job) -> JobExecutionResult:
+        if job.job_type != "ARCHITECT_DESIGN":
+            raise ValueError("Architect design requires an ARCHITECT_DESIGN job")
+        if job.worker_class is not WorkerClass.ARCHITECT:
+            raise ValueError("Architect design requires an Architect worker")
+        if job.milestone_id is not None:
+            raise ValueError("Architect design requires a project-scoped job")
+
+        # Scheduler calls execute on its worker pool. Constructing the service from
+        # this connection keeps every SQLite repository on the executing thread.
+        try:
+            with closing(self.connection_factory(self.database_path)) as connection:
+                self.service_factory(connection).design(
+                    job.project_id, job.correlation_id
+                )
+        except ArchitectError as error:
+            transient = {
+                ArchitectFailureKind.TIMEOUT,
+                ArchitectFailureKind.TRANSIENT_PROVIDER,
+                ArchitectFailureKind.THROTTLED,
+            }
+            return JobExecutionResult(
+                JobExecutionDisposition.FAILED,
+                error_id=f"architect-design-{error.kind.value.casefold()}",
+                failure_classification=(
+                    FailureClassification.TRANSIENT
+                    if error.kind in transient
+                    else FailureClassification.PERMANENT
+                ),
+            )
+        return JobExecutionResult(JobExecutionDisposition.SUCCEEDED)
 
 
 class InitialCodexExecutor:
