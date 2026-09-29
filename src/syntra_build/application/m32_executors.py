@@ -28,6 +28,7 @@ from syntra_build.application.scheduler import (
     JobExecutionResult,
 )
 from syntra_build.application.specification import SpecificationDraftService
+from syntra_build.application.workspaces import WorkspaceService, milestone_branch_name
 from syntra_build.domain import (
     ARCHITECT_TASK_INTERFACE_VERSION,
     ArchitectTaskRequest,
@@ -47,6 +48,7 @@ from syntra_build.domain import (
 )
 from syntra_build.domain.codex import CodexProcessStatus, CodexRunRequest
 from syntra_build.domain.failures import FailureClassification
+from syntra_build.domain.workspaces import WorkspaceError, WorkspaceState
 from syntra_build.infrastructure.persistence.architect import (
     SQLiteArchitectInteractionRepository,
 )
@@ -63,12 +65,145 @@ from syntra_build.infrastructure.persistence.projects import SQLiteProjectReposi
 from syntra_build.infrastructure.persistence.provisioning import (
     SQLiteProvisioningRepository,
 )
+from syntra_build.infrastructure.persistence.workspaces import SQLiteWorkspaceRepository
 
 _TRANSIENT_ARCHITECT_FAILURES = {
     ArchitectFailureKind.TIMEOUT,
     ArchitectFailureKind.TRANSIENT_PROVIDER,
     ArchitectFailureKind.THROTTLED,
 }
+
+
+class WorkspacePrepareExecutor:
+    """Prepare and verify one trusted M19 workspace on the worker thread."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        service_factory: Callable[[sqlite3.Connection], WorkspaceService],
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
+    ) -> None:
+        self.database_path = database_path
+        self.service_factory = service_factory
+        self.clock = clock
+        self.connection_factory = connection_factory
+
+    def execute(self, job: Job) -> JobExecutionResult:
+        if job.job_type != "WORKSPACE_PREPARE":
+            raise ValueError("Workspace preparation requires a WORKSPACE_PREPARE job")
+        if job.worker_class is not WorkerClass.GIT:
+            raise ValueError("Workspace preparation requires a Git worker")
+        if job.milestone_id is None:
+            raise ValueError("Workspace preparation requires a milestone-scoped job")
+        if job.payload:
+            raise ValueError("Workspace preparation does not accept workflow payload")
+
+        occurred_at = self.clock()
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError("Workspace preparation clock must return a UTC timestamp")
+        occurred_at = occurred_at.astimezone(UTC)
+
+        try:
+            with closing(self.connection_factory(self.database_path)) as connection:
+                milestones = SQLiteMilestoneRepository(connection, lambda: str(uuid4()))
+                milestone = milestones.get(job.milestone_id, job.project_id)
+                project = SQLiteProjectRepository(connection, lambda: str(uuid4())).get(
+                    job.project_id
+                )
+                if project.state is not ProjectState.BUILDING:
+                    raise ValueError("Workspace preparation project must be BUILDING")
+                if milestone.state not in {
+                    MilestoneState.PREPARING_WORKSPACE,
+                    MilestoneState.CODING,
+                }:
+                    raise ValueError(
+                        "Workspace preparation milestone must be PREPARING_WORKSPACE"
+                    )
+
+                task = SQLiteArchitectInteractionRepository(
+                    connection
+                ).accepted_task_for_milestone(
+                    str(job.project_id), str(job.milestone_id)
+                )
+                if (
+                    task.project_id != job.project_id
+                    or task.milestone_id != job.milestone_id
+                    or task.task_type is not ArchitectTaskType.IMPLEMENT
+                ):
+                    raise ValueError(
+                        "accepted Architect IMPLEMENT task identity is inconsistent"
+                    )
+
+                provisioning = SQLiteProvisioningRepository(connection)
+                repository = provisioning.for_project(job.project_id)
+                baseline = provisioning.baseline(job.project_id)
+                if (
+                    repository is None
+                    or repository.status is not RepositoryProvisioningStatus.VERIFIED
+                    or repository.verified_at is None
+                    or repository.external_repository_id is None
+                    or repository.default_branch != "main"
+                    or baseline is None
+                    or baseline.verified_at is None
+                    or baseline.github_repository_id != repository.id
+                ):
+                    raise ValueError(
+                        "verified M18 repository baseline is unavailable or inconsistent"
+                    )
+
+                service = self.service_factory(connection)
+                workspace = service.prepare_workspace(
+                    job.project_id, job.milestone_id, occurred_at
+                )
+                persisted = SQLiteWorkspaceRepository(
+                    connection
+                ).workspace_for_milestone(job.milestone_id)
+                expected_branch = milestone_branch_name(
+                    milestone.sequence_number, milestone.title
+                )
+                expected_path = (
+                    service.workspace_root / str(job.project_id) / str(job.milestone_id)
+                ).resolve(strict=False)
+                if (
+                    persisted != workspace
+                    or workspace.project_id != job.project_id
+                    or workspace.milestone_id != job.milestone_id
+                    or workspace.path != expected_path
+                    or service.workspace_root not in workspace.path.parents
+                    or workspace.branch_name != expected_branch
+                    or workspace.base_branch != "main"
+                    or not workspace.base_sha
+                    or workspace.last_validated_at is None
+                    or workspace.state is not WorkspaceState.READY
+                    or workspace.current_head_sha != workspace.base_sha
+                ):
+                    raise WorkspaceError(
+                        "prepared workspace is not verified ready for implementation"
+                    )
+
+                if milestone.state is MilestoneState.PREPARING_WORKSPACE:
+                    milestones.apply_transition(
+                        MilestoneTransitionRequest(
+                            job.milestone_id,
+                            job.project_id,
+                            MilestoneState.PREPARING_WORKSPACE,
+                            MilestoneState.CODING,
+                            "trusted workspace prepared and verified",
+                            "SYSTEM",
+                            "workspace-prepare-executor",
+                            job.correlation_id,
+                            occurred_at,
+                        )
+                    )
+        except WorkspaceError:
+            return JobExecutionResult(
+                JobExecutionDisposition.FAILED,
+                error_id="workspace-prepare-invariant",
+                failure_classification=FailureClassification.PERMANENT,
+            )
+        return JobExecutionResult(JobExecutionDisposition.SUCCEEDED)
 
 
 class ArchitectTaskExecutor:
