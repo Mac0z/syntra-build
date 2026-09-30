@@ -794,10 +794,8 @@ class ChangeValidationExecutor:
             service = ChangeValidationService(connection, self.git, self.data_root)
             validations = SQLiteValidationRepository(connection)
             trusted_head = workspace.current_head_sha or workspace.base_sha
-            try:
-                current = service.collector.collect(workspace.path, trusted_head)
-            except WorkspaceError:
-                current = None
+            live = service.replay_evidence(job.project_id, job.milestone_id)
+            current = live.collected if live is not None else None
             accepted = (
                 validations.accepted_evidence(
                     workspace.id, trusted_head, current.canonical_hash

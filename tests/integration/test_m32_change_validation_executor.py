@@ -406,6 +406,66 @@ def test_exact_replay_repairs_transition_without_duplicate(tmp_path: Path) -> No
         assert db.execute("SELECT count(*) FROM change_sets").fetchone()[0] == before
 
 
+def test_accept_replay_after_branch_tamper_is_blocked(tmp_path: Path) -> None:
+    database, worktree, trusted = seed(tmp_path)
+    (worktree / "safe.py").write_text("safe = True\n")
+    with open_database(database) as db:
+        accepted = ChangeValidationService(db, trusted, tmp_path / "data").validate(
+            PID, MID, CORRELATION, now=NOW
+        )
+        assert accepted.decision is ValidationDecision.ACCEPT
+    git(worktree, "checkout", "-b", "tampered-branch")
+
+    result = executor(database, trusted, tmp_path / "data").execute(validation_job())
+
+    assert result.disposition is JobExecutionDisposition.FAILED
+    assert result.failure_classification is FailureClassification.POLICY
+    assert milestone_state(database) == MilestoneState.VALIDATING_CHANGES.value
+    with open_database(database) as db:
+        assert db.execute("SELECT count(*) FROM change_sets").fetchone()[0] == 2
+        latest = db.execute(
+            "SELECT decision FROM change_sets ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        assert latest[0] == ValidationDecision.BLOCKED.value
+        event = db.execute(
+            """SELECT event_type,blocking FROM security_events
+               ORDER BY rowid DESC LIMIT 1"""
+        ).fetchone()
+        assert event["event_type"] == "UNEXPECTED_GIT_HISTORY_CHANGE"
+        assert event["blocking"] == 1
+
+
+def test_accept_replay_after_repository_identity_tamper_is_blocked(
+    tmp_path: Path,
+) -> None:
+    database, worktree, trusted = seed(tmp_path)
+    (worktree / "safe.py").write_text("safe = True\n")
+    with open_database(database) as db:
+        accepted = ChangeValidationService(db, trusted, tmp_path / "data").validate(
+            PID, MID, CORRELATION, now=NOW
+        )
+        assert accepted.decision is ValidationDecision.ACCEPT
+    git(worktree, "remote", "set-url", "origin", "https://example.test/tampered.git")
+
+    result = executor(database, trusted, tmp_path / "data").execute(validation_job())
+
+    assert result.disposition is JobExecutionDisposition.FAILED
+    assert result.failure_classification is FailureClassification.POLICY
+    assert milestone_state(database) == MilestoneState.VALIDATING_CHANGES.value
+    with open_database(database) as db:
+        assert db.execute("SELECT count(*) FROM change_sets").fetchone()[0] == 2
+        latest = db.execute(
+            "SELECT decision FROM change_sets ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        assert latest[0] == ValidationDecision.BLOCKED.value
+        event = db.execute(
+            """SELECT event_type,blocking FROM security_events
+               ORDER BY rowid DESC LIMIT 1"""
+        ).fetchone()
+        assert event["event_type"] == "REPOSITORY_IDENTITY_MISMATCH"
+        assert event["blocking"] == 1
+
+
 def test_changed_diff_after_accept_creates_fresh_authoritative_evidence(
     tmp_path: Path,
 ) -> None:
