@@ -134,3 +134,25 @@ class SQLiteValidationRepository:
             row["files_json"],
             row["correlation_id"],
         )
+
+    def accepted_by_id(self, change_set_id: str) -> AcceptedChangeSetEvidence | None:
+        """Return one immutable ACCEPT record by its durable identity."""
+        row = self.connection.execute(
+            """SELECT id,project_id,milestone_id,worktree_id,branch_name,
+            head_sha_before_commit,diff_hash,files_json,correlation_id
+            FROM change_sets WHERE id=? AND decision='ACCEPT'""",
+            (change_set_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return AcceptedChangeSetEvidence(
+            row["id"],
+            row["project_id"],
+            row["milestone_id"],
+            row["worktree_id"],
+            row["branch_name"],
+            row["head_sha_before_commit"],
+            row["diff_hash"],
+            row["files_json"],
+            row["correlation_id"],
+        )

@@ -399,6 +399,42 @@ def test_persisted_commit_replays_without_second_commit(tmp_path: Path) -> None:
         assert db.execute("SELECT count(*) FROM commits").fetchone()[0] == 1
 
 
+def test_new_accept_after_prior_commit_creates_next_commit(tmp_path: Path) -> None:
+    database, worktree, trusted, _, _ = prepare(tmp_path)
+    first = executor(database, trusted, tmp_path / "data").execute(commit_job())
+    assert first.disposition is JobExecutionDisposition.SUCCEEDED
+    with open_database(database) as db:
+        commit_a = db.execute("SELECT * FROM commits").fetchone()
+        accept_a = db.execute("SELECT * FROM change_sets").fetchone()
+        db.execute("UPDATE milestones SET state='COMMITTING' WHERE id=?", (str(MID),))
+        db.commit()
+
+    (worktree / "second.py").write_text("second = True\n")
+    with open_database(database) as db:
+        accept_b = ChangeValidationService(db, trusted, tmp_path / "data").validate(
+            PID, MID, "second-validation", now=NOW
+        )
+        db.commit()
+    assert accept_b.decision is ValidationDecision.ACCEPT
+    assert accept_b.id != accept_a["id"]
+    assert accept_b.trusted_head_sha == commit_a["commit_sha"]
+
+    result = executor(database, trusted, tmp_path / "data").execute(commit_job())
+
+    assert result.disposition is JobExecutionDisposition.SUCCEEDED
+    with open_database(database) as db:
+        commits = db.execute("SELECT * FROM commits ORDER BY created_at,id").fetchall()
+        workspace = db.execute("SELECT * FROM git_workspaces").fetchone()
+        assert len(commits) == 2
+        commit_b = next(row for row in commits if row["id"] != commit_a["id"])
+        assert commit_b["parent_sha"] == commit_a["commit_sha"]
+        assert commit_b["change_set_id"] == accept_b.id
+        assert commit_b["validated_diff_hash"] == accept_b.diff_hash
+        assert workspace["current_head_sha"] == commit_b["commit_sha"]
+    assert git(worktree, "show", "--pretty=", "--name-only", "HEAD") == "second.py"
+    assert milestone_state(database) == MilestoneState.PUSHING.value
+
+
 def test_unexplained_live_commit_is_not_adopted(tmp_path: Path) -> None:
     database, worktree, trusted, _, _ = prepare(tmp_path)
     identity = dict(

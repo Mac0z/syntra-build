@@ -959,15 +959,25 @@ class TrustedCommitExecutor:
                 ):
                     raise ValueError("managed workspace identity is unavailable")
 
-                persisted = self._existing_commit(records, workspace)
-                accepted_head = (
-                    persisted.commit.parent_sha
-                    if persisted is not None
-                    else workspace.current_head_sha or workspace.base_sha
+                trusted_head = workspace.current_head_sha or workspace.base_sha
+                validations = SQLiteValidationRepository(connection)
+                evidence = validations.accepted_for_workspace_head(
+                    workspace.id, trusted_head
                 )
-                evidence = SQLiteValidationRepository(
-                    connection
-                ).accepted_for_workspace_head(workspace.id, accepted_head)
+                persisted = (
+                    records.commit_for_change_set(workspace.id, evidence.id)
+                    if evidence is not None
+                    else None
+                )
+                accepted_head = trusted_head
+                if evidence is None:
+                    # A post-commit crash advances the durable workspace HEAD before
+                    # the milestone transition. Replay is allowed only for the commit
+                    # at that exact HEAD, and only when no newer ACCEPT exists there.
+                    persisted = records.commit_at_head(workspace.id, trusted_head)
+                    if persisted is not None:
+                        evidence = validations.accepted_by_id(persisted.change_set_id)
+                        accepted_head = persisted.commit.parent_sha
                 paths = self._accepted_paths(evidence, job, workspace, accepted_head)
                 assert evidence is not None
                 message = f"{milestone.code}: {milestone.title}"
@@ -1017,12 +1027,6 @@ class TrustedCommitExecutor:
                 failure_classification=FailureClassification.PERMANENT,
             )
         return JobExecutionResult(JobExecutionDisposition.SUCCEEDED)
-
-    @staticmethod
-    def _existing_commit(
-        records: SQLiteWorkspaceRepository, workspace: Workspace
-    ) -> PersistedTrustedCommit | None:
-        return records.latest_commit_for_milestone(workspace.id, workspace.milestone_id)
 
     @staticmethod
     def _accepted_paths(

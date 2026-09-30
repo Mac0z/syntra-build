@@ -208,6 +208,18 @@ class SQLiteWorkspaceRepository:
             return None
         return self.commit_for_change_set(workspace_id, row["change_set_id"])
 
+    def commit_at_head(
+        self, workspace_id: str, commit_sha: str
+    ) -> PersistedTrustedCommit | None:
+        row = self.connection.execute(
+            """SELECT change_set_id FROM commits
+            WHERE worktree_id=? AND commit_sha=?""",
+            (workspace_id, commit_sha),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.commit_for_change_set(workspace_id, row["change_set_id"])
+
     @staticmethod
     def _workspace(row: sqlite3.Row) -> Workspace:
         created = _time(row["created_at"])
