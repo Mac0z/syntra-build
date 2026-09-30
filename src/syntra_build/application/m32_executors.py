@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
@@ -17,6 +19,7 @@ from syntra_build.application.architect import (
     ArchitectProvider,
     ArchitectTaskService,
 )
+from syntra_build.application.change_validation import ChangeValidationService
 from syntra_build.application.codex import WorkspaceBoundCodexRunner
 from syntra_build.application.provisioning import (
     ProvisioningError,
@@ -46,11 +49,17 @@ from syntra_build.domain import (
     RepositoryProvisioningStatus,
     WorkerClass,
 )
+from syntra_build.domain.change_validation import ValidationDecision
 from syntra_build.domain.codex import CodexProcessStatus, CodexRunRequest
 from syntra_build.domain.failures import FailureClassification
-from syntra_build.domain.workspaces import WorkspaceError, WorkspaceState
+from syntra_build.domain.workspaces import Workspace, WorkspaceError, WorkspaceState
+from syntra_build.infrastructure.git_workspace import TrustedGit
 from syntra_build.infrastructure.persistence.architect import (
     SQLiteArchitectInteractionRepository,
+)
+from syntra_build.infrastructure.persistence.change_validation import (
+    AcceptedChangeSetEvidence,
+    SQLiteValidationRepository,
 )
 from syntra_build.infrastructure.persistence.codex import SQLiteCodexRunRepository
 from syntra_build.infrastructure.persistence.connection import open_database
@@ -67,6 +76,8 @@ from syntra_build.infrastructure.persistence.provisioning import (
     SQLiteProvisioningRepository,
 )
 from syntra_build.infrastructure.persistence.workspaces import SQLiteWorkspaceRepository
+
+_CANONICAL_DIFF_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 _TRANSIENT_ARCHITECT_FAILURES = {
     ArchitectFailureKind.TIMEOUT,
@@ -716,3 +727,176 @@ class InitialCodexExecutor:
             )
         ):
             raise ValueError("Codex result identity does not match request")
+
+
+class ChangeValidationExecutor:
+    """Validate one Codex-produced worktree delta without mutating Git state."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        git: TrustedGit,
+        data_root: Path,
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
+    ) -> None:
+        self.database_path = database_path
+        self.git = git
+        self.data_root = data_root
+        self.clock = clock
+        self.connection_factory = connection_factory
+
+    def execute(self, job: Job) -> JobExecutionResult:
+        if job.job_type != "CHANGE_VALIDATE":
+            raise ValueError("change validation requires a CHANGE_VALIDATE job")
+        if job.worker_class is not WorkerClass.GIT:
+            raise ValueError("change validation requires a Git worker")
+        if job.milestone_id is None:
+            raise ValueError("change validation requires a milestone-scoped job")
+        if job.payload:
+            raise ValueError("change validation does not accept workflow payload")
+
+        occurred_at = self.clock()
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError("change validation clock must return a UTC timestamp")
+        occurred_at = occurred_at.astimezone(UTC)
+
+        with closing(self.connection_factory(self.database_path)) as connection:
+            milestones = SQLiteMilestoneRepository(connection, lambda: str(uuid4()))
+            milestone = milestones.get(job.milestone_id, job.project_id)
+            project = SQLiteProjectRepository(connection, lambda: str(uuid4())).get(
+                job.project_id
+            )
+            if project.state is not ProjectState.BUILDING:
+                raise ValueError("change validation project must be BUILDING")
+            if milestone.state not in {
+                MilestoneState.VALIDATING_CHANGES,
+                MilestoneState.COMMITTING,
+            }:
+                raise ValueError(
+                    "change validation milestone must be VALIDATING_CHANGES"
+                )
+
+            workspaces = SQLiteWorkspaceRepository(connection)
+            workspace = workspaces.workspace_for_milestone(job.milestone_id)
+            if (
+                workspace is None
+                or workspace.project_id != job.project_id
+                or workspace.milestone_id != job.milestone_id
+            ):
+                raise ValueError("managed workspace identity is unavailable")
+            if not SQLiteCodexRunRepository(connection).has_successful_coding_run(
+                job.project_id, job.milestone_id, workspace.id
+            ):
+                raise ValueError("successful durable Codex run is unavailable")
+
+            service = ChangeValidationService(connection, self.git, self.data_root)
+            validations = SQLiteValidationRepository(connection)
+            trusted_head = workspace.current_head_sha or workspace.base_sha
+            try:
+                current = service.collector.collect(workspace.path, trusted_head)
+            except WorkspaceError:
+                current = None
+            accepted = (
+                validations.accepted_evidence(
+                    workspace.id, trusted_head, current.canonical_hash
+                )
+                if current is not None
+                else None
+            )
+            if accepted is not None:
+                assert current is not None
+                self._require_accepted_identity(accepted, job, workspace, current.files)
+                if milestone.state is MilestoneState.VALIDATING_CHANGES:
+                    self._advance(milestones, job, occurred_at)
+                return JobExecutionResult(JobExecutionDisposition.SUCCEEDED)
+            if milestone.state is MilestoneState.COMMITTING:
+                raise ValueError(
+                    "COMMITTING milestone has no accepted evidence for current diff"
+                )
+
+            change_set = service.validate(
+                job.project_id,
+                job.milestone_id,
+                job.correlation_id,
+                authorised_protected_paths=(),
+                now=occurred_at,
+            )
+            if change_set.decision is ValidationDecision.ACCEPT:
+                if (
+                    change_set.project_id != job.project_id
+                    or change_set.milestone_id != job.milestone_id
+                    or change_set.correlation_id != job.correlation_id
+                    or change_set.workspace_id != workspace.id
+                    or change_set.branch_name != workspace.branch_name
+                    or change_set.trusted_head_sha != trusted_head
+                    or change_set.is_empty
+                    or not change_set.files
+                    or _CANONICAL_DIFF_HASH.fullmatch(change_set.diff_hash) is None
+                ):
+                    raise ValueError("accepted change set identity is inconsistent")
+                durable = validations.accepted_evidence(
+                    workspace.id, trusted_head, change_set.diff_hash
+                )
+                if durable is None:
+                    raise RuntimeError("accepted change set was not durably persisted")
+                self._require_accepted_identity(
+                    durable, job, workspace, change_set.files
+                )
+                self._advance(milestones, job, occurred_at)
+                return JobExecutionResult(JobExecutionDisposition.SUCCEEDED)
+
+            return JobExecutionResult(
+                JobExecutionDisposition.FAILED,
+                error_id=f"change-validation-{change_set.decision.value.casefold()}",
+                failure_classification=(
+                    FailureClassification.POLICY
+                    if change_set.decision is ValidationDecision.BLOCKED
+                    else FailureClassification.PERMANENT
+                ),
+            )
+
+    @staticmethod
+    def _require_accepted_identity(
+        evidence: AcceptedChangeSetEvidence,
+        job: Job,
+        workspace: Workspace,
+        files: tuple[object, ...],
+    ) -> None:
+        persisted_files = json.loads(evidence.files_json)
+        if (
+            evidence.project_id != str(job.project_id)
+            or evidence.milestone_id != str(job.milestone_id)
+            or evidence.correlation_id != job.correlation_id
+            or evidence.workspace_id != workspace.id
+            or evidence.branch_name != workspace.branch_name
+            or evidence.trusted_head_sha
+            != (workspace.current_head_sha or workspace.base_sha)
+            or evidence.diff_hash is None
+            or _CANONICAL_DIFF_HASH.fullmatch(evidence.diff_hash) is None
+            or not files
+            or not persisted_files
+        ):
+            raise ValueError("accepted validation evidence identity is inconsistent")
+
+    @staticmethod
+    def _advance(
+        milestones: SQLiteMilestoneRepository,
+        job: Job,
+        occurred_at: datetime,
+    ) -> None:
+        assert job.milestone_id is not None
+        milestones.apply_transition(
+            MilestoneTransitionRequest(
+                job.milestone_id,
+                job.project_id,
+                MilestoneState.VALIDATING_CHANGES,
+                MilestoneState.COMMITTING,
+                "worktree changes accepted by durable validation",
+                "SYSTEM",
+                "change-validation-executor",
+                job.correlation_id,
+                occurred_at,
+            )
+        )

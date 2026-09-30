@@ -135,6 +135,30 @@ class SQLiteCodexRunRepository:
             known_issues=tuple(json.loads(row["known_issues_json"])),
         )
 
+    def has_successful_coding_run(
+        self,
+        project_id: ProjectId,
+        milestone_id: MilestoneId,
+        worktree_id: str,
+    ) -> bool:
+        """Return whether the exact workspace has durable successful coding evidence."""
+        row = self.connection.execute(
+            """SELECT 1 FROM codex_runs r
+               JOIN jobs j ON j.id=r.job_id
+               WHERE r.project_id=? AND r.milestone_id=? AND r.worktree_id=?
+                 AND r.process_status=? AND r.completed_at IS NOT NULL
+                 AND j.project_id=r.project_id AND j.milestone_id=r.milestone_id
+                 AND j.job_type='CODEX_RUN'
+               ORDER BY r.completed_at DESC,r.id DESC LIMIT 1""",
+            (
+                str(project_id),
+                str(milestone_id),
+                worktree_id,
+                CodexProcessStatus.SUCCEEDED.value,
+            ),
+        ).fetchone()
+        return row is not None
+
     def _test(self, run_id: str, report: ReportedTest) -> None:
         self.connection.execute(
             """INSERT INTO codex_run_tests
