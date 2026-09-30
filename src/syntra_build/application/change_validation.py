@@ -7,6 +7,7 @@ import logging
 import sqlite3
 from collections import Counter
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -22,9 +23,10 @@ from syntra_build.domain.change_validation import (
 )
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
 from syntra_build.domain.security import SecurityEventType, SecuritySeverity
-from syntra_build.domain.workspaces import WorkspaceError
+from syntra_build.domain.workspaces import Workspace, WorkspaceError
 from syntra_build.infrastructure.change_validation import (
     ChangeCollector,
+    CollectedChanges,
     RegexSecretScanner,
 )
 from syntra_build.infrastructure.git_workspace import TrustedGit
@@ -48,6 +50,17 @@ _PROTECTED = (
     "SECURITY.md",
     "security/**",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class LiveChangeEvidence:
+    """Read-only M21 workspace identity and current-diff observation."""
+
+    workspace: Workspace
+    trusted_head: str
+    collected: CollectedChanges | None
+    identity_problem: bool
+    history_problem: bool
 
 
 class ProtectedPathPolicy:
@@ -90,6 +103,67 @@ class ChangeValidationService:
         self.protected_paths = protected_paths or ProtectedPathPolicy()
         self.security = SecurityPolicy(connection)
 
+    def replay_evidence(
+        self, project_id: ProjectId, milestone_id: MilestoneId
+    ) -> LiveChangeEvidence | None:
+        """Return current diff evidence only when every live identity check passes."""
+        evidence = self._collect_live_evidence(project_id, milestone_id)
+        if (
+            evidence.identity_problem
+            or evidence.history_problem
+            or evidence.collected is None
+        ):
+            return None
+        return evidence
+
+    def _collect_live_evidence(
+        self, project_id: ProjectId, milestone_id: MilestoneId
+    ) -> LiveChangeEvidence:
+        managed = self.workspaces.managed_for_project(project_id)
+        workspace = self.workspaces.workspace_for_milestone(milestone_id)
+        if managed is None or workspace is None or workspace.project_id != project_id:
+            raise WorkspaceError("managed workspace does not exist")
+        trusted_head = workspace.current_head_sha or workspace.base_sha
+        expected_path = (
+            self.workspace_root / str(project_id) / str(milestone_id)
+        ).resolve(strict=False)
+        identity_problem = False
+        history_problem = False
+        try:
+            actual_path = workspace.path.resolve(strict=True)
+            identity_problem = (
+                workspace.path != expected_path
+                or actual_path != expected_path
+                or self.workspace_root not in actual_path.parents
+                or not self.git.registered(managed.path, actual_path)
+                or self.git.origin(actual_path) != managed.remote_url
+                or self.git.common_dir(actual_path) != managed.path.resolve(strict=True)
+                or not self.git.is_bare(managed.path)
+            )
+            branch = self.git.branch(actual_path)
+            head = self.git.head(actual_path)
+            history_problem = branch != workspace.branch_name or head != trusted_head
+        except OSError, WorkspaceError:
+            actual_path = workspace.path
+            identity_problem = True
+
+        collected: CollectedChanges | None
+        try:
+            collected = self.collector.collect(actual_path, trusted_head)
+        except WorkspaceError:
+            collected = (
+                self.collector.collect(workspace.path, trusted_head)
+                if not identity_problem
+                else None
+            )
+        return LiveChangeEvidence(
+            workspace,
+            trusted_head,
+            collected,
+            identity_problem,
+            history_problem,
+        )
+
     def validate(
         self,
         project_id: ProjectId,
@@ -130,38 +204,12 @@ class ChangeValidationService:
                 )
             )
 
-        managed = self.workspaces.managed_for_project(project_id)
-        workspace = self.workspaces.workspace_for_milestone(milestone_id)
-        if managed is None or workspace is None or workspace.project_id != project_id:
-            raise WorkspaceError("managed workspace does not exist")
-        trusted_head = workspace.current_head_sha or workspace.base_sha
-        expected_path = (
-            self.workspace_root / str(project_id) / str(milestone_id)
-        ).resolve(strict=False)
-        identity_problem = False
-        history_problem = False
-        collected = None
-        try:
-            actual_path = workspace.path.resolve(strict=True)
-            identity_problem = (
-                workspace.path != expected_path
-                or actual_path != expected_path
-                or self.workspace_root not in actual_path.parents
-                or not self.git.registered(managed.path, actual_path)
-                or self.git.origin(actual_path) != managed.remote_url
-                or self.git.common_dir(actual_path) != managed.path.resolve(strict=True)
-                or not self.git.is_bare(managed.path)
-            )
-            branch = self.git.branch(actual_path)
-            head = self.git.head(actual_path)
-            history_problem = branch != workspace.branch_name or head != trusted_head
-        except OSError, WorkspaceError:
-            actual_path = workspace.path
-            branch, head = (
-                workspace.branch_name,
-                trusted_head,
-            )
-            identity_problem = True
+        live = self._collect_live_evidence(project_id, milestone_id)
+        workspace = live.workspace
+        trusted_head = live.trusted_head
+        identity_problem = live.identity_problem
+        history_problem = live.history_problem
+        collected = live.collected
         if identity_problem:
             finding(
                 FindingCode.REPOSITORY_IDENTITY_MISMATCH,
@@ -177,14 +225,6 @@ class ChangeValidationService:
                 "Preserve the workspace and investigate the history change.",
             )
 
-        try:
-            collected = self.collector.collect(actual_path, trusted_head)
-        except WorkspaceError:
-            collected = (
-                self.collector.collect(workspace.path, trusted_head)
-                if not identity_problem
-                else None
-            )
         if collected is None:
             files: tuple[ChangedFile, ...] = ()
             diff_hash = "sha256:" + "0" * 64

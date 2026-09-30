@@ -12,10 +12,14 @@ from syntra_build.domain.change_validation import ChangeSet
 @dataclass(frozen=True, slots=True)
 class AcceptedChangeSetEvidence:
     id: str
+    project_id: str
+    milestone_id: str
     workspace_id: str
+    branch_name: str
     trusted_head_sha: str
     diff_hash: str
     files_json: str
+    correlation_id: str
 
 
 class SQLiteValidationRepository:
@@ -85,7 +89,8 @@ class SQLiteValidationRepository:
     ) -> AcceptedChangeSetEvidence | None:
         """Return ACCEPT evidence bound to one workspace, HEAD, and exact diff."""
         row = self.connection.execute(
-            """SELECT id,worktree_id,head_sha_before_commit,diff_hash,files_json
+            """SELECT id,project_id,milestone_id,worktree_id,branch_name,
+            head_sha_before_commit,diff_hash,files_json,correlation_id
             FROM change_sets WHERE worktree_id=? AND head_sha_before_commit=?
             AND diff_hash=? AND decision='ACCEPT'
             ORDER BY created_at DESC LIMIT 1""",
@@ -95,8 +100,12 @@ class SQLiteValidationRepository:
             return None
         return AcceptedChangeSetEvidence(
             row["id"],
+            row["project_id"],
+            row["milestone_id"],
             row["worktree_id"],
+            row["branch_name"],
             row["head_sha_before_commit"],
             row["diff_hash"],
             row["files_json"],
+            row["correlation_id"],
         )
