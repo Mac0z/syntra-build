@@ -1185,7 +1185,10 @@ class TrustedPushExecutor:
                     )
 
                 result = None
-                if persisted.commit.pushed_at is None:
+                if (
+                    milestone.state is MilestoneState.PUSHING
+                    and persisted.commit.pushed_at is None
+                ):
                     result = service.push(
                         job.project_id,
                         job.milestone_id,
