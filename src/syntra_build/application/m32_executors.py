@@ -75,7 +75,10 @@ from syntra_build.infrastructure.persistence.projects import SQLiteProjectReposi
 from syntra_build.infrastructure.persistence.provisioning import (
     SQLiteProvisioningRepository,
 )
-from syntra_build.infrastructure.persistence.workspaces import SQLiteWorkspaceRepository
+from syntra_build.infrastructure.persistence.workspaces import (
+    PersistedTrustedCommit,
+    SQLiteWorkspaceRepository,
+)
 
 _CANONICAL_DIFF_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
@@ -898,3 +901,194 @@ class ChangeValidationExecutor:
                 occurred_at,
             )
         )
+
+
+class TrustedCommitExecutor:
+    """Create or safely replay one validation-bound trusted local commit."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        git: TrustedGit,
+        data_root: Path,
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
+    ) -> None:
+        self.database_path = database_path
+        self.git = git
+        self.data_root = data_root
+        self.clock = clock
+        self.connection_factory = connection_factory
+
+    def execute(self, job: Job) -> JobExecutionResult:
+        if job.job_type != "GIT_COMMIT":
+            raise ValueError("trusted commit requires a GIT_COMMIT job")
+        if job.worker_class is not WorkerClass.GIT:
+            raise ValueError("trusted commit requires a Git worker")
+        if job.milestone_id is None:
+            raise ValueError("trusted commit requires a milestone-scoped job")
+        if job.payload:
+            raise ValueError("trusted commit does not accept workflow payload")
+
+        occurred_at = self.clock()
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError("trusted commit clock must return a UTC timestamp")
+        occurred_at = occurred_at.astimezone(UTC)
+        try:
+            with closing(self.connection_factory(self.database_path)) as connection:
+                milestones = SQLiteMilestoneRepository(connection, lambda: str(uuid4()))
+                milestone = milestones.get(job.milestone_id, job.project_id)
+                project = SQLiteProjectRepository(connection, lambda: str(uuid4())).get(
+                    job.project_id
+                )
+                if project.state is not ProjectState.BUILDING:
+                    raise ValueError("trusted commit project must be BUILDING")
+                if milestone.state not in {
+                    MilestoneState.COMMITTING,
+                    MilestoneState.PUSHING,
+                }:
+                    raise ValueError("trusted commit milestone must be COMMITTING")
+
+                records = SQLiteWorkspaceRepository(connection)
+                workspace = records.workspace_for_milestone(job.milestone_id)
+                if (
+                    workspace is None
+                    or workspace.project_id != job.project_id
+                    or workspace.milestone_id != job.milestone_id
+                ):
+                    raise ValueError("managed workspace identity is unavailable")
+
+                trusted_head = workspace.current_head_sha or workspace.base_sha
+                validations = SQLiteValidationRepository(connection)
+                evidence = validations.accepted_for_workspace_head(
+                    workspace.id, trusted_head
+                )
+                persisted = (
+                    records.commit_for_change_set(workspace.id, evidence.id)
+                    if evidence is not None
+                    else None
+                )
+                accepted_head = trusted_head
+                if evidence is None:
+                    # A post-commit crash advances the durable workspace HEAD before
+                    # the milestone transition. Replay is allowed only for the commit
+                    # at that exact HEAD, and only when no newer ACCEPT exists there.
+                    persisted = records.commit_at_head(workspace.id, trusted_head)
+                    if persisted is not None:
+                        evidence = validations.accepted_by_id(persisted.change_set_id)
+                        accepted_head = persisted.commit.parent_sha
+                paths = self._accepted_paths(evidence, job, workspace, accepted_head)
+                assert evidence is not None
+                message = f"{milestone.code}: {milestone.title}"
+                service = WorkspaceService(connection, self.git, self.data_root)
+
+                if persisted is None:
+                    if milestone.state is not MilestoneState.COMMITTING:
+                        raise ValueError(
+                            "PUSHING milestone has no durable trusted commit"
+                        )
+                    created = service.commit(
+                        job.project_id,
+                        job.milestone_id,
+                        accepted_head,
+                        paths,
+                        message,
+                        occurred_at,
+                        expected_diff_hash=evidence.diff_hash,
+                    )
+                    persisted = records.commit_for_change_set(workspace.id, evidence.id)
+                    if persisted is None or (
+                        persisted.commit.commit_sha != created.commit_sha
+                    ):
+                        raise WorkspaceError("trusted commit was not durably persisted")
+
+                self._verify_commit(
+                    persisted, job, workspace, evidence, message, service, occurred_at
+                )
+                if milestone.state is MilestoneState.COMMITTING:
+                    milestones.apply_transition(
+                        MilestoneTransitionRequest(
+                            job.milestone_id,
+                            job.project_id,
+                            MilestoneState.COMMITTING,
+                            MilestoneState.PUSHING,
+                            "trusted local commit durably verified",
+                            "SYSTEM",
+                            "trusted-commit-executor",
+                            job.correlation_id,
+                            occurred_at,
+                        )
+                    )
+        except WorkspaceError:
+            return JobExecutionResult(
+                JobExecutionDisposition.FAILED,
+                error_id="trusted-commit-invariant",
+                failure_classification=FailureClassification.PERMANENT,
+            )
+        return JobExecutionResult(JobExecutionDisposition.SUCCEEDED)
+
+    @staticmethod
+    def _accepted_paths(
+        evidence: AcceptedChangeSetEvidence | None,
+        job: Job,
+        workspace: Workspace,
+        accepted_head: str,
+    ) -> tuple[str, ...]:
+        if evidence is None:
+            raise WorkspaceError("accepted validation evidence is unavailable")
+        try:
+            files = json.loads(evidence.files_json)
+            paths = tuple(item["path"] for item in files)
+        except (TypeError, KeyError, json.JSONDecodeError) as error:
+            raise WorkspaceError("accepted files evidence is malformed") from error
+        if (
+            evidence.project_id != str(job.project_id)
+            or evidence.milestone_id != str(job.milestone_id)
+            or evidence.workspace_id != workspace.id
+            or evidence.branch_name != workspace.branch_name
+            or evidence.trusted_head_sha != accepted_head
+            or _CANONICAL_DIFF_HASH.fullmatch(evidence.diff_hash) is None
+            or not paths
+            or len(set(paths)) != len(paths)
+            or not all(isinstance(path, str) and path for path in paths)
+        ):
+            raise WorkspaceError(
+                "accepted validation evidence identity is inconsistent"
+            )
+        return paths
+
+    @staticmethod
+    def _verify_commit(
+        persisted: PersistedTrustedCommit,
+        job: Job,
+        original: Workspace,
+        evidence: AcceptedChangeSetEvidence,
+        message: str,
+        service: WorkspaceService,
+        occurred_at: datetime,
+    ) -> None:
+        commit = persisted.commit
+        if (
+            persisted.project_id != job.project_id
+            or persisted.milestone_id != job.milestone_id
+            or commit.workspace_id != original.id
+            or commit.parent_sha != evidence.trusted_head_sha
+            or commit.branch_name != original.branch_name
+            or commit.message != message
+            or persisted.change_set_id != evidence.id
+            or persisted.validated_diff_hash != evidence.diff_hash
+            or commit.pushed_at is not None
+        ):
+            raise WorkspaceError("durable trusted commit identity is inconsistent")
+        inspection = service.inspect(job.project_id, job.milestone_id, occurred_at)
+        if (
+            inspection.workspace.project_id != job.project_id
+            or inspection.workspace.milestone_id != job.milestone_id
+            or inspection.workspace.id != original.id
+            or inspection.workspace.branch_name != original.branch_name
+            or inspection.workspace.current_head_sha != commit.commit_sha
+            or inspection.current_branch != commit.branch_name
+            or inspection.head_sha != commit.commit_sha
+        ):
+            raise WorkspaceError("live workspace differs from durable trusted commit")

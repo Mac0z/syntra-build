@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -14,6 +15,15 @@ from syntra_build.domain.workspaces import (
     WorkspaceError,
     WorkspaceState,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedTrustedCommit:
+    commit: TrustedCommit
+    project_id: ProjectId
+    milestone_id: MilestoneId
+    change_set_id: str
+    validated_diff_hash: str
 
 
 def _time(value: str | None) -> datetime | None:
@@ -156,6 +166,59 @@ class SQLiteWorkspaceRepository:
             "UPDATE commits SET pushed_at=COALESCE(pushed_at,?) WHERE commit_sha=?",
             (now.isoformat(), commit_sha),
         )
+
+    def commit_for_change_set(
+        self, workspace_id: str, change_set_id: str
+    ) -> PersistedTrustedCommit | None:
+        row = self.connection.execute(
+            """SELECT * FROM commits WHERE worktree_id=? AND change_set_id=?
+            ORDER BY created_at DESC,id DESC LIMIT 1""",
+            (workspace_id, change_set_id),
+        ).fetchone()
+        if row is None:
+            return None
+        created_at = _time(row["created_at"])
+        assert created_at is not None
+        return PersistedTrustedCommit(
+            TrustedCommit(
+                row["id"],
+                row["worktree_id"],
+                row["commit_sha"],
+                row["parent_sha"],
+                row["branch_name"],
+                row["message"],
+                created_at,
+                _time(row["pushed_at"]),
+            ),
+            ProjectId.from_string(row["project_id"]),
+            MilestoneId.from_string(row["milestone_id"]),
+            row["change_set_id"],
+            row["validated_diff_hash"],
+        )
+
+    def latest_commit_for_milestone(
+        self, workspace_id: str, milestone_id: MilestoneId
+    ) -> PersistedTrustedCommit | None:
+        row = self.connection.execute(
+            """SELECT change_set_id FROM commits WHERE worktree_id=?
+            AND milestone_id=? ORDER BY created_at DESC,id DESC LIMIT 1""",
+            (workspace_id, str(milestone_id)),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.commit_for_change_set(workspace_id, row["change_set_id"])
+
+    def commit_at_head(
+        self, workspace_id: str, commit_sha: str
+    ) -> PersistedTrustedCommit | None:
+        row = self.connection.execute(
+            """SELECT change_set_id FROM commits
+            WHERE worktree_id=? AND commit_sha=?""",
+            (workspace_id, commit_sha),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.commit_for_change_set(workspace_id, row["change_set_id"])
 
     @staticmethod
     def _workspace(row: sqlite3.Row) -> Workspace:
