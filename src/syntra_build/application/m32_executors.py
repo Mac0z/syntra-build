@@ -52,7 +52,12 @@ from syntra_build.domain import (
 from syntra_build.domain.change_validation import ValidationDecision
 from syntra_build.domain.codex import CodexProcessStatus, CodexRunRequest
 from syntra_build.domain.failures import FailureClassification
-from syntra_build.domain.workspaces import Workspace, WorkspaceError, WorkspaceState
+from syntra_build.domain.workspaces import (
+    PushNotAppliedError,
+    Workspace,
+    WorkspaceError,
+    WorkspaceState,
+)
 from syntra_build.infrastructure.git_workspace import TrustedGit
 from syntra_build.infrastructure.persistence.architect import (
     SQLiteArchitectInteractionRepository,
@@ -1092,3 +1097,192 @@ class TrustedCommitExecutor:
             or inspection.head_sha != commit.commit_sha
         ):
             raise WorkspaceError("live workspace differs from durable trusted commit")
+
+
+class TrustedPushExecutor:
+    """Push and independently verify the trusted commit at the current HEAD."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        git: TrustedGit,
+        data_root: Path,
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
+    ) -> None:
+        self.database_path = database_path
+        self.git = git
+        self.data_root = data_root
+        self.clock = clock
+        self.connection_factory = connection_factory
+
+    def execute(self, job: Job) -> JobExecutionResult:
+        if job.job_type != "GIT_PUSH":
+            raise ValueError("trusted push requires a GIT_PUSH job")
+        if job.worker_class is not WorkerClass.GIT:
+            raise ValueError("trusted push requires a Git worker")
+        if job.milestone_id is None:
+            raise ValueError("trusted push requires a milestone-scoped job")
+        if job.payload:
+            raise ValueError("trusted push does not accept workflow payload")
+
+        occurred_at = self.clock()
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError("trusted push clock must return a UTC timestamp")
+        occurred_at = occurred_at.astimezone(UTC)
+
+        try:
+            with closing(self.connection_factory(self.database_path)) as connection:
+                milestones = SQLiteMilestoneRepository(connection, lambda: str(uuid4()))
+                milestone = milestones.get(job.milestone_id, job.project_id)
+                project = SQLiteProjectRepository(connection, lambda: str(uuid4())).get(
+                    job.project_id
+                )
+                if project.state is not ProjectState.BUILDING:
+                    raise ValueError("trusted push project must be BUILDING")
+                if milestone.state not in {
+                    MilestoneState.PUSHING,
+                    MilestoneState.PR_CREATING,
+                }:
+                    raise ValueError("trusted push milestone must be PUSHING")
+
+                records = SQLiteWorkspaceRepository(connection)
+                managed = records.managed_for_project(job.project_id)
+                workspace = records.workspace_for_milestone(job.milestone_id)
+                if (
+                    managed is None
+                    or workspace is None
+                    or workspace.project_id != job.project_id
+                    or workspace.milestone_id != job.milestone_id
+                    or workspace.git_repository_id != managed.id
+                ):
+                    raise WorkspaceError("managed workspace identity is unavailable")
+                if workspace.current_head_sha is None:
+                    raise WorkspaceError("workspace has no current trusted HEAD")
+                persisted = records.commit_at_head(
+                    workspace.id, workspace.current_head_sha
+                )
+                if persisted is None:
+                    raise WorkspaceError(
+                        "trusted commit at current HEAD is unavailable"
+                    )
+                self._verify_chain(persisted, job, workspace, connection)
+
+                service = WorkspaceService(connection, self.git, self.data_root)
+                # Re-prove live local identity on every replay, including after a
+                # durable push marker already exists.
+                inspection = service.inspect(
+                    job.project_id, job.milestone_id, occurred_at
+                )
+                if (
+                    inspection.workspace.id != workspace.id
+                    or inspection.current_branch != workspace.branch_name
+                    or inspection.head_sha != persisted.commit.commit_sha
+                ):
+                    raise WorkspaceError(
+                        "live workspace differs from trusted push target"
+                    )
+
+                result = None
+                if persisted.commit.pushed_at is None:
+                    result = service.push(
+                        job.project_id,
+                        job.milestone_id,
+                        persisted.commit.commit_sha,
+                        occurred_at,
+                    )
+                    if (
+                        result.branch_name != workspace.branch_name
+                        or result.commit_sha != persisted.commit.commit_sha
+                        or result.remote_sha != persisted.commit.commit_sha
+                    ):
+                        raise WorkspaceError(
+                            "trusted push result identity is inconsistent"
+                        )
+
+                durable = records.commit_at_head(
+                    workspace.id, workspace.current_head_sha
+                )
+                self._verify_durable(persisted, durable)
+                remote_sha = self.git.remote_branch_sha(
+                    managed.path, managed.remote_url, workspace.branch_name
+                )
+                if remote_sha != persisted.commit.commit_sha:
+                    raise WorkspaceError(
+                        "durable push evidence conflicts with remote branch"
+                    )
+
+                if milestone.state is MilestoneState.PUSHING:
+                    milestones.apply_transition(
+                        MilestoneTransitionRequest(
+                            job.milestone_id,
+                            job.project_id,
+                            MilestoneState.PUSHING,
+                            MilestoneState.PR_CREATING,
+                            "trusted remote commit durably verified",
+                            "SYSTEM",
+                            "trusted-push-executor",
+                            job.correlation_id,
+                            occurred_at,
+                        )
+                    )
+        except PushNotAppliedError:
+            return JobExecutionResult(
+                JobExecutionDisposition.FAILED,
+                error_id="trusted-push-not-applied",
+                failure_classification=FailureClassification.TRANSIENT,
+            )
+        except WorkspaceError:
+            return JobExecutionResult(
+                JobExecutionDisposition.FAILED,
+                error_id="trusted-push-invariant",
+                failure_classification=FailureClassification.PERMANENT,
+            )
+        return JobExecutionResult(JobExecutionDisposition.SUCCEEDED)
+
+    @staticmethod
+    def _verify_chain(
+        persisted: PersistedTrustedCommit,
+        job: Job,
+        workspace: Workspace,
+        connection: sqlite3.Connection,
+    ) -> None:
+        commit = persisted.commit
+        evidence = SQLiteValidationRepository(connection).accepted_by_id(
+            persisted.change_set_id
+        )
+        if (
+            persisted.project_id != job.project_id
+            or persisted.milestone_id != job.milestone_id
+            or commit.workspace_id != workspace.id
+            or commit.branch_name != workspace.branch_name
+            or commit.commit_sha != workspace.current_head_sha
+            or evidence is None
+            or evidence.project_id != str(job.project_id)
+            or evidence.milestone_id != str(job.milestone_id)
+            or evidence.workspace_id != workspace.id
+            or evidence.branch_name != workspace.branch_name
+            or evidence.trusted_head_sha != commit.parent_sha
+            or evidence.diff_hash != persisted.validated_diff_hash
+            or _CANONICAL_DIFF_HASH.fullmatch(persisted.validated_diff_hash) is None
+        ):
+            raise WorkspaceError("trusted commit validation linkage is inconsistent")
+
+    @staticmethod
+    def _verify_durable(
+        expected: PersistedTrustedCommit,
+        actual: PersistedTrustedCommit | None,
+    ) -> None:
+        if (
+            actual is None
+            or actual.project_id != expected.project_id
+            or actual.milestone_id != expected.milestone_id
+            or actual.commit.workspace_id != expected.commit.workspace_id
+            or actual.commit.commit_sha != expected.commit.commit_sha
+            or actual.commit.branch_name != expected.commit.branch_name
+            or actual.change_set_id != expected.change_set_id
+            or actual.validated_diff_hash != expected.validated_diff_hash
+            or actual.commit.pushed_at is None
+        ):
+            raise WorkspaceError("durable trusted push evidence is inconsistent")
