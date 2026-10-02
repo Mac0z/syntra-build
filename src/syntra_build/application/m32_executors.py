@@ -26,6 +26,11 @@ from syntra_build.application.provisioning import (
     ProvisioningFailure,
     RepositoryProvisioningService,
 )
+from syntra_build.application.pull_requests import (
+    PullRequestError,
+    PullRequestFailure,
+    PullRequestLifecycleService,
+)
 from syntra_build.application.scheduler import (
     JobExecutionDisposition,
     JobExecutionResult,
@@ -52,6 +57,11 @@ from syntra_build.domain import (
 from syntra_build.domain.change_validation import ValidationDecision
 from syntra_build.domain.codex import CodexProcessStatus, CodexRunRequest
 from syntra_build.domain.failures import FailureClassification
+from syntra_build.domain.pull_requests import (
+    PULL_REQUEST_INTERFACE_VERSION,
+    PullRequestDescriptor,
+    PullRequestState,
+)
 from syntra_build.domain.workspaces import (
     PushNotAppliedError,
     Workspace,
@@ -79,6 +89,10 @@ from syntra_build.infrastructure.persistence.milestones import SQLiteMilestoneRe
 from syntra_build.infrastructure.persistence.projects import SQLiteProjectRepository
 from syntra_build.infrastructure.persistence.provisioning import (
     SQLiteProvisioningRepository,
+)
+from syntra_build.infrastructure.persistence.pull_requests import (
+    PullRequestRecord,
+    SQLitePullRequestRepository,
 )
 from syntra_build.infrastructure.persistence.workspaces import (
     PersistedTrustedCommit,
@@ -1289,3 +1303,264 @@ class TrustedPushExecutor:
             or actual.commit.pushed_at is None
         ):
             raise WorkspaceError("durable trusted push evidence is inconsistent")
+
+
+class PullRequestCreateExecutor:
+    """Create or reconcile one already-pushed M22 implementation PR."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        service_factory: Callable[[sqlite3.Connection], PullRequestLifecycleService],
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
+    ) -> None:
+        self.database_path = database_path
+        self.service_factory = service_factory
+        self.clock = clock
+        self.connection_factory = connection_factory
+
+    def execute(self, job: Job) -> JobExecutionResult:
+        if job.job_type != "PR_CREATE":
+            raise ValueError("pull request creation requires a PR_CREATE job")
+        if job.worker_class is not WorkerClass.GITHUB:
+            raise ValueError("pull request creation requires a GitHub worker")
+        if job.milestone_id is None:
+            raise ValueError("pull request creation requires a milestone-scoped job")
+        if job.payload:
+            raise ValueError("pull request creation does not accept workflow payload")
+
+        occurred_at = self.clock()
+        if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+            raise ValueError("pull request creation clock must return a UTC timestamp")
+        occurred_at = occurred_at.astimezone(UTC)
+
+        try:
+            with closing(self.connection_factory(self.database_path)) as connection:
+                milestones = SQLiteMilestoneRepository(connection, lambda: str(uuid4()))
+                milestone = milestones.get(job.milestone_id, job.project_id)
+                project = SQLiteProjectRepository(connection, lambda: str(uuid4())).get(
+                    job.project_id
+                )
+                if project.state is not ProjectState.BUILDING:
+                    raise ValueError("pull request creation project must be BUILDING")
+                if milestone.state not in {
+                    MilestoneState.PR_CREATING,
+                    MilestoneState.CI_RUNNING,
+                }:
+                    raise ValueError(
+                        "pull request creation milestone must be PR_CREATING"
+                    )
+
+                records = SQLiteWorkspaceRepository(connection)
+                managed = records.managed_for_project(job.project_id)
+                workspace = records.workspace_for_milestone(job.milestone_id)
+                if (
+                    managed is None
+                    or workspace is None
+                    or workspace.project_id != job.project_id
+                    or workspace.milestone_id != job.milestone_id
+                    or workspace.git_repository_id != managed.id
+                    or workspace.current_head_sha is None
+                ):
+                    raise WorkspaceError("managed workspace identity is unavailable")
+                persisted = records.commit_at_head(
+                    workspace.id, workspace.current_head_sha
+                )
+                if persisted is None:
+                    raise WorkspaceError(
+                        "trusted commit at current HEAD is unavailable"
+                    )
+                TrustedPushExecutor._verify_chain(persisted, job, workspace, connection)
+                if persisted.commit.pushed_at is None:
+                    raise WorkspaceError("trusted commit has no durable push evidence")
+
+                service = self.service_factory(connection)
+                if (
+                    service.connection is not connection
+                    or service.workspace.connection is not connection
+                ):
+                    raise WorkspaceError(
+                        "pull request lifecycle must use the worker connection"
+                    )
+                inspection = service.workspace.inspect(
+                    job.project_id, job.milestone_id, occurred_at
+                )
+                if (
+                    inspection.workspace.id != workspace.id
+                    or inspection.current_branch != workspace.branch_name
+                    or inspection.head_sha != persisted.commit.commit_sha
+                ):
+                    raise WorkspaceError(
+                        "live workspace differs from trusted pull-request head"
+                    )
+                remote_sha = service.workspace.git.remote_branch_sha(
+                    managed.path, managed.remote_url, workspace.branch_name
+                )
+                if remote_sha != persisted.commit.commit_sha:
+                    raise WorkspaceError(
+                        "remote branch differs from trusted pull-request head"
+                    )
+
+                if milestone.state is MilestoneState.CI_RUNNING:
+                    durable = SQLitePullRequestRepository(connection).for_milestone(
+                        job.milestone_id
+                    )
+                    if durable is None:
+                        raise WorkspaceError(
+                            "CI_RUNNING milestone has no durable pull request"
+                        )
+                else:
+                    durable = service.establish_for_pushed_commit(
+                        job.project_id,
+                        job.milestone_id,
+                        persisted.commit.commit_sha,
+                        persisted.change_set_id,
+                        job.correlation_id,
+                        now=occurred_at,
+                    )
+
+                repository = SQLiteProvisioningRepository(connection).for_project(
+                    job.project_id
+                )
+                if (
+                    repository is None
+                    or repository.status is not RepositoryProvisioningStatus.VERIFIED
+                    or repository.verified_at is None
+                    or repository.external_repository_id is None
+                    or repository.default_branch != "main"
+                    or managed.github_repository_id != repository.id
+                ):
+                    raise WorkspaceError("verified GitHub repository is unavailable")
+                reloaded = SQLitePullRequestRepository(connection).for_milestone(
+                    job.milestone_id
+                )
+                self._verify_durable(
+                    durable,
+                    reloaded,
+                    connection,
+                    repository.id,
+                    repository.external_repository_id,
+                    repository.full_name,
+                    workspace.branch_name,
+                    persisted.commit.commit_sha,
+                    job,
+                )
+                assert reloaded is not None
+                live = service.github.get(
+                    repository.full_name,
+                    reloaded.external_pr_number,
+                    job.project_id,
+                    job.milestone_id,
+                )
+                self._verify_live(
+                    live,
+                    reloaded,
+                    repository.external_repository_id,
+                    repository.full_name,
+                    job,
+                )
+                if milestone.state is MilestoneState.PR_CREATING:
+                    milestones.apply_transition(
+                        MilestoneTransitionRequest(
+                            job.milestone_id,
+                            job.project_id,
+                            MilestoneState.PR_CREATING,
+                            MilestoneState.CI_RUNNING,
+                            "trusted implementation pull request durably verified",
+                            "SYSTEM",
+                            "pull-request-create-executor",
+                            job.correlation_id,
+                            occurred_at,
+                            metadata={
+                                "pull_request_id": reloaded.id,
+                                "external_pr_number": reloaded.external_pr_number,
+                                "head_sha": reloaded.head_sha,
+                            },
+                        )
+                    )
+        except PullRequestError as error:
+            return self._pull_request_failure(error)
+        except WorkspaceError:
+            return JobExecutionResult(
+                JobExecutionDisposition.FAILED,
+                error_id="pull-request-create-invariant",
+                failure_classification=FailureClassification.PERMANENT,
+            )
+        return JobExecutionResult(JobExecutionDisposition.SUCCEEDED)
+
+    @staticmethod
+    def _verify_durable(
+        returned: PullRequestRecord,
+        durable: PullRequestRecord | None,
+        connection: sqlite3.Connection,
+        repository_id: str,
+        external_repository_id: int | None,
+        full_name: str,
+        branch_name: str,
+        head_sha: str,
+        job: Job,
+    ) -> None:
+        active = connection.execute(
+            "SELECT active_pull_request_id FROM milestones WHERE id=?",
+            (str(job.milestone_id),),
+        ).fetchone()
+        if (
+            durable is None
+            or returned != durable
+            or external_repository_id is None
+            or durable.project_id != job.project_id
+            or durable.milestone_id != job.milestone_id
+            or durable.github_repository_id != repository_id
+            or durable.state is not PullRequestState.OPEN
+            or durable.head_branch != branch_name
+            or durable.base_branch != "main"
+            or durable.head_sha != head_sha
+            or durable.web_url
+            != f"https://github.com/{full_name}/pull/{durable.external_pr_number}"
+            or active is None
+            or active["active_pull_request_id"] != durable.id
+        ):
+            raise WorkspaceError("durable pull request evidence is inconsistent")
+
+    @staticmethod
+    def _verify_live(
+        live: PullRequestDescriptor,
+        durable: PullRequestRecord,
+        external_repository_id: int | None,
+        full_name: str,
+        job: Job,
+    ) -> None:
+        if (
+            live.interface_version != PULL_REQUEST_INTERFACE_VERSION
+            or external_repository_id is None
+            or live.repository_id != external_repository_id
+            or live.project_id != job.project_id
+            or live.milestone_id != job.milestone_id
+            or live.pull_request_number != durable.external_pr_number
+            or live.state is not PullRequestState.OPEN
+            or live.head_branch != durable.head_branch
+            or live.base_branch != durable.base_branch
+            or live.head_sha != durable.head_sha
+            or live.web_url
+            != f"https://github.com/{full_name}/pull/{live.pull_request_number}"
+        ):
+            raise WorkspaceError("live pull request evidence is inconsistent")
+
+    @staticmethod
+    def _pull_request_failure(error: PullRequestError) -> JobExecutionResult:
+        if error.failure in {
+            PullRequestFailure.TRANSIENT,
+            PullRequestFailure.AMBIGUOUS,
+        }:
+            classification = FailureClassification.TRANSIENT
+        elif error.failure is PullRequestFailure.SECURITY_BLOCKED:
+            classification = FailureClassification.POLICY
+        else:
+            classification = FailureClassification.PERMANENT
+        return JobExecutionResult(
+            JobExecutionDisposition.FAILED,
+            error_id=f"pull-request-{error.failure.value.casefold().replace('_', '-')}",
+            failure_classification=classification,
+        )

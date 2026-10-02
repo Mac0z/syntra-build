@@ -165,7 +165,54 @@ class PullRequestLifecycleService:
         *,
         now: datetime | None = None,
     ) -> PullRequestRecord:
-        """Host/recovery seam for an already-created trusted M21 commit."""
+        """Host/recovery seam for a trusted commit, including M19 push recovery."""
+        return self._establish_for_commit(
+            project_id,
+            milestone_id,
+            commit_sha,
+            change_set_id,
+            correlation_id,
+            now=now,
+            allow_push=True,
+        )
+
+    def establish_for_pushed_commit(
+        self,
+        project_id: ProjectId,
+        milestone_id: MilestoneId,
+        commit_sha: str,
+        change_set_id: str,
+        correlation_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> PullRequestRecord:
+        """Establish a PR only when the trusted remote branch is already exact.
+
+        This narrow Scheduler seam is deliberately observational at the Git boundary:
+        it never calls ``WorkspaceService.push`` and therefore cannot create or repair
+        remote history.
+        """
+        return self._establish_for_commit(
+            project_id,
+            milestone_id,
+            commit_sha,
+            change_set_id,
+            correlation_id,
+            now=now,
+            allow_push=False,
+        )
+
+    def _establish_for_commit(
+        self,
+        project_id: ProjectId,
+        milestone_id: MilestoneId,
+        commit_sha: str,
+        change_set_id: str,
+        correlation_id: str,
+        *,
+        now: datetime | None,
+        allow_push: bool,
+    ) -> PullRequestRecord:
         now = now or datetime.now(UTC)
         commit_evidence = self.connection.execute(
             """SELECT 1 FROM commits c JOIN change_sets cs ON cs.id=c.change_set_id
@@ -207,8 +254,22 @@ class PullRequestLifecycleService:
                 "workspace base differs from verified default branch",
             )
         self._require_unblocked(project_id, milestone_id)
-        pushed = self.workspace.push(project_id, milestone_id, commit_sha, now)
-        if pushed.remote_sha != commit_sha:
+        remote_sha: str | None
+        if allow_push:
+            remote_sha = self.workspace.push(
+                project_id, milestone_id, commit_sha, now
+            ).remote_sha
+        else:
+            managed = self.workspace.records.managed_for_project(project_id)
+            if managed is None or managed.id != inspection.workspace.git_repository_id:
+                raise PullRequestError(
+                    PullRequestFailure.REPOSITORY_IDENTITY_MISMATCH,
+                    "managed repository identity differs from workspace",
+                )
+            remote_sha = self.workspace.git.remote_branch_sha(
+                managed.path, managed.remote_url, inspection.workspace.branch_name
+            )
+        if remote_sha != commit_sha:
             raise PullRequestError(
                 PullRequestFailure.HEAD_SHA_MISMATCH,
                 "remote milestone branch was not verified",
