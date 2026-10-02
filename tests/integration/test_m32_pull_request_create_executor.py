@@ -17,6 +17,7 @@ from syntra_build.application.scheduler import JobExecutionDisposition
 from syntra_build.application.workspaces import WorkspaceService
 from syntra_build.domain import Job, JobId, JobState, MilestoneState, WorkerClass
 from syntra_build.domain.failures import FailureClassification
+from syntra_build.domain.identifiers import MilestoneId, ProjectId
 from syntra_build.domain.pull_requests import (
     PullRequestCreateRequest,
     PullRequestDescriptor,
@@ -34,8 +35,12 @@ class FakeGitHub:
         self.intent_seen = False
 
     def find_open(
-        self, repository_full_name: str, head_branch: str, project_id, milestone_id
-    ) -> tuple[PullRequestDescriptor, ...]:  # type: ignore[no-untyped-def]
+        self,
+        repository_full_name: str,
+        head_branch: str,
+        project_id: ProjectId,
+        milestone_id: MilestoneId,
+    ) -> tuple[PullRequestDescriptor, ...]:
         return tuple(
             item for item in self.remote if item.state is PullRequestState.OPEN
         )
@@ -69,8 +74,12 @@ class FakeGitHub:
         return created
 
     def get(
-        self, repository_full_name: str, number: int, project_id, milestone_id
-    ) -> PullRequestDescriptor:  # type: ignore[no-untyped-def]
+        self,
+        repository_full_name: str,
+        number: int,
+        project_id: ProjectId,
+        milestone_id: MilestoneId,
+    ) -> PullRequestDescriptor:
         self.get_calls += 1
         return next(item for item in self.remote if item.pull_request_number == number)
 
