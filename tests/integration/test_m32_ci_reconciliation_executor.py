@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -99,27 +100,38 @@ def _seed(connection: sqlite3.Connection) -> tuple[ProjectId, MilestoneId, str]:
     return project, milestone, pull_request.id
 
 
-def _job(project: ProjectId, milestone: MilestoneId, **changes: object) -> Job:
-    values: dict[str, object] = {
-        "job_type": "CI_RECONCILE",
-        "worker_class": WorkerClass.CI,
-        "milestone_id": milestone,
-        "payload": None,
-    }
-    values.update(changes)
+class _DefaultMilestone:
+    pass
+
+
+_DEFAULT_MILESTONE = _DefaultMilestone()
+
+
+def _job(
+    project: ProjectId,
+    milestone: MilestoneId,
+    *,
+    job_type: str = "CI_RECONCILE",
+    worker_class: WorkerClass = WorkerClass.CI,
+    milestone_id: MilestoneId | None | _DefaultMilestone = _DEFAULT_MILESTONE,
+    payload: Mapping[str, str | int | float | bool | None] | None = None,
+) -> Job:
+    resolved_milestone = (
+        milestone if isinstance(milestone_id, _DefaultMilestone) else milestone_id
+    )
     return Job(
         JobId.generate(),
         project,
-        str(values["job_type"]),
+        job_type,
         JobState.QUEUED,
         0,
         NOW,
         NOW,
-        values["milestone_id"],
+        resolved_milestone,
         correlation_id="m32.11",
-        worker_class=values["worker_class"],
-        payload=values["payload"],
-    )  # type: ignore[arg-type]
+        worker_class=worker_class,
+        payload=payload,
+    )
 
 
 class PullRequests:
@@ -216,16 +228,18 @@ def test_pass_uses_exact_persisted_head_and_stops_at_architect_review(
 
 
 @pytest.mark.parametrize(
-    "changes",
+    "job_factory",
     [
-        {"job_type": "PR_CREATE"},
-        {"worker_class": WorkerClass.GITHUB},
-        {"milestone_id": None},
-        {"payload": {"head_sha": HEAD}},
+        lambda project, milestone: _job(project, milestone, job_type="PR_CREATE"),
+        lambda project, milestone: _job(
+            project, milestone, worker_class=WorkerClass.GITHUB
+        ),
+        lambda project, milestone: _job(project, milestone, milestone_id=None),
+        lambda project, milestone: _job(project, milestone, payload={"head_sha": HEAD}),
     ],
 )
 def test_invalid_envelope_opens_no_worker_resources(
-    tmp_path: Path, changes: dict[str, object]
+    tmp_path: Path, job_factory: Callable[[ProjectId, MilestoneId], Job]
 ) -> None:
     opened = 0
     project, milestone = ProjectId.generate(), MilestoneId.generate()
@@ -241,7 +255,7 @@ def test_invalid_envelope_opens_no_worker_resources(
         connection_factory,
     )
     with pytest.raises(ValueError):
-        executor.execute(_job(project, milestone, **changes))
+        executor.execute(job_factory(project, milestone))
     assert opened == 0
 
 
