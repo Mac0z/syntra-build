@@ -167,6 +167,16 @@ class SQLiteArchitectReviewRepository:
         ).fetchone()
         return None if row is None else self._record(row)
 
+    def get(self, review_id: str) -> ReviewRecord | None:
+        """Reload one review and its persisted finding count by durable identity."""
+        row = self.connection.execute(
+            """SELECT r.*,(SELECT count(*) FROM architect_review_findings f
+            WHERE f.review_id=r.id) AS finding_count
+            FROM architect_reviews r WHERE r.id=?""",
+            (review_id,),
+        ).fetchone()
+        return None if row is None else self._record(row)
+
     def completed_for_correlation(
         self, project_id: str, milestone_id: str, correlation_id: str
     ) -> ReviewRecord | None:
