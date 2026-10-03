@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -25,7 +26,7 @@ from syntra_build.domain.codex import (
     CodexRunResult,
 )
 from syntra_build.domain.design import ARCHITECT_INTERFACE_VERSION
-from syntra_build.domain.identifiers import MilestoneId, ProjectId
+from syntra_build.domain.identifiers import JobId, MilestoneId, ProjectId
 from syntra_build.domain.jobs import WorkerClass
 from syntra_build.domain.milestone_state_machine import MilestoneTransitionRequest
 from syntra_build.domain.milestones import MilestoneState
@@ -37,6 +38,7 @@ from syntra_build.domain.reviews import (
     ReviewFinding,
     ReviewFindingSeverity,
 )
+from syntra_build.infrastructure.persistence.codex import SQLiteCodexRunRepository
 from syntra_build.infrastructure.persistence.connection import (
     open_database,
     transaction,
@@ -458,13 +460,36 @@ def test_durable_job_runs_through_scheduler_codex_boundary(tmp_path: Path) -> No
             NOW.isoformat(),
         ),
     )
+    db.commit()
     database_path = Path(db.execute("PRAGMA database_list").fetchone()[2])
+    requests: list[CodexRunRequest] = []
+    clean_requirements: list[bool] = []
 
     class Runner:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self.connection = connection
+
+        def validate_workspace(
+            self, request: CodexRunRequest, *, require_clean: bool
+        ) -> None:
+            clean_requirements.append(require_clean)
+            assert request.worktree_path == workspace
+
         def run(self, request: CodexRunRequest) -> CodexRunResult:
+            requests.append(request)
             assert request.task["task_type"] == "REVIEW_REWORK"
             assert "github" not in request.task
-            return CodexRunResult(
+            runs = SQLiteCodexRunRepository(self.connection)
+            runs.start(
+                "review-rework-run",
+                request,
+                workspace_id,
+                "f" * 64,
+                NOW,
+                "stdout",
+                "stderr",
+            )
+            result = CodexRunResult(
                 "1.0",
                 request.correlation_id,
                 request.project_id,
@@ -478,13 +503,15 @@ def test_durable_job_runs_through_scheduler_codex_boundary(tmp_path: Path) -> No
                 request.timeout_seconds,
                 exit_code=0,
             )
+            runs.complete("review-rework-run", result)
+            return result
 
         def cancel(self, job_id: str, attempt_number: int) -> bool:
             return False
 
     executor = ReviewReworkCodexExecutor(
         database_path,
-        lambda _connection: Runner(),
+        Runner,
         timeout_seconds=60,
         clock=lambda: NOW,
     )
@@ -498,11 +525,15 @@ def test_durable_job_runs_through_scheduler_codex_boundary(tmp_path: Path) -> No
     try:
         assert scheduler.run_once().dispatched == 1
         for _ in range(100):
-            if scheduler.run_once().completed:
+            report = scheduler.run_once()
+            if report.completed or report.errors:
                 break
             time.sleep(0.01)
         else:
             pytest.fail("Codex scheduler job did not complete")
+        assert not report.errors, (
+            repr(report.errors[0].__cause__) if report.errors else ""
+        )
         assert (
             SQLiteMilestoneRepository(db, lambda: str(uuid4()))
             .get(milestone, project)
@@ -515,6 +546,23 @@ def test_durable_job_runs_through_scheduler_codex_boundary(tmp_path: Path) -> No
             ).fetchone()[0]
             == "SUCCEEDED"
         )
+        job_row = db.execute(
+            "SELECT id FROM jobs WHERE job_type='CODEX_REVIEW_REWORK'"
+        ).fetchone()
+        persisted_job = SQLiteJobRepository(db, lambda: str(uuid4())).get(
+            JobId.from_string(job_row[0]), project
+        )
+        replay = executor.execute(
+            replace(persisted_job, attempt_number=persisted_job.attempt_number - 1)
+        )
+        assert replay.disposition.value == "SUCCEEDED"
+        assert len(requests) == 1
+        assert clean_requirements == [True, False]
+        assert requests[0].job_id == JobId.from_string(job_row[0])
+        assert db.execute("SELECT count(*) FROM codex_runs").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM change_sets").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM commits").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM ci_runs").fetchone()[0] == 1
     finally:
         scheduler.close()
 
