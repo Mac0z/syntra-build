@@ -907,12 +907,11 @@ def test_provider_success_only_reaches_verify_then_independent_get_completes(
     def assert_intent() -> None:
         nonlocal called
         called = True
-        assert (
-            db.execute(
-                "SELECT status FROM merge_attempts WHERE id=?", (attempt,)
-            ).fetchone()[0]
-            == "REQUESTED"
-        )
+        row = db.execute(
+            "SELECT status,mutation_started_at FROM merge_attempts WHERE id=?",
+            (attempt,),
+        ).fetchone()
+        assert tuple(row) == ("REQUESTED", NOW.isoformat())
 
     github.before_merge = assert_intent
     keeper.execute(attempt, request, now=NOW)

@@ -40,7 +40,7 @@ def _db(tmp_path: Path) -> sqlite3.Connection:
 
 def test_migration_26_and_active_resolution_history(tmp_path: Path) -> None:
     db = _db(tmp_path)
-    assert current_schema_version(db) == 27
+    assert current_schema_version(db) == 28
     project = Project(
         ProjectId.from_string("00000000-0000-4000-8000-000000000001"),
         "project",

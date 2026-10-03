@@ -10,6 +10,7 @@ from collections.abc import Callable
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 from syntra_build.application.architect import (
@@ -25,6 +26,12 @@ from syntra_build.application.architect_review import (
 )
 from syntra_build.application.change_validation import ChangeValidationService
 from syntra_build.application.codex import WorkspaceBoundCodexRunner
+from syntra_build.application.gatekeeper import (
+    Gatekeeper,
+    GatekeeperRejected,
+    MergeBusy,
+    MergeIdentityError,
+)
 from syntra_build.application.provisioning import (
     ProvisioningError,
     ProvisioningFailure,
@@ -61,7 +68,14 @@ from syntra_build.domain import (
 from syntra_build.domain.change_validation import ValidationDecision
 from syntra_build.domain.ci import CIOverallStatus
 from syntra_build.domain.codex import CodexProcessStatus, CodexRunRequest
-from syntra_build.domain.failures import FailureClassification
+from syntra_build.domain.failures import FailureClassification, classify_failure
+from syntra_build.domain.merges import (
+    MERGE_INTERFACE_VERSION,
+    MergeEligibilityRequest,
+    MergeRequest,
+    MergeStatus,
+    MergeStrategy,
+)
 from syntra_build.domain.pull_requests import (
     PULL_REQUEST_INTERFACE_VERSION,
     PullRequestDescriptor,
@@ -1573,6 +1587,334 @@ class PullRequestCreateExecutor:
             JobExecutionDisposition.FAILED,
             error_id=f"pull-request-{error.failure.value.casefold().replace('_', '-')}",
             failure_classification=classification,
+        )
+
+
+class GatekeeperMergeExecutor:
+    """Expose the released Gatekeeper through the single PR_MERGE route."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        gatekeeper_factory: Callable[[sqlite3.Connection], Gatekeeper],
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
+    ) -> None:
+        self.database_path = database_path
+        self.gatekeeper_factory = gatekeeper_factory
+        self.clock = clock
+        self.connection_factory = connection_factory
+
+    def execute(self, job: Job) -> JobExecutionResult:
+        if job.job_type != "PR_MERGE":
+            raise ValueError("Gatekeeper merge requires a PR_MERGE job")
+        if job.worker_class is not WorkerClass.GITHUB:
+            raise ValueError("Gatekeeper merge requires a GitHub worker")
+        if job.milestone_id is None:
+            raise ValueError("Gatekeeper merge requires a milestone-scoped job")
+        if job.payload:
+            raise ValueError("Gatekeeper merge does not accept workflow payload")
+
+        now = self.clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("Gatekeeper merge clock must return a UTC timestamp")
+        now = now.astimezone(UTC)
+        try:
+            with closing(self.connection_factory(self.database_path)) as connection:
+                project = SQLiteProjectRepository(connection, lambda: str(uuid4())).get(
+                    job.project_id
+                )
+                milestone = SQLiteMilestoneRepository(
+                    connection, lambda: str(uuid4())
+                ).get(job.milestone_id, job.project_id)
+                if project.state is not ProjectState.BUILDING:
+                    raise MergeIdentityError("merge project must be BUILDING")
+                if milestone.state not in {
+                    MilestoneState.MERGE_READY,
+                    MilestoneState.MERGING,
+                    MilestoneState.MERGE_VERIFY,
+                    MilestoneState.COMPLETE,
+                }:
+                    raise MergeIdentityError("milestone is not in a merge route state")
+
+                request = self._eligibility_request(connection, job)
+                attempt = connection.execute(
+                    """SELECT * FROM merge_attempts WHERE milestone_id=?
+                    ORDER BY requested_at DESC,rowid DESC LIMIT 1""",
+                    (str(job.milestone_id),),
+                ).fetchone()
+                keeper = self.gatekeeper_factory(connection)
+                if keeper.connection is not connection:
+                    raise MergeIdentityError(
+                        "Gatekeeper must use the worker-owned SQLite connection"
+                    )
+
+                if milestone.state is MilestoneState.MERGE_READY:
+                    if attempt is not None:
+                        raise MergeIdentityError(
+                            "MERGE_READY milestone already has durable merge intent"
+                        )
+                    attempt_id, merge_request = keeper.prepare(
+                        request, MergeStrategy.SQUASH, now=now
+                    )
+                    if not attempt_id:
+                        raise MergeIdentityError("Gatekeeper returned an empty attempt")
+                    attempt = self._exact_attempt(
+                        connection, attempt_id, request, MergeStrategy.SQUASH
+                    )
+                    state = self._milestone_state(connection, job)
+                    if state is not MilestoneState.MERGING:
+                        raise MergeIdentityError("prepare did not persist MERGING")
+                    result = keeper.execute(attempt_id, merge_request, now=now)
+                    if result.status is MergeStatus.MERGED:
+                        keeper.verify(attempt_id, merge_request, now=now)
+                    elif result.status is MergeStatus.UNKNOWN:
+                        return self._failure(
+                            "gatekeeper-merge-unknown", FailureClassification.TRANSIENT
+                        )
+                    else:
+                        return self._failure(
+                            "gatekeeper-merge-rejected", FailureClassification.POLICY
+                        )
+                else:
+                    if attempt is None:
+                        raise MergeIdentityError(
+                            "later merge state lacks durable merge intent"
+                        )
+                    attempt = self._exact_attempt(
+                        connection, attempt["id"], request, MergeStrategy.SQUASH
+                    )
+                    merge_request = self._merge_request(job, request, attempt)
+                    attempt_id = attempt["id"]
+                    if milestone.state is MilestoneState.COMPLETE:
+                        return self._verified_result(
+                            connection, job, request, attempt_id
+                        )
+                    if milestone.state is MilestoneState.MERGE_VERIFY:
+                        if not keeper.verify(attempt_id, merge_request, now=now):
+                            return self._failure(
+                                "gatekeeper-merge-verification-pending",
+                                FailureClassification.TRANSIENT,
+                            )
+                    else:
+                        recovered = keeper.recover(attempt_id, merge_request, now=now)
+                        if not recovered:
+                            refreshed = connection.execute(
+                                "SELECT * FROM merge_attempts WHERE id=?", (attempt_id,)
+                            ).fetchone()
+                            assert refreshed is not None
+                            if (
+                                refreshed["status"] == "REQUESTED"
+                                and refreshed["mutation_started_at"] is None
+                            ):
+                                result = keeper.execute(
+                                    attempt_id, merge_request, now=now
+                                )
+                                if result.status is MergeStatus.MERGED:
+                                    keeper.verify(attempt_id, merge_request, now=now)
+                                elif result.status is MergeStatus.UNKNOWN:
+                                    return self._failure(
+                                        "gatekeeper-merge-unknown",
+                                        FailureClassification.TRANSIENT,
+                                    )
+                                else:
+                                    return self._failure(
+                                        "gatekeeper-merge-rejected",
+                                        FailureClassification.POLICY,
+                                    )
+                            else:
+                                # Mutation may have begun. Future attempts remain
+                                # observation-only and can never issue another PUT.
+                                return self._failure(
+                                    "gatekeeper-merge-recovery-pending",
+                                    FailureClassification.TRANSIENT,
+                                )
+                return self._verified_result(connection, job, request, attempt_id)
+        except GatekeeperRejected:
+            return self._failure(
+                "gatekeeper-policy-rejected", FailureClassification.POLICY
+            )
+        except MergeBusy:
+            return self._failure(
+                "gatekeeper-merge-busy", FailureClassification.TRANSIENT
+            )
+        except MergeIdentityError, PersistenceError, ValueError:
+            return self._failure(
+                "gatekeeper-merge-identity", FailureClassification.PERMANENT
+            )
+        except Exception as error:
+            classification = classify_failure(error)
+            if classification is FailureClassification.UNKNOWN:
+                classification = FailureClassification.PERMANENT
+            return self._failure("gatekeeper-provider-failure", classification)
+
+    @staticmethod
+    def _failure(
+        error_id: str, classification: FailureClassification
+    ) -> JobExecutionResult:
+        return JobExecutionResult(
+            JobExecutionDisposition.FAILED,
+            error_id=error_id,
+            failure_classification=classification,
+        )
+
+    @staticmethod
+    def _milestone_state(connection: sqlite3.Connection, job: Job) -> MilestoneState:
+        row = connection.execute(
+            "SELECT state FROM milestones WHERE id=? AND project_id=?",
+            (str(job.milestone_id), str(job.project_id)),
+        ).fetchone()
+        if row is None:
+            raise MergeIdentityError("milestone disappeared")
+        return MilestoneState(row["state"])
+
+    @staticmethod
+    def _eligibility_request(
+        connection: sqlite3.Connection, job: Job
+    ) -> MergeEligibilityRequest:
+        assert job.milestone_id is not None
+        row = connection.execute(
+            """SELECT m.active_pull_request_id,p.id AS pull_request_id,
+            p.project_id AS pr_project_id,p.milestone_id AS pr_milestone_id,
+            p.github_repository_id,p.external_pr_number,p.head_branch,p.base_branch,
+            p.head_sha,r.project_id AS repo_project_id,r.external_repository_id,
+            r.default_branch,r.status AS repository_status,r.verified_at
+            FROM milestones m
+            LEFT JOIN pull_requests p ON p.id=m.active_pull_request_id
+            LEFT JOIN github_repositories r ON r.id=p.github_repository_id
+            WHERE m.id=? AND m.project_id=?""",
+            (str(job.milestone_id), str(job.project_id)),
+        ).fetchone()
+        if (
+            row is None
+            or row["active_pull_request_id"] is None
+            or row["pull_request_id"] is None
+            or row["pr_project_id"] != str(job.project_id)
+            or row["pr_milestone_id"] != str(job.milestone_id)
+            or row["repo_project_id"] != str(job.project_id)
+            or row["repository_status"] != "VERIFIED"
+            or row["verified_at"] is None
+            or row["external_repository_id"] is None
+            or not isinstance(row["external_pr_number"], int)
+            or row["external_pr_number"] <= 0
+            or not row["head_branch"]
+            or row["base_branch"] != "main"
+            or row["default_branch"] != "main"
+            or row["base_branch"] != row["default_branch"]
+            or re.fullmatch(r"[0-9a-fA-F]{40}", row["head_sha"] or "") is None
+        ):
+            raise MergeIdentityError("exact active pull request is unavailable")
+        return MergeEligibilityRequest(
+            MERGE_INTERFACE_VERSION,
+            job.correlation_id,
+            job.project_id,
+            job.milestone_id,
+            row["github_repository_id"],
+            row["external_repository_id"],
+            row["pull_request_id"],
+            row["external_pr_number"],
+            row["head_branch"],
+            row["base_branch"],
+            row["head_sha"],
+        )
+
+    @staticmethod
+    def _exact_attempt(
+        connection: sqlite3.Connection,
+        attempt_id: str,
+        request: MergeEligibilityRequest,
+        strategy: MergeStrategy,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM merge_attempts WHERE id=?", (attempt_id,)
+        ).fetchone()
+        if row is None:
+            raise MergeIdentityError("durable merge attempt is unavailable")
+        result = connection.execute(
+            "SELECT * FROM merge_eligibility_results WHERE id=?",
+            (row["gatekeeper_result_id"],),
+        ).fetchone()
+        if not all(
+            (
+                row["project_id"] == str(request.project_id),
+                row["milestone_id"] == str(request.milestone_id),
+                row["pull_request_id"] == request.pull_request_id,
+                row["expected_head_sha"] == request.expected_head_sha,
+                row["expected_head_branch"] == request.expected_head_branch,
+                row["expected_base_branch"] == request.expected_base_branch,
+                row["merge_strategy"] == strategy.value,
+                result is not None,
+                result is not None and bool(result["eligible"]),
+                result is not None and result["project_id"] == str(request.project_id),
+                result is not None
+                and result["milestone_id"] == str(request.milestone_id),
+                result is not None
+                and result["pull_request_id"] == request.pull_request_id,
+                result is not None and result["head_sha"] == request.expected_head_sha,
+            )
+        ):
+            raise MergeIdentityError("durable merge attempt identity conflicts")
+        return cast(sqlite3.Row, row)
+
+    @staticmethod
+    def _merge_request(
+        job: Job, request: MergeEligibilityRequest, attempt: sqlite3.Row
+    ) -> MergeRequest:
+        assert job.milestone_id is not None
+        return MergeRequest(
+            MERGE_INTERFACE_VERSION,
+            job.correlation_id,
+            job.project_id,
+            job.milestone_id,
+            request.repository_id,
+            request.pull_request_number,
+            request.expected_head_sha,
+            MergeStrategy(attempt["merge_strategy"]),
+            attempt["gatekeeper_result_id"],
+        )
+
+    @staticmethod
+    def _verified_result(
+        connection: sqlite3.Connection,
+        job: Job,
+        request: MergeEligibilityRequest,
+        attempt_id: str,
+    ) -> JobExecutionResult:
+        row = connection.execute(
+            """SELECT m.state,m.active_pull_request_id,p.state AS pr_state,
+            p.head_sha,p.merge_commit_sha,p.merged_at,a.status AS attempt_status,
+            a.project_id AS attempt_project_id,a.milestone_id AS attempt_milestone_id,
+            a.pull_request_id AS attempt_pr_id,a.expected_head_sha
+            FROM milestones m JOIN pull_requests p ON p.id=m.active_pull_request_id
+            JOIN merge_attempts a ON a.id=? WHERE m.id=? AND m.project_id=?""",
+            (attempt_id, str(job.milestone_id), str(job.project_id)),
+        ).fetchone()
+        if (
+            row is None
+            or row["state"] != "COMPLETE"
+            or row["active_pull_request_id"] != request.pull_request_id
+            or row["pr_state"] != "MERGED"
+            or row["head_sha"] != request.expected_head_sha
+            or row["attempt_status"] != "MERGED"
+            or row["attempt_project_id"] != str(job.project_id)
+            or row["attempt_milestone_id"] != str(job.milestone_id)
+            or row["attempt_pr_id"] != request.pull_request_id
+            or row["expected_head_sha"] != request.expected_head_sha
+            or not row["merge_commit_sha"]
+            or not row["merged_at"]
+        ):
+            raise MergeIdentityError("verified durable merge evidence is incomplete")
+        return JobExecutionResult(
+            JobExecutionDisposition.SUCCEEDED,
+            result={
+                "merge_attempt_id": attempt_id,
+                "pull_request_id": request.pull_request_id,
+                "pull_request_number": request.pull_request_number,
+                "expected_head_sha": request.expected_head_sha,
+                "merge_status": MergeStatus.MERGED.value,
+                "merge_commit_sha": row["merge_commit_sha"],
+            },
         )
 
 

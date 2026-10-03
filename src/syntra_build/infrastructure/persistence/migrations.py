@@ -1267,6 +1267,16 @@ MIGRATIONS: tuple[Migration, ...] = (
                 AND state IN ('QUEUED','DISPATCHED','RUNNING','WAITING_EXTERNAL','RETRY_WAIT')""",
         ),
     ),
+    Migration(
+        version=28,
+        name="028_merge_mutation_intent",
+        statements=(
+            # REQUESTED alone could not distinguish a crash before the merge PUT
+            # from a crash after the PUT was issued.  This durable timestamp is
+            # written immediately before mutation and is intentionally never reset.
+            "ALTER TABLE merge_attempts ADD COLUMN mutation_started_at TEXT",
+        ),
+    ),
 )
 
 

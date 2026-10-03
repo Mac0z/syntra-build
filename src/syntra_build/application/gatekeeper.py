@@ -80,6 +80,7 @@ class _AttemptContext:
     gatekeeper_result_id: str
     merge_strategy: MergeStrategy
     status: MergeStatus | None
+    mutation_started_at: str | None
     milestone_state: MilestoneState
     project_state: str
     persisted_pr_state: PullRequestState
@@ -527,6 +528,7 @@ class Gatekeeper:
             row["gatekeeper_result_id"],
             MergeStrategy(row["merge_strategy"]),
             None if row["status"] == "REQUESTED" else MergeStatus(row["status"]),
+            row["mutation_started_at"],
             MilestoneState(row["milestone_state"]),
             row["project_state"],
             PullRequestState(row["persisted_pr_state"]),
@@ -707,6 +709,7 @@ class Gatekeeper:
         context = self._attempt_context(attempt_id, request)
         if (
             context.status is not None
+            or context.mutation_started_at is not None
             or context.milestone_state is not MilestoneState.MERGING
         ):
             raise MergeIdentityError("merge attempt is not executable")
@@ -730,6 +733,17 @@ class Gatekeeper:
                 now,
                 "fresh pull request identity or state differs before merge",
             )
+        # Commit a durable point-of-no-return before the provider mutation.  A
+        # restarted worker can now prove whether executing a REQUESTED attempt is
+        # safe or whether it must use observation-only recovery.
+        with transaction(self.connection):
+            changed = self.connection.execute(
+                """UPDATE merge_attempts SET mutation_started_at=?
+                WHERE id=? AND status='REQUESTED' AND mutation_started_at IS NULL""",
+                (now.isoformat(), attempt_id),
+            )
+            if changed.rowcount != 1:
+                raise MergeIdentityError("merge mutation may already have started")
         try:
             result = self.github.merge(context.repository_full_name, request)
         except AmbiguousGitHubResult:

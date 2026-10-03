@@ -4,6 +4,7 @@ from uuid import uuid4
 import pytest
 from test_m26_gatekeeper import NOW, SHA, seed_eligible
 
+from syntra_build.application.gatekeeper import Gatekeeper
 from syntra_build.infrastructure.persistence import (
     MIGRATIONS,
     apply_migrations,
@@ -145,3 +146,19 @@ def test_genuine_023_upgrade_preserves_m25_data_and_builds_m26_constraints(
             )
         with pytest.raises(Exception, match="preservation-oriented"):
             db.execute("DELETE FROM merge_eligibility_results WHERE id=?", (result_id,))
+
+
+def test_m32_14_upgrade_adds_merge_mutation_crash_boundary(tmp_path: Path) -> None:
+    with open_database(tmp_path / "m32-14-upgrade.db") as db:
+        apply_migrations(db, MIGRATIONS[:27])
+        seed, github = seed_eligible(db)
+        attempt_id, _request = Gatekeeper(db, github).prepare(seed.request, now=NOW)
+        apply_migrations(db)
+
+        row = db.execute(
+            "SELECT status,mutation_started_at FROM merge_attempts WHERE id=?",
+            (attempt_id,),
+        ).fetchone()
+        assert tuple(row) == ("REQUESTED", None)
+        assert current_schema_version(db) == 28
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
