@@ -308,6 +308,10 @@ class LifecycleCoordinator:
         )
         if active:
             job = STATE_JOBS.get(active["state"])
+            if active["state"] == "CODING" and self._review_rework_owns_coding(
+                active["id"]
+            ):
+                return 0
             return (
                 self._enqueue(project_id, MilestoneId.from_string(active["id"]), *job)
                 if job
@@ -331,6 +335,20 @@ class LifecycleCoordinator:
             )
             return 1
         return 0
+
+    def _review_rework_owns_coding(self, milestone_id: str) -> bool:
+        """Never reinterpret review-rework CODING provenance as initial work."""
+        return (
+            self._db.execute(
+                """SELECT 1 FROM jobs WHERE milestone_id=?
+               AND job_type='CODEX_REVIEW_REWORK'
+               AND state IN ('QUEUED','DISPATCHED','RUNNING','WAITING_EXTERNAL',
+                             'RETRY_WAIT','SUCCEEDED','FAILED','CANCELLED',
+                             'ABANDONED') LIMIT 1""",
+                (milestone_id,),
+            ).fetchone()
+            is not None
+        )
 
     def _completion_unblocked(self, project_id: ProjectId) -> bool:
         """Require resolved human/security evidence before project completion."""

@@ -21,11 +21,16 @@ from syntra_build.adapters.telegram import (
 )
 from syntra_build.application.ci_handoff import PullRequestCIHandoff
 from syntra_build.application.ci_monitor import CIMonitor
+from syntra_build.application.dispatch_guard import DiskDispatchGuard
 from syntra_build.application.gatekeeper import Gatekeeper
 from syntra_build.application.human_intervention import HumanInterventionService
 from syntra_build.application.operational_health import (
     LocalResourceSampler,
     OperationalHealth,
+)
+from syntra_build.application.production import (
+    ProductionDueWorkCoordinator,
+    build_production_executors,
 )
 from syntra_build.application.pull_requests import PullRequestLifecycleService
 from syntra_build.application.recovery import RecoveryCoordinator, RecoveryServices
@@ -110,10 +115,10 @@ class ServiceRuntime:
         self._executor_factory = executor_factory
 
     def _production_executors(self) -> Mapping[WorkerClass, object]:
-        """Expose only explicitly supplied, reviewed executor composition."""
+        """Use an explicit test seam or the reviewed production composition."""
         if self._executor_factory is not None:
             return self._executor_factory(self.config)
-        return {}
+        return build_production_executors(self.config, metrics=self.recorder)
 
     def _database_available(self) -> bool:
         try:
@@ -152,14 +157,29 @@ class ServiceRuntime:
 
     def _control_loop(self) -> None:
         connection = open_database(self.config.database.sqlite_path)
-        scheduler = Scheduler(
-            SQLiteJobRepository(connection, lambda: str(uuid4())),
-            self.capacity,
-            self._production_executors(),  # type: ignore[arg-type]
-            # M32.0 keeps autonomous orchestration dormant until concrete routes exist.
-            due_work_enqueuer=None,
-            metrics=self.recorder,
-        )
+        try:
+            due_work = ProductionDueWorkCoordinator(connection)
+            scheduler = Scheduler(
+                SQLiteJobRepository(connection, lambda: str(uuid4())),
+                self.capacity,
+                self._production_executors(),  # type: ignore[arg-type]
+                due_work_enqueuer=due_work.enqueue_due,
+                dispatch_guard=DiskDispatchGuard(
+                    LocalResourceSampler(self.config.filesystem.data_root),
+                    self.config.security,
+                ),
+                metrics=self.recorder,
+            )
+        except Exception:
+            connection.close()
+            self.health.recovery_failed()
+            self.failed_event.set()
+            self.ready_event.set()
+            _LOGGER.exception(
+                "Production composition failed",
+                extra={"event": "production_composition_failed"},
+            )
+            return
         self.scheduler = scheduler
         scheduler.enter_drain()
         try:
@@ -217,6 +237,13 @@ class ServiceRuntime:
                 else None
             )
             cursors = SQLiteProviderCursorRepository(connection)
+            # Recovery and all startup composition have succeeded. This is the one
+            # transition that intentionally activates autonomous M32 scheduling.
+            scheduler.exit_drain()
+            _LOGGER.info(
+                "Production scheduler activated",
+                extra={"event": "scheduler_activated"},
+            )
             self.ready_event.set()
             loop = SchedulerLoop(scheduler, self._loop_interval)
             while not self.stop_event.is_set():
