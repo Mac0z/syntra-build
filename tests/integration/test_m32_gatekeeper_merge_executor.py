@@ -197,7 +197,7 @@ def test_ambiguous_put_unresolved_is_never_replayed(tmp_path: Path) -> None:
         ).fetchone()[0]
 
 
-def test_prepared_without_put_can_execute_but_started_attempt_only_recovers(
+def test_prepared_without_put_executes_once_then_independently_verifies(
     tmp_path: Path,
 ) -> None:
     database, seed, github, executor = prepared(tmp_path)
@@ -205,6 +205,100 @@ def test_prepared_without_put_can_execute_but_started_attempt_only_recovers(
         attempt, _request = Gatekeeper(connection, github).prepare(
             seed.request, now=NOW
         )
+        durable = connection.execute(
+            "SELECT status,mutation_started_at FROM merge_attempts WHERE id=?",
+            (attempt,),
+        ).fetchone()
+        assert tuple(durable) == ("REQUESTED", None)
+        assert (
+            connection.execute(
+                "SELECT state FROM milestones WHERE id=?", (str(seed.milestone),)
+            ).fetchone()[0]
+            == "MERGING"
+        )
+
+    def assert_marker_precedes_put() -> None:
+        with open_database(database) as connection:
+            marker = connection.execute(
+                "SELECT mutation_started_at FROM merge_attempts WHERE id=?",
+                (attempt,),
+            ).fetchone()[0]
+            assert marker == NOW.isoformat()
+        merged(github)
+
+    github.before_merge = assert_marker_precedes_put
+    result = executor.execute(job(seed.project, seed.milestone))
+
+    assert result.disposition is JobExecutionDisposition.SUCCEEDED
+    assert len(github.merge_calls) == 1
+    assert len(github.get_calls) >= 5
+    with open_database(database) as connection:
+        assert tuple(
+            connection.execute(
+                "SELECT status,mutation_started_at FROM merge_attempts WHERE id=?",
+                (attempt,),
+            ).fetchone()
+        ) == ("MERGED", NOW.isoformat())
+        assert (
+            connection.execute(
+                "SELECT state FROM milestones WHERE id=?", (str(seed.milestone),)
+            ).fetchone()[0]
+            == "COMPLETE"
+        )
+
+
+def test_mutation_started_open_attempt_never_replays_put(tmp_path: Path) -> None:
+    database, seed, github, executor = prepared(tmp_path)
+    with open_database(database) as connection:
+        attempt, _request = Gatekeeper(connection, github).prepare(
+            seed.request, now=NOW
+        )
+        connection.execute(
+            "UPDATE merge_attempts SET mutation_started_at=? WHERE id=?",
+            (NOW.isoformat(), attempt),
+        )
+
+    first = executor.execute(job(seed.project, seed.milestone))
+    second = executor.execute(job(seed.project, seed.milestone))
+
+    assert first.disposition is JobExecutionDisposition.FAILED
+    assert first.failure_classification is FailureClassification.TRANSIENT
+    assert second.disposition is JobExecutionDisposition.FAILED
+    assert second.failure_classification is FailureClassification.TRANSIENT
+    assert github.merge_calls == []
+    with open_database(database) as connection:
+        assert tuple(
+            connection.execute(
+                "SELECT status,mutation_started_at FROM merge_attempts WHERE id=?",
+                (attempt,),
+            ).fetchone()
+        ) == ("REQUESTED", NOW.isoformat())
+        assert (
+            connection.execute(
+                "SELECT state FROM milestones WHERE id=?", (str(seed.milestone),)
+            ).fetchone()[0]
+            == "MERGING"
+        )
+
+
+def test_mutation_started_attempt_later_completes_by_observation(
+    tmp_path: Path,
+) -> None:
+    database, seed, github, executor = prepared(tmp_path)
+    with open_database(database) as connection:
+        attempt, _request = Gatekeeper(connection, github).prepare(
+            seed.request, now=NOW
+        )
+        connection.execute(
+            "UPDATE merge_attempts SET mutation_started_at=? WHERE id=?",
+            (NOW.isoformat(), attempt),
+        )
+
+    pending = executor.execute(job(seed.project, seed.milestone))
+    assert pending.disposition is JobExecutionDisposition.FAILED
+    assert pending.failure_classification is FailureClassification.TRANSIENT
+    assert github.merge_calls == []
+
     merged(github)
     recovered = executor.execute(job(seed.project, seed.milestone))
     assert recovered.disposition is JobExecutionDisposition.SUCCEEDED
