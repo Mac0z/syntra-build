@@ -367,6 +367,63 @@ class ArchitectReworkTask:
     findings: tuple[ReviewFinding, ...]
     agents_instructions: dict[str, object]
 
+    @classmethod
+    def from_dict(cls, value: object) -> ArchitectReworkTask:
+        """Reconstruct the immutable M24 handoff without coercing input types."""
+        fields = {
+            "task_type",
+            "project_id",
+            "milestone_id",
+            "pull_request_number",
+            "branch",
+            "reviewed_sha",
+            "findings",
+            "agents_instructions",
+            "constraints",
+        }
+        if not isinstance(value, dict) or set(value) != fields:
+            raise DomainValidationError("malformed Architect rework task")
+        agents = value["agents_instructions"]
+        expected_agents = {"revision", "content", "hash"}
+        if (
+            value["task_type"] != "REVIEW_REWORK"
+            or type(value["pull_request_number"]) is not int
+            or value["pull_request_number"] < 1
+            or not isinstance(value["branch"], str)
+            or not value["branch"].strip()
+            or not isinstance(value["reviewed_sha"], str)
+            or len(value["reviewed_sha"]) != 40
+            or any(
+                character not in "0123456789abcdef"
+                for character in value["reviewed_sha"]
+            )
+            or not isinstance(value["findings"], list)
+            or not value["findings"]
+            or not isinstance(agents, dict)
+            or set(agents) != expected_agents
+            or type(agents["revision"]) is not int
+            or agents["revision"] < 1
+            or not isinstance(agents["content"], str)
+            or not agents["content"].strip()
+            or not isinstance(agents["hash"], str)
+            or len(agents["hash"]) != 64
+            or not isinstance(value["constraints"], list)
+        ):
+            raise DomainValidationError("malformed Architect rework task")
+        try:
+            return cls(
+                value["task_type"],
+                ProjectId.from_string(value["project_id"]),
+                MilestoneId.from_string(value["milestone_id"]),
+                value["pull_request_number"],
+                value["branch"],
+                value["reviewed_sha"],
+                tuple(ReviewFinding.from_dict(item) for item in value["findings"]),
+                dict(agents),
+            )
+        except (TypeError, ValueError) as error:
+            raise DomainValidationError("malformed Architect rework task") from error
+
     def to_dict(self) -> dict[str, object]:
         return {
             "task_type": self.task_type,
