@@ -19,6 +19,10 @@ from syntra_build.application.architect import (
     ArchitectProvider,
     ArchitectTaskService,
 )
+from syntra_build.application.architect_review import (
+    ArchitectReviewError,
+    ArchitectReviewService,
+)
 from syntra_build.application.change_validation import ChangeValidationService
 from syntra_build.application.codex import WorkspaceBoundCodexRunner
 from syntra_build.application.provisioning import (
@@ -55,6 +59,7 @@ from syntra_build.domain import (
     WorkerClass,
 )
 from syntra_build.domain.change_validation import ValidationDecision
+from syntra_build.domain.ci import CIOverallStatus
 from syntra_build.domain.codex import CodexProcessStatus, CodexRunRequest
 from syntra_build.domain.failures import FailureClassification
 from syntra_build.domain.pull_requests import (
@@ -76,6 +81,7 @@ from syntra_build.infrastructure.persistence.change_validation import (
     AcceptedChangeSetEvidence,
     SQLiteValidationRepository,
 )
+from syntra_build.infrastructure.persistence.ci import SQLiteCIRepository
 from syntra_build.infrastructure.persistence.codex import SQLiteCodexRunRepository
 from syntra_build.infrastructure.persistence.connection import open_database
 from syntra_build.infrastructure.persistence.design import (
@@ -93,6 +99,10 @@ from syntra_build.infrastructure.persistence.provisioning import (
 from syntra_build.infrastructure.persistence.pull_requests import (
     PullRequestRecord,
     SQLitePullRequestRepository,
+)
+from syntra_build.infrastructure.persistence.reviews import (
+    ReviewRecord,
+    SQLiteArchitectReviewRepository,
 )
 from syntra_build.infrastructure.persistence.workspaces import (
     PersistedTrustedCommit,
@@ -1564,3 +1574,202 @@ class PullRequestCreateExecutor:
             error_id=f"pull-request-{error.failure.value.casefold().replace('_', '-')}",
             failure_classification=classification,
         )
+
+
+class ArchitectReviewExecutor:
+    """Expose M24 exact-head review through one worker-owned Scheduler boundary."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        service_factory: Callable[[sqlite3.Connection], ArchitectReviewService],
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
+    ) -> None:
+        self.database_path = database_path
+        self.service_factory = service_factory
+        self.clock = clock
+        self.connection_factory = connection_factory
+
+    def execute(self, job: Job) -> JobExecutionResult:
+        if job.job_type != "ARCHITECT_REVIEW":
+            raise ValueError("Architect review requires an ARCHITECT_REVIEW job")
+        if job.worker_class is not WorkerClass.ARCHITECT:
+            raise ValueError("Architect review requires an Architect worker")
+        if job.milestone_id is None:
+            raise ValueError("Architect review requires a milestone-scoped job")
+        if job.payload:
+            raise ValueError("Architect review does not accept workflow payload")
+
+        try:
+            with closing(self.connection_factory(self.database_path)) as connection:
+                reviews = SQLiteArchitectReviewRepository(connection)
+                completed = reviews.completed_for_correlation(
+                    str(job.project_id), str(job.milestone_id), job.correlation_id
+                )
+                try:
+                    project = SQLiteProjectRepository(
+                        connection, lambda: str(uuid4())
+                    ).get(job.project_id)
+                    milestone = SQLiteMilestoneRepository(
+                        connection, lambda: str(uuid4())
+                    ).get(job.milestone_id, job.project_id)
+                except PersistenceError as error:
+                    raise ArchitectReviewError(
+                        "Architect review project or milestone is unavailable"
+                    ) from error
+                pull_request = SQLitePullRequestRepository(connection).for_milestone(
+                    job.milestone_id
+                )
+                active = connection.execute(
+                    "SELECT active_pull_request_id FROM milestones WHERE id=?",
+                    (str(job.milestone_id),),
+                ).fetchone()
+                if (
+                    pull_request is None
+                    or active is None
+                    or active["active_pull_request_id"] != pull_request.id
+                    or pull_request.project_id != job.project_id
+                    or pull_request.milestone_id != job.milestone_id
+                    or pull_request.state is not PullRequestState.OPEN
+                    or not pull_request.head_sha.strip()
+                ):
+                    raise ArchitectReviewError(
+                        "Architect review requires the exact active OPEN pull request"
+                    )
+                expected_head_sha = pull_request.head_sha
+
+                # A completed same-correlation review is deliberately checked before
+                # current-state preconditions. M24 can therefore reconcile a worker
+                # retry after its first execution already advanced the milestone.
+                if completed is None:
+                    if project.state is not ProjectState.BUILDING:
+                        raise ArchitectReviewError(
+                            "Architect review project must be BUILDING"
+                        )
+                    if milestone.state is not MilestoneState.ARCHITECT_REVIEW:
+                        raise ArchitectReviewError(
+                            "Architect review milestone must be ARCHITECT_REVIEW"
+                        )
+                    repository = SQLiteProvisioningRepository(connection).for_project(
+                        job.project_id
+                    )
+                    if (
+                        repository is None
+                        or repository.id != pull_request.github_repository_id
+                        or repository.status
+                        is not RepositoryProvisioningStatus.VERIFIED
+                        or repository.verified_at is None
+                        or repository.external_repository_id is None
+                    ):
+                        raise ArchitectReviewError(
+                            "verified GitHub repository is unavailable"
+                        )
+                    ci = SQLiteCIRepository(connection).latest_for_head(
+                        pull_request.id, expected_head_sha
+                    )
+                    if (
+                        ci is None
+                        or ci.project_id != str(job.project_id)
+                        or ci.milestone_id != str(job.milestone_id)
+                        or ci.pull_request_id != pull_request.id
+                        or ci.head_sha != expected_head_sha
+                        or ci.overall_status is not CIOverallStatus.PASSED
+                    ):
+                        raise ArchitectReviewError(
+                            "exact active pull-request head lacks PASSED CI evidence"
+                        )
+
+                service = self.service_factory(connection)
+                if (
+                    service.connection is not connection
+                    or service.reviews.connection is not connection
+                    or (
+                        service.human_interventions is not None
+                        and getattr(service.human_interventions, "connection", None)
+                        is not connection
+                    )
+                ):
+                    raise ArchitectReviewError(
+                        "Architect review services must use the worker connection"
+                    )
+                returned = service.review(
+                    job.project_id,
+                    job.milestone_id,
+                    job.correlation_id,
+                    expected_head_sha=expected_head_sha,
+                )
+                durable = reviews.get(returned.id)
+                self._verify_durable(
+                    connection, durable, returned, pull_request, job, expected_head_sha
+                )
+                assert durable is not None
+        except ArchitectError as error:
+            return JobExecutionResult(
+                JobExecutionDisposition.FAILED,
+                error_id=f"architect-review-{error.kind.value.casefold()}",
+                failure_classification=(
+                    FailureClassification.TRANSIENT
+                    if error.kind in _TRANSIENT_ARCHITECT_FAILURES
+                    else FailureClassification.PERMANENT
+                ),
+            )
+        except ArchitectReviewError:
+            return JobExecutionResult(
+                JobExecutionDisposition.FAILED,
+                error_id="architect-review-invariant",
+                failure_classification=FailureClassification.PERMANENT,
+            )
+        return JobExecutionResult(
+            JobExecutionDisposition.SUCCEEDED,
+            result={
+                "review_id": durable.id,
+                "pull_request_id": durable.pull_request_id,
+                "reviewed_sha": durable.reviewed_sha,
+                "verdict": durable.verdict.value,
+                "finding_count": durable.finding_count,
+                "superseded": durable.superseded_at is not None,
+            },
+        )
+
+    @staticmethod
+    def _verify_durable(
+        connection: sqlite3.Connection,
+        durable: ReviewRecord | None,
+        returned: ReviewRecord,
+        pull_request: PullRequestRecord,
+        job: Job,
+        expected_head_sha: str,
+    ) -> None:
+        if (
+            durable is None
+            or durable != returned
+            or durable.pull_request_id != pull_request.id
+            or (
+                durable.reviewed_sha != expected_head_sha
+                and durable.superseded_at is None
+            )
+        ):
+            raise ArchitectReviewError(
+                "durable Architect review differs from the returned exact-head review"
+            )
+        request = connection.execute(
+            """SELECT q.status,q.correlation_id,r.project_id,r.milestone_id,
+                      (SELECT count(*) FROM architect_review_findings f
+                       WHERE f.review_id=r.id) AS finding_count
+               FROM architect_reviews r JOIN architect_requests q
+                 ON q.id=r.architect_request_id WHERE r.id=?""",
+            (durable.id,),
+        ).fetchone()
+        if (
+            request is None
+            or request["status"] != "SUCCEEDED"
+            or request["correlation_id"] != job.correlation_id
+            or request["project_id"] != str(job.project_id)
+            or request["milestone_id"] != str(job.milestone_id)
+            or int(request["finding_count"]) != durable.finding_count
+        ):
+            raise ArchitectReviewError(
+                "durable Architect request/review evidence is inconsistent"
+            )
