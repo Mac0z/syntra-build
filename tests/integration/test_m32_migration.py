@@ -18,7 +18,7 @@ def test_schema_26_to_27_preserves_evidence_and_accepts_task(tmp_path: Path) -> 
     db.execute(
         "INSERT INTO architect_requests(id,project_id,request_type,provider,model,reasoning_level,request_schema_version,request_payload_json,correlation_id,started_at,status) VALUES('old','00000000-0000-0000-0000-000000000001','DESIGN','fake','m','high','1.0','{}','old','2026-01-01T00:00:00+00:00','STARTED')"
     )
-    apply_migrations(db)
+    apply_migrations(db, MIGRATIONS[:27])
     assert current_schema_version(db) == 27
     assert (
         db.execute(
@@ -33,7 +33,7 @@ def test_schema_26_to_27_preserves_evidence_and_accepts_task(tmp_path: Path) -> 
     db.close()
 
 
-def test_fresh_schema_is_27(tmp_path: Path) -> None:
+def test_fresh_schema_is_28(tmp_path: Path) -> None:
     db = open_database(tmp_path / "fresh.db")
-    assert apply_migrations(db) == 27
+    assert apply_migrations(db) == 28
     db.close()
