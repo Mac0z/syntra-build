@@ -343,7 +343,8 @@ class LifecycleCoordinator:
                 """SELECT 1 FROM jobs WHERE milestone_id=?
                AND job_type='CODEX_REVIEW_REWORK'
                AND state IN ('QUEUED','DISPATCHED','RUNNING','WAITING_EXTERNAL',
-                             'RETRY_WAIT','SUCCEEDED','FAILED','ABANDONED') LIMIT 1""",
+                             'RETRY_WAIT','SUCCEEDED','FAILED','CANCELLED',
+                             'ABANDONED') LIMIT 1""",
                 (milestone_id,),
             ).fetchone()
             is not None

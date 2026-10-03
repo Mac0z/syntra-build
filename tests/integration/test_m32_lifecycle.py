@@ -161,7 +161,13 @@ def test_active_review_rework_owns_coding(tmp_path: Path, state: JobState) -> No
 
 
 @pytest.mark.parametrize(
-    "state", [JobState.SUCCEEDED, JobState.FAILED, JobState.ABANDONED]
+    "state",
+    [
+        JobState.SUCCEEDED,
+        JobState.FAILED,
+        JobState.CANCELLED,
+        JobState.ABANDONED,
+    ],
 )
 def test_historical_review_rework_never_falls_back_to_initial_codex(
     tmp_path: Path, state: JobState
@@ -184,7 +190,22 @@ def test_historical_review_rework_never_falls_back_to_initial_codex(
             worker_class=WorkerClass.CODEX,
         )
     )
-    assert LifecycleCoordinator(db, clock=lambda: NOW).enqueue_due() == 0
+    lifecycle = LifecycleCoordinator(db, clock=lambda: NOW)
+    assert lifecycle.enqueue_due() == 0
+    assert lifecycle.enqueue_due() == 0
+    assert (
+        db.execute(
+            "SELECT state FROM milestones WHERE id=?", (str(milestone),)
+        ).fetchone()[0]
+        == MilestoneState.CODING.value
+    )
+    assert (
+        db.execute(
+            "SELECT state FROM jobs WHERE milestone_id=? AND job_type='CODEX_REVIEW_REWORK'",
+            (str(milestone),),
+        ).fetchone()[0]
+        == state.value
+    )
     assert (
         db.execute("SELECT COUNT(*) FROM jobs WHERE job_type='CODEX_RUN'").fetchone()[0]
         == 0
