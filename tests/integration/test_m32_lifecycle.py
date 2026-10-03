@@ -9,14 +9,19 @@ import pytest
 
 from syntra_build.application.lifecycle import LifecycleCoordinator
 from syntra_build.domain import (
+    Job,
+    JobId,
+    JobState,
     Milestone,
     MilestoneId,
     MilestoneState,
     Project,
     ProjectId,
     ProjectState,
+    WorkerClass,
 )
 from syntra_build.infrastructure.persistence import apply_migrations, open_database
+from syntra_build.infrastructure.persistence.jobs import SQLiteJobRepository
 from syntra_build.infrastructure.persistence.milestones import SQLiteMilestoneRepository
 from syntra_build.infrastructure.persistence.projects import SQLiteProjectRepository
 
@@ -104,6 +109,86 @@ def test_ready_milestone_queues_one_implementation_task(tmp_path: Path) -> None:
     row = db.execute("SELECT job_type,worker_class,payload_json FROM jobs").fetchone()
     assert row[0:2] == ("ARCHITECT_TASK", "ARCHITECT")
     assert json.loads(row[2]) == {"task_type": "IMPLEMENT"}
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        JobState.QUEUED,
+        JobState.DISPATCHED,
+        JobState.RUNNING,
+        JobState.WAITING_EXTERNAL,
+        JobState.RETRY_WAIT,
+    ],
+)
+def test_active_review_rework_owns_coding(tmp_path: Path, state: JobState) -> None:
+    db = _db(tmp_path)
+    project = _project(db)
+    milestone = _milestone(db, project, MilestoneState.CODING)
+    job_id = JobId.generate()
+    SQLiteJobRepository(db, lambda: str(uuid4())).add(
+        Job(
+            job_id,
+            project,
+            "CODEX_REVIEW_REWORK",
+            state,
+            1,
+            NOW,
+            NOW,
+            milestone,
+            correlation_id="review-correlation",
+            max_attempts=1,
+            worker_class=WorkerClass.CODEX,
+            payload={
+                "task_type": "REVIEW_REWORK",
+                "review_id": "review",
+                "rework_task_id": "task",
+                "pull_request_id": "pr",
+            },
+        )
+    )
+    lifecycle = LifecycleCoordinator(db, clock=lambda: NOW)
+    assert lifecycle.enqueue_due() == 0
+    assert lifecycle.enqueue_due() == 0
+    assert (
+        db.execute("SELECT COUNT(*) FROM jobs WHERE job_type='CODEX_RUN'").fetchone()[0]
+        == 0
+    )
+    assert (
+        db.execute("SELECT state FROM jobs WHERE id=?", (str(job_id),)).fetchone()[0]
+        == state.value
+    )
+
+
+@pytest.mark.parametrize(
+    "state", [JobState.SUCCEEDED, JobState.FAILED, JobState.ABANDONED]
+)
+def test_historical_review_rework_never_falls_back_to_initial_codex(
+    tmp_path: Path, state: JobState
+) -> None:
+    db = _db(tmp_path)
+    project = _project(db)
+    milestone = _milestone(db, project, MilestoneState.CODING)
+    SQLiteJobRepository(db, lambda: str(uuid4())).add(
+        Job(
+            JobId.generate(),
+            project,
+            "CODEX_REVIEW_REWORK",
+            state,
+            1,
+            NOW,
+            NOW,
+            milestone,
+            correlation_id="review-correlation",
+            max_attempts=1,
+            worker_class=WorkerClass.CODEX,
+        )
+    )
+    assert LifecycleCoordinator(db, clock=lambda: NOW).enqueue_due() == 0
+    assert (
+        db.execute("SELECT COUNT(*) FROM jobs WHERE job_type='CODEX_RUN'").fetchone()[0]
+        == 0
+    )
 
 
 def test_project_scoped_design_job_is_idempotent(tmp_path: Path) -> None:

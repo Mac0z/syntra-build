@@ -86,6 +86,7 @@ def test_real_runtime_thread_and_http_health(tmp_path: Path) -> None:
         loop_interval=0.01,
         shutdown_grace=1,
         configure_runtime_logging=False,
+        executor_factory=lambda _config: {},
     )
     assert runtime.health.projection().ready is False
     runtime.start()
@@ -111,6 +112,7 @@ def test_metrics_and_automatic_backups_can_be_disabled(tmp_path: Path) -> None:
         loop_interval=0.01,
         shutdown_grace=1,
         configure_runtime_logging=False,
+        executor_factory=lambda _config: {},
     )
     runtime.start()
     runtime.stop()
@@ -166,6 +168,7 @@ def test_continuous_telegram_uses_router_and_durable_cursor(tmp_path: Path) -> N
         loop_interval=0.01,
         shutdown_grace=1,
         configure_runtime_logging=False,
+        executor_factory=lambda _config: {},
     )
     runtime.start()
     assert sent.wait(2)
@@ -205,6 +208,7 @@ def test_restart_rediscovers_persisted_human_wait(tmp_path: Path) -> None:
             loop_interval=0.01,
             shutdown_grace=1,
             configure_runtime_logging=False,
+            executor_factory=lambda _config: {},
         )
         runtime.start()
         assert runtime.health.projection().ready
@@ -257,6 +261,7 @@ def test_service_persists_unauthorised_telegram_event_without_routing(
         loop_interval=0.01,
         shutdown_grace=1,
         configure_runtime_logging=False,
+        executor_factory=lambda _config: {},
     )
     runtime.start()
     assert polled.wait(2)
@@ -292,6 +297,7 @@ def test_provider_aware_recovery_builder_supplies_released_observers(
         tmp_path / "config.json",
         config_loader=lambda _path: config,
         configure_runtime_logging=False,
+        executor_factory=lambda _config: {},
     )
     from syntra_build.infrastructure.persistence.connection import open_database
 
@@ -330,6 +336,7 @@ def test_runtime_readiness_barrier_exposes_all_lifecycle_phases(
         loop_interval=0.01,
         shutdown_grace=1,
         configure_runtime_logging=False,
+        executor_factory=lambda _config: {},
     )
     assert runtime.health.projection().state.value == "STARTING"
     starter = Thread(target=runtime.start)
