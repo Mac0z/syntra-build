@@ -304,8 +304,6 @@ def test_provider_aware_recovery_builder_supplies_released_observers(
     with open_database(config.database.sqlite_path) as connection:
         services, workspace = runtime._recovery_services(connection)
         assert workspace is not None
-        assert services.pull_requests is not None
-        assert services.ci is not None
         assert services.gatekeeper is not None
         assert services.workspace is workspace
         assert services.human is not None

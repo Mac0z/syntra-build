@@ -3,13 +3,9 @@
 import argparse
 from pathlib import Path
 
-from syntra_build.adapters.github.actions import GitHubActionsAdapter
 from syntra_build.adapters.github.pull_requests import GitHubPullRequestAdapter
-from syntra_build.application.ci_handoff import PullRequestCIHandoff
-from syntra_build.application.ci_monitor import CIMonitor
 from syntra_build.application.gatekeeper import Gatekeeper
 from syntra_build.application.human_intervention import HumanInterventionService
-from syntra_build.application.pull_requests import PullRequestLifecycleService
 from syntra_build.application.recovery import RecoveryCoordinator, RecoveryServices
 from syntra_build.application.scheduler import Scheduler, WorkerCapacity
 from syntra_build.application.workspaces import WorkspaceService
@@ -53,17 +49,12 @@ def main() -> int:
                 services = RecoveryServices(workspace=workspace)
                 if args.mode in {"github", "all"}:
                     prs = GitHubPullRequestAdapter(config)
-                    lifecycle = PullRequestLifecycleService(connection, workspace, prs)
                     services = RecoveryServices(
-                        pull_requests=PullRequestCIHandoff(connection, lifecycle),
-                        ci=CIMonitor(connection, prs, GitHubActionsAdapter(config)),
                         gatekeeper=Gatekeeper(connection, prs),
                         workspace=workspace,
                     )
             if args.mode in {"human", "all"}:
                 services = RecoveryServices(
-                    pull_requests=services.pull_requests,
-                    ci=services.ci,
                     gatekeeper=services.gatekeeper,
                     workspace=services.workspace,
                     human=HumanInterventionService(
