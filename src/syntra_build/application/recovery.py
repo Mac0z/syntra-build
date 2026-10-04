@@ -14,14 +14,11 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import uuid4
 
-from syntra_build.application.ci_handoff import PullRequestCIHandoff
-from syntra_build.application.ci_monitor import CIMonitor
 from syntra_build.application.gatekeeper import Gatekeeper
 from syntra_build.application.human_intervention import HumanInterventionService
 from syntra_build.application.review_rework import ReviewReworkCoordinator
 from syntra_build.application.scheduler.core import Scheduler
 from syntra_build.application.workspaces import WorkspaceService
-from syntra_build.domain.ci import CIOverallStatus
 from syntra_build.domain.identifiers import JobId
 from syntra_build.domain.job_state_machine import JobTransitionRequest
 from syntra_build.domain.jobs import Job, JobState, WorkerClass
@@ -64,18 +61,19 @@ class RecoveryHealthSink(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class RecoveryServices:
-    """Trusted M22–M26 services used by concrete recovery paths."""
+    """Observation-only services used by startup recovery.
 
-    pull_requests: PullRequestCIHandoff | None = None
-    ci: CIMonitor | None = None
+    M32 route executors own PR creation, CI reconciliation, and Git mutations.  They
+    intentionally have no seam here: startup recovery restores their durable work
+    rather than becoming a second executor.
+    """
+
     gatekeeper: Gatekeeper | None = None
     workspace: WorkspaceService | None = None
     human: HumanInterventionService | None = None
 
 
-_UNSAFE_STATES = frozenset(
-    {"COMMITTING", "PUSHING", "PR_CREATING", "MERGING", "MERGE_VERIFY"}
-)
+_UNSAFE_STATES = frozenset({"MERGING", "MERGE_VERIFY"})
 _HUMAN_STATES = frozenset({"HUMAN_DECISION", "HUMAN_TEST"})
 _EXTERNAL_WAIT_STATES = frozenset({"CI_RUNNING", "ARCHITECT_REVIEW"})
 
@@ -154,7 +152,7 @@ class RecoveryCoordinator:
                 "DISPATCHED",
                 "RUNNING",
             }:
-                return self._lost_local_job(subject, correlation_id)
+                return self._lost_worker_job(subject, correlation_id)
             if subject.job_id is not None:
                 return RecoveryDecision(
                     subject.job_state or "JOB",
@@ -193,58 +191,6 @@ class RecoveryCoordinator:
         state = subject.milestone_state
         if subject.milestone_id is None or state is None:
             return None
-        if state == "PR_CREATING" and self.services.pull_requests is not None:
-            row = self.connection.execute(
-                """SELECT cs.id FROM change_sets cs JOIN commits c
-                   ON c.change_set_id=cs.id
-                   WHERE cs.project_id=? AND cs.milestone_id=? AND cs.decision='ACCEPT'
-                   ORDER BY cs.created_at DESC,cs.id LIMIT 1""",
-                (str(subject.project_id), str(subject.milestone_id)),
-            ).fetchone()
-            if row is None:
-                raise ValueError("PR recovery lacks accepted change-set/commit intent")
-            record = self.services.pull_requests.establish(
-                subject.project_id,
-                subject.milestone_id,
-                row["id"],
-                correlation_id,
-                now=self.clock(),
-            )
-            return RecoveryDecision(
-                "PR_CREATING",
-                RecoveryDisposition.RECONCILED,
-                "trusted PR adopted and CI handoff restored",
-                {"pull_request_id": record.id, "head_sha": record.head_sha},
-            )
-        if state == "CI_RUNNING" and self.services.ci is not None:
-            pr = self.connection.execute(
-                "SELECT head_sha FROM pull_requests WHERE milestone_id=?",
-                (str(subject.milestone_id),),
-            ).fetchone()
-            if pr is None:
-                raise ValueError("CI recovery lacks trusted pull request")
-            run = self.services.ci.reconcile(
-                subject.project_id,
-                subject.milestone_id,
-                correlation_id,
-                expected_head_sha=pr["head_sha"],
-            )
-            disposition = (
-                RecoveryDisposition.RECONCILED
-                if run.overall_status
-                in {CIOverallStatus.PASSED, CIOverallStatus.FAILED}
-                else RecoveryDisposition.RESTORED_WAIT
-            )
-            return RecoveryDecision(
-                "CI_RUNNING",
-                disposition,
-                "existing exact-head CI reconciled",
-                {
-                    "ci_run_id": run.id,
-                    "head_sha": run.head_sha,
-                    "status": run.overall_status.value,
-                },
-            )
         if state in {"COMMITTING", "PUSHING"} and self.services.workspace is not None:
             commit = self.connection.execute(
                 """SELECT c.commit_sha,c.pushed_at,c.change_set_id
@@ -254,7 +200,13 @@ class RecoveryCoordinator:
                 (str(subject.project_id), str(subject.milestone_id)),
             ).fetchone()
             if commit is None:
-                raise ValueError("Git recovery cannot identify one accepted commit")
+                # This is the normal pre-GIT_COMMIT boundary.  The released route
+                # owns the mutation after the drain barrier opens.
+                return RecoveryDecision(
+                    state,
+                    RecoveryDisposition.RESTORED_WAIT,
+                    "unfinished Git route retained for normal executor replay",
+                )
             inspection = self.services.workspace.inspect(
                 subject.project_id, subject.milestone_id, self.clock()
             )
@@ -273,23 +225,11 @@ class RecoveryCoordinator:
                     "existing trusted commit adopted without committing",
                     {"commit_sha": commit["commit_sha"]},
                 )
-            pushed = self.services.workspace.push(
-                subject.project_id,
-                subject.milestone_id,
-                commit["commit_sha"],
-                self.clock(),
-            )
-            self._advance_milestone(
-                subject,
-                MilestoneState.PR_CREATING,
-                correlation_id,
-                "recovery verified exact remote branch commit",
-            )
             return RecoveryDecision(
                 state,
-                RecoveryDisposition.RECONCILED,
-                "remote branch reconciled without force push",
-                {"commit_sha": pushed.commit_sha, "remote_sha": pushed.remote_sha},
+                RecoveryDisposition.RESTORED_WAIT,
+                "trusted push authority retained for normal executor reconciliation",
+                {"commit_sha": commit["commit_sha"]},
             )
         if state in {"MERGING", "MERGE_VERIFY"} and self.services.gatekeeper:
             return self._recover_merge(subject, correlation_id)
@@ -434,39 +374,46 @@ class RecoveryCoordinator:
             {"gate_id": gate["id"], "gate_state": gate["state"]},
         )
 
-    def _lost_local_job(
+    def _lost_worker_job(
         self, subject: RecoverySubject, correlation_id: str
     ) -> RecoveryDecision:
         assert subject.job_id is not None and subject.job_state is not None
         job = self.jobs.get(subject.job_id, subject.project_id)
-        if job.worker_class not in {
+        local = job.worker_class in {
             WorkerClass.CODEX,
             WorkerClass.GIT,
             WorkerClass.ARCHITECT,
-        }:
+        }
+        if job.job_type == "PR_MERGE" and self._merge_mutation_started(subject):
+            verified = self._verified_merge_evidence(subject)
+            decision = (
+                RecoveryDecision(
+                    job.job_type,
+                    RecoveryDisposition.RECONCILED,
+                    "exact merge was already durably verified",
+                    verified,
+                )
+                if verified is not None
+                else self._recover_merge(subject, correlation_id)
+            )
+            if decision.disposition is not RecoveryDisposition.RECONCILED:
+                return decision
+            with transaction(self.connection):
+                abandoned = self._abandon(
+                    job, correlation_id, "merge proven externally"
+                )
             return RecoveryDecision(
                 job.job_type,
-                RecoveryDisposition.UNKNOWN,
-                "non-local execution requires explicit observer",
+                RecoveryDisposition.RECONCILED,
+                "orphan merge worker terminalized after exact merge verification",
+                {"abandoned_job_id": str(abandoned.id), **dict(decision.observed)},
             )
-        clean = (
+        clean = not local or (
             self.workspace_clean(subject) if self.workspace_clean is not None else False
         )
         with transaction(self.connection):
-            abandoned = self.jobs.abandon(
-                JobTransitionRequest(
-                    job.id,
-                    job.project_id,
-                    job.state,
-                    JobState.ABANDONED,
-                    "local process did not survive restart",
-                    "RECOVERY",
-                    "startup-recovery",
-                    correlation_id,
-                    self.clock(),
-                    metadata={"worktree_preserved": True},
-                    error_id="RECOVERY_PROCESS_LOST",
-                )
+            abandoned = self._abandon(
+                job, correlation_id, "worker did not survive restart"
             )
             replacement = self._replacement(job, correlation_id) if clean else None
         if not clean:
@@ -500,6 +447,54 @@ class RecoveryCoordinator:
             None,
         )
 
+    def _merge_mutation_started(self, subject: RecoverySubject) -> bool:
+        if subject.milestone_id is None:
+            return False
+        row = self.connection.execute(
+            """SELECT mutation_started_at FROM merge_attempts
+               WHERE project_id=? AND milestone_id=?
+               ORDER BY requested_at DESC,id LIMIT 1""",
+            (str(subject.project_id), str(subject.milestone_id)),
+        ).fetchone()
+        return row is not None and row["mutation_started_at"] is not None
+
+    def _verified_merge_evidence(
+        self, subject: RecoverySubject
+    ) -> dict[str, str] | None:
+        if subject.milestone_id is None:
+            return None
+        row = self.connection.execute(
+            """SELECT a.id attempt_id,a.merge_commit_sha
+               FROM merge_attempts a JOIN pull_requests p ON p.id=a.pull_request_id
+               WHERE a.project_id=? AND a.milestone_id=? AND a.status='MERGED'
+                 AND p.state='MERGED' AND a.merge_commit_sha=p.merge_commit_sha
+               ORDER BY a.requested_at DESC,a.id LIMIT 1""",
+            (str(subject.project_id), str(subject.milestone_id)),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "merge_attempt_id": row["attempt_id"],
+            "merge_commit_sha": row["merge_commit_sha"],
+        }
+
+    def _abandon(self, job: Job, correlation_id: str, reason: str) -> Job:
+        return self.jobs.abandon(
+            JobTransitionRequest(
+                job.id,
+                job.project_id,
+                job.state,
+                JobState.ABANDONED,
+                reason,
+                "RECOVERY",
+                "startup-recovery",
+                correlation_id,
+                self.clock(),
+                metadata={"worktree_preserved": True},
+                error_id="RECOVERY_PROCESS_LOST",
+            )
+        )
+
     def _replacement(self, prior: Job, correlation_id: str) -> Job:
         existing = self.connection.execute(
             """SELECT id FROM jobs WHERE project_id=? AND milestone_id IS ?
@@ -530,7 +525,10 @@ class RecoveryCoordinator:
             scheduled_at=now,
             timeout_seconds=prior.timeout_seconds,
             worker_class=prior.worker_class,
-            payload={**dict(prior.payload or {}), "replaces_job_id": str(prior.id)},
+            # Executor payloads are released command contracts.  Recovery
+            # provenance belongs in observations/job transition evidence, never
+            # in the trusted command vocabulary.
+            payload=dict(prior.payload or {}),
         )
         self.jobs.add(replacement)
         return replacement
