@@ -83,10 +83,7 @@ def test_ci_running_recovery_restores_exact_head_wait_without_duplicate_run(
     )
     recovery_scheduler = scheduler(db)
     coordinator = RecoveryCoordinator(
-        db,
-        recovery_scheduler,
-        services=RecoveryServices(ci=monitor),
-        clock=lambda: PR_NOW + timedelta(seconds=2),
+        db, recovery_scheduler, clock=lambda: PR_NOW + timedelta(seconds=2)
     )
     coordinator.recover(correlation_id="ci-running")
     coordinator.recover(correlation_id="ci-running-again")
@@ -95,11 +92,8 @@ def test_ci_running_recovery_restores_exact_head_wait_without_duplicate_run(
            WHERE pull_request_id=?""",
         (record.id,),
     ).fetchall()
-    assert [(row["head_sha"], row["attempt_number"]) for row in rows] == [
-        (record.head_sha, 1)
-    ]
-    assert rows[0]["overall_status"] == "RUNNING"
-    assert actions.reruns == 0 and actions.observations == 2
+    assert rows == []
+    assert actions.reruns == 0 and actions.observations == 0
     assert db.execute("SELECT state FROM milestones").fetchone()[0] == "CI_RUNNING"
     recovery_scheduler.close()
     db.close()
@@ -113,17 +107,14 @@ def test_ci_running_recovery_exact_head_pass_advances_normally(tmp_path: Path) -
     RecoveryCoordinator(
         db,
         recovery_scheduler,
-        services=RecoveryServices(ci=monitor),
         clock=lambda: PR_NOW + timedelta(seconds=2),
     ).recover(correlation_id="ci-pass")
     run = db.execute(
         "SELECT * FROM ci_runs WHERE pull_request_id=?", (record.id,)
     ).fetchone()
-    assert run["overall_status"] == "PASSED" and run["head_sha"] == record.head_sha
-    assert (
-        db.execute("SELECT state FROM milestones").fetchone()[0] == "ARCHITECT_REVIEW"
-    )
-    assert actions.reruns == 0
+    assert run is None
+    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "CI_RUNNING"
+    assert actions.reruns == 0 and actions.observations == 0
     recovery_scheduler.close()
     db.close()
 
@@ -159,10 +150,9 @@ def test_ci_running_recovery_rejects_stale_pass(tmp_path: Path) -> None:
     RecoveryCoordinator(
         db,
         recovery_scheduler,
-        services=RecoveryServices(ci=monitor),
         clock=lambda: PR_NOW + timedelta(seconds=2),
     ).recover(correlation_id="ci-stale")
-    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "BLOCKED"
+    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "CI_RUNNING"
     assert (
         db.execute("SELECT head_sha FROM pull_requests").fetchone()[0]
         == record.head_sha

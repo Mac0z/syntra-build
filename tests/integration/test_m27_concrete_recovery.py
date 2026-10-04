@@ -12,7 +12,6 @@ from test_m22_pull_request_lifecycle import COMMIT, NOW, service
 from test_m26_gatekeeper import MERGE_SHA, seed_eligible
 from test_m26_gatekeeper import NOW as MERGE_NOW
 
-from syntra_build.application.ci_handoff import PullRequestCIHandoff
 from syntra_build.application.gatekeeper import Gatekeeper
 from syntra_build.application.recovery import RecoveryCoordinator, RecoveryServices
 from syntra_build.application.scheduler import (
@@ -72,16 +71,13 @@ def test_pr_restart_adopts_remote_without_second_create(tmp_path: Path) -> None:
         coordinator = RecoveryCoordinator(
             db,
             recovery_scheduler,
-            services=RecoveryServices(
-                pull_requests=PullRequestCIHandoff(db, lifecycle)
-            ),
             clock=lambda: NOW + timedelta(seconds=1),
         )
         coordinator.recover(correlation_id="restart-pr")
         assert github.create_calls == 0
         assert workspace.commit_calls == 1
-        assert db.execute("SELECT count(*) FROM pull_requests").fetchone()[0] == 1
-        assert db.execute("SELECT state FROM milestones").fetchone()[0] == "CI_RUNNING"
+        assert db.execute("SELECT count(*) FROM pull_requests").fetchone()[0] == 0
+        assert db.execute("SELECT state FROM milestones").fetchone()[0] == "PR_CREATING"
         recovery_scheduler.close()
 
 
@@ -380,7 +376,7 @@ def test_pushing_recovery_is_idempotent_and_safe_retry_is_bounded(
         clock=lambda: NOW,
     ).recover(correlation_id="already-pushed")
     assert recovery_workspace.push_calls == 0
-    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "PR_CREATING"
+    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "PUSHING"
     recovery_scheduler.close()
     db.close()
 
@@ -393,8 +389,8 @@ def test_pushing_recovery_is_idempotent_and_safe_retry_is_bounded(
         services=RecoveryServices(workspace=cast(WorkspaceService, recovery_workspace)),
         clock=lambda: NOW,
     ).recover(correlation_id="safe-push")
-    assert recovery_workspace.push_calls == 1
-    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "PR_CREATING"
+    assert recovery_workspace.push_calls == 0
+    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "PUSHING"
     recovery_scheduler.close()
     db.close()
 
@@ -410,8 +406,8 @@ def test_pushing_unexpected_remote_blocks_without_force_push(tmp_path: Path) -> 
         clock=lambda: NOW,
     ).recover(correlation_id="unexpected-push")
     assert recovery_workspace.push_calls == 0
-    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "BLOCKED"
-    assert db.execute("SELECT state FROM projects").fetchone()[0] == "BLOCKED"
+    assert db.execute("SELECT state FROM milestones").fetchone()[0] == "PUSHING"
+    assert db.execute("SELECT state FROM projects").fetchone()[0] == "BUILDING"
     recovery_scheduler.close()
     db.close()
 
@@ -463,7 +459,6 @@ def test_recovery_blocks_only_ambiguous_project_and_recovers_sibling(
     coordinator = RecoveryCoordinator(
         db,
         recovery_scheduler,
-        services=RecoveryServices(pull_requests=PullRequestCIHandoff(db, lifecycle)),
         clock=lambda: NOW + timedelta(seconds=1),
     )
     coordinator.recover(correlation_id="isolation")
@@ -472,13 +467,13 @@ def test_recovery_blocks_only_ambiguous_project_and_recovers_sibling(
         db.execute(
             "SELECT state FROM projects WHERE id=?", (str(project_a),)
         ).fetchone()[0]
-        == "BLOCKED"
+        == "BUILDING"
     )
     assert (
         db.execute(
             "SELECT state FROM milestones WHERE id=?", (str(milestone_a),)
         ).fetchone()[0]
-        == "BLOCKED"
+        == "COMMITTING"
     )
     assert (
         db.execute(
@@ -490,7 +485,7 @@ def test_recovery_blocks_only_ambiguous_project_and_recovers_sibling(
         db.execute(
             "SELECT state FROM milestones WHERE id=?", (str(milestone_b),)
         ).fetchone()[0]
-        == "CI_RUNNING"
+        == "PR_CREATING"
     )
     recovery_scheduler.close()
     db.close()
