@@ -441,7 +441,7 @@ def test_clean_lost_codex_queues_one_idempotent_replacement(tmp_path: Path) -> N
         (str(job_id), str(project), str(milestone)),
     ).fetchall()
     assert len(replacements) == 1 and replacements[0]["state"] == "QUEUED"
-    assert f'"replaces_job_id":"{job_id}"' in replacements[0]["payload_json"]
+    assert replacements[0]["payload_json"] == '{"task":"preserve"}'
     assert db.execute("SELECT state FROM milestones").fetchone()[0] == "CODING"
     scheduler.close()
     db.close()

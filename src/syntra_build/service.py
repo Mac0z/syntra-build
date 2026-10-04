@@ -12,15 +12,12 @@ from pathlib import Path
 from threading import Event, Thread
 from uuid import uuid4
 
-from syntra_build.adapters.github.actions import GitHubActionsAdapter
 from syntra_build.adapters.github.pull_requests import GitHubPullRequestAdapter
 from syntra_build.adapters.telegram import (
     TelegramClient,
     TelegramDesignApprovalHandler,
     TelegramHumanInterventionHandler,
 )
-from syntra_build.application.ci_handoff import PullRequestCIHandoff
-from syntra_build.application.ci_monitor import CIMonitor
 from syntra_build.application.dispatch_guard import DiskDispatchGuard
 from syntra_build.application.gatekeeper import Gatekeeper
 from syntra_build.application.human_intervention import HumanInterventionService
@@ -32,7 +29,6 @@ from syntra_build.application.production import (
     ProductionDueWorkCoordinator,
     build_production_executors,
 )
-from syntra_build.application.pull_requests import PullRequestLifecycleService
 from syntra_build.application.recovery import RecoveryCoordinator, RecoveryServices
 from syntra_build.application.scheduler import (
     Scheduler,
@@ -295,15 +291,8 @@ class ServiceRuntime:
         )
         workspace = WorkspaceService(connection, git, self.config.filesystem.data_root)
         pull_requests = GitHubPullRequestAdapter(self.config)
-        lifecycle = PullRequestLifecycleService(connection, workspace, pull_requests)
         return (
             RecoveryServices(
-                pull_requests=PullRequestCIHandoff(connection, lifecycle),
-                ci=CIMonitor(
-                    connection,
-                    pull_requests,
-                    GitHubActionsAdapter(self.config, metrics=self.recorder),
-                ),
                 gatekeeper=Gatekeeper(connection, pull_requests),
                 workspace=workspace,
                 human=human,
