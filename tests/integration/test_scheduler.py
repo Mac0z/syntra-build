@@ -522,14 +522,17 @@ def test_drain_keeps_queue_and_active_work_can_finish(tmp_path: Path) -> None:
     job_b = add_job(jobs, project_id)
     release = Event()
     executor = RecordingExecutor(release=release)
+    due_ticks: list[datetime] = []
     capacity = capacities(codex_concurrency=1)
     scheduler = Scheduler(
         jobs,
         capacity,
         {WorkerClass.CODEX: executor},
         clock=lambda: NOW,
+        due_work_enqueuer=due_ticks.append,
     )
     scheduler.run_once()
+    assert due_ticks == [NOW]
     running = next(
         job_id
         for job_id in (job_a, job_b)
@@ -538,6 +541,7 @@ def test_drain_keeps_queue_and_active_work_can_finish(tmp_path: Path) -> None:
     queued = job_b if running == job_a else job_a
     scheduler.enter_drain()
     assert scheduler.run_once().dispatched == 0
+    assert due_ticks == [NOW]
     assert jobs.get(queued, project_id).state is JobState.QUEUED
 
     release.set()
@@ -546,6 +550,7 @@ def test_drain_keeps_queue_and_active_work_can_finish(tmp_path: Path) -> None:
     assert jobs.get(queued, project_id).state is JobState.QUEUED
     scheduler.exit_drain()
     assert scheduler.run_once().dispatched == 1
+    assert due_ticks == [NOW, NOW]
     harvest(scheduler, executor)
     scheduler.close()
     connection.close()

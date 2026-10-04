@@ -205,6 +205,12 @@ class Scheduler:
         """Harvest completed work, then claim as many due jobs as capacity permits."""
         with self._lock:
             completed, failures, errors = self._harvest()
+            if self._draining:
+                return SchedulerCycleResult(
+                    completed=completed,
+                    worker_start_failures=failures,
+                    errors=tuple(errors),
+                )
             if self._due_work_enqueuer is not None:
                 self._due_work_enqueuer(self._now())
             if hasattr(self._jobs, "due_retries"):
@@ -215,12 +221,6 @@ class Scheduler:
                 )
                 for exhausted in promotion.exhausted:
                     self._handle_exhaustion(exhausted)
-            if self._draining:
-                return SchedulerCycleResult(
-                    completed=completed,
-                    worker_start_failures=failures,
-                    errors=tuple(errors),
-                )
             candidates = self._jobs.eligible(self._now(), self._candidate_limit)
             counts = {
                 "dispatched": 0,
