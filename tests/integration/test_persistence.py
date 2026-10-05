@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
@@ -145,6 +146,52 @@ def test_transaction_commit_rollback_and_nesting(tmp_path: Path) -> None:
             with pytest.raises(TransactionError, match="nested"):
                 with transaction(db):
                     pass
+
+
+def test_mutation_transaction_reserves_writer_before_guarded_read(
+    tmp_path: Path,
+) -> None:
+    """A competing WAL writer waits instead of invalidating a guarded snapshot."""
+    path = tmp_path / "concurrent-mutations.db"
+    with open_database(path) as primary:
+        primary.execute("CREATE TABLE sample (id INTEGER PRIMARY KEY, value TEXT)")
+        primary.execute("INSERT INTO sample VALUES (1, 'initial')")
+        competing_started = Event()
+        competing_committed = Event()
+        errors: list[BaseException] = []
+
+        def competing_mutation() -> None:
+            try:
+                with open_database(path) as competing:
+                    competing_started.set()
+                    with transaction(competing):
+                        competing.execute(
+                            "UPDATE sample SET value='competing' WHERE id=1"
+                        )
+                    competing_committed.set()
+            except BaseException as error:
+                errors.append(error)
+
+        with transaction(primary):
+            assert (
+                primary.execute("SELECT value FROM sample WHERE id=1").fetchone()[0]
+                == "initial"
+            )
+            writer = Thread(target=competing_mutation)
+            writer.start()
+            assert competing_started.wait(2)
+            # BEGIN IMMEDIATE keeps the competing commit behind this mutation.
+            assert not competing_committed.wait(0.1)
+            primary.execute("UPDATE sample SET value='primary' WHERE id=1")
+
+        writer.join(2)
+        assert not writer.is_alive()
+        assert errors == []
+        assert competing_committed.is_set()
+        assert (
+            primary.execute("SELECT value FROM sample WHERE id=1").fetchone()[0]
+            == "competing"
+        )
 
 
 def test_bootstrap_logs_lifecycle_without_sql(

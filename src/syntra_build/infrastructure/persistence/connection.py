@@ -47,11 +47,15 @@ def open_database(path: Path) -> sqlite3.Connection:
 
 @contextmanager
 def transaction(connection: sqlite3.Connection) -> Iterator[None]:
-    """Commit one atomic block, rollback on failure, and reject nesting."""
+    """Own one atomic mutation block, rollback on failure, and reject nesting.
+
+    Acquiring SQLite's write reservation before any guarded reads prevents a WAL
+    read snapshot from becoming impossible to upgrade after a concurrent commit.
+    """
     if connection.in_transaction:
         raise TransactionError("nested transactions are not supported")
     try:
-        connection.execute("BEGIN")
+        connection.execute("BEGIN IMMEDIATE")
         try:
             yield
         except BaseException:
