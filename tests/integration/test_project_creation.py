@@ -15,14 +15,13 @@ from syntra_build.application.projects import (
     ProjectCreationService,
     SQLiteProjectQueryService,
 )
-from syntra_build.domain import Project, ProjectId, ProjectState, WorkflowEventId
+from syntra_build.domain import ProjectId, ProjectState, WorkflowEventId
 from syntra_build.infrastructure.persistence import (
     SQLiteProjectRepository,
     SQLiteWorkflowEventRepository,
     apply_migrations,
     open_database,
 )
-from syntra_build.infrastructure.persistence.errors import PersistenceError
 
 NOW = datetime(2026, 9, 9, 12, tzinfo=UTC)
 PROJECT_ID = ProjectId.from_string("00000000-0000-0000-0000-000000000014")
@@ -187,18 +186,19 @@ def test_external_deduplication_constraint_race_returns_committed_winner(
     loser_db = open_database(path)
     apply_migrations(loser_db)
 
-    class RacingProjects(SQLiteProjectRepository):
-        def add(self, project: Project) -> None:
+    class RacingGitHubNames(FakeGitHubNames):
+        def conflicts(self, canonical_name: str) -> bool:
+            super().conflicts(canonical_name)
             committed = winner.create_from_command(command())
             assert committed.project.id == PROJECT_ID
-            raise PersistenceError("synthetic lost concurrent insertion")
+            return False
 
-    loser_projects = RacingProjects(loser_db, lambda: "loser-transition")
+    loser_projects = SQLiteProjectRepository(loser_db, lambda: "loser-transition")
     loser = ProjectCreationService(
         loser_db,
         loser_projects,
         SQLiteWorkflowEventRepository(loser_db),
-        FakeGitHubNames(),
+        RacingGitHubNames(),
         project_id_factory=lambda: ProjectId.from_string(
             "00000000-0000-0000-0000-000000000015"
         ),

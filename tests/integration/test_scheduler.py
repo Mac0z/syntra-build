@@ -5,7 +5,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Condition, Event
+from threading import Condition, Event, Thread
 
 import pytest
 
@@ -42,6 +42,7 @@ from syntra_build.infrastructure.persistence import (
     SQLiteProjectRepository,
     apply_migrations,
     open_database,
+    transaction,
 )
 from syntra_build.infrastructure.persistence.jobs import SchedulableJob
 
@@ -185,6 +186,64 @@ def harvest(scheduler: Scheduler, executor: RecordingExecutor) -> None:
     assert executor.finished.wait(2)
     scheduler.wait_for_wake(2)
     scheduler.run_once()
+
+
+def test_dispatch_waits_for_overlapping_worker_owned_database_write(
+    tmp_path: Path,
+) -> None:
+    """Worker and control connections serialize without leaking SQLITE_BUSY."""
+    path = tmp_path / "overlapping-writes.db"
+    connection, _, jobs, project_id = database(path)
+    job_id = add_job(jobs, project_id)
+    worker_holds_write = Event()
+    control_requested_write = Event()
+    release_worker = Event()
+    worker_errors: list[BaseException] = []
+
+    def worker_mutation() -> None:
+        try:
+            with open_database(path) as worker_connection:
+                with transaction(worker_connection):
+                    worker_connection.execute(
+                        "UPDATE projects SET updated_at=updated_at WHERE id=?",
+                        (str(project_id),),
+                    )
+                    worker_holds_write.set()
+                    assert release_worker.wait(2)
+        except BaseException as error:
+            worker_errors.append(error)
+
+    def release_after_control_contends() -> None:
+        assert control_requested_write.wait(2)
+        release_worker.set()
+
+    worker = Thread(target=worker_mutation)
+    worker.start()
+    assert worker_holds_write.wait(2)
+    releaser = Thread(target=release_after_control_contends)
+    releaser.start()
+    connection.set_trace_callback(
+        lambda statement: (
+            control_requested_write.set() if statement == "BEGIN IMMEDIATE" else None
+        )
+    )
+    executor = RecordingExecutor()
+    scheduler = Scheduler(
+        jobs, capacities(codex_concurrency=1), {WorkerClass.CODEX: executor}
+    )
+
+    result = scheduler.run_once()
+
+    worker.join(2)
+    releaser.join(2)
+    assert not worker.is_alive()
+    assert not releaser.is_alive()
+    assert worker_errors == []
+    assert result.dispatched == 1
+    assert jobs.get(job_id).state is JobState.RUNNING
+    harvest(scheduler, executor)
+    scheduler.close()
+    connection.close()
 
 
 def test_eligibility_filters_state_and_due_time(tmp_path: Path) -> None:

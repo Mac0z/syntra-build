@@ -619,6 +619,33 @@ def test_prepare_persists_before_mutation_and_global_serializes(db) -> None:
         )
 
 
+def test_prepare_observes_github_without_holding_write_transaction(db) -> None:
+    seed, github = seed_eligible(db)
+
+    class TransactionCheckingGitHub(FakeGitHub):
+        def get(
+            self,
+            repository_full_name: str,
+            number: int,
+            project_id: ProjectId,
+            milestone_id: MilestoneId,
+        ) -> PullRequestDescriptor:
+            assert not db.in_transaction
+            return super().get(repository_full_name, number, project_id, milestone_id)
+
+    checking_github = TransactionCheckingGitHub(github.live)
+
+    attempt_id, _ = Gatekeeper(db, checking_github).prepare(seed.request, now=NOW)
+
+    assert len(checking_github.get_calls) == 2
+    assert (
+        db.execute(
+            "SELECT status FROM merge_attempts WHERE id=?", (attempt_id,)
+        ).fetchone()[0]
+        == "REQUESTED"
+    )
+
+
 @pytest.mark.parametrize(
     "live_change",
     [
