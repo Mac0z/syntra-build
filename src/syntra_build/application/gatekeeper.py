@@ -395,8 +395,13 @@ class Gatekeeper:
             with transaction(self.connection):
                 self._persist_result(request, result)
             raise GatekeeperRejected(result)
+        # Provider observation must complete before BEGIN IMMEDIATE acquires the
+        # process-wide SQLite writer reservation. Persisted policy is evaluated
+        # again inside the transaction so this observation cannot authorize a
+        # merge after authoritative state changes concurrently.
+        live = self._fresh_pr(request)
         with transaction(self.connection):
-            result = self._evaluate_persisted(request, self._fresh_pr(request), now)
+            result = self._evaluate_persisted(request, live, now)
             self._persist_result(request, result)
             if not result.eligible:
                 raise GatekeeperRejected(result)
