@@ -45,6 +45,10 @@ from syntra_build.application.operational_health import (
     LocalResourceSampler,
     OperationalHealth,
 )
+from syntra_build.application.project_controls import (
+    AuthoritativeProjectCommandService,
+    WorkflowEventCommandAuditSink,
+)
 from syntra_build.application.projects import ProjectCreationService
 from syntra_build.application.specification import DesignPackageDecisionHandler
 from syntra_build.application.status import (
@@ -146,7 +150,7 @@ def build_host_router(
     github_transport: GitHubTransport | None = None,
     health: LocalHealthService | None = None,
 ) -> CommandRouter:
-    """Compose the durable M14 services used by real Telegram host routing."""
+    """Compose durable production services used by real Telegram host routing."""
     projects = SQLiteProjectRepository(connection, lambda: str(uuid4()))
     events = SQLiteWorkflowEventRepository(connection)
     checker = (
@@ -177,8 +181,8 @@ def build_host_router(
     status = SQLiteStatusService(connection, projects)
     return CommandRouter(
         project_queries=status,
-        project_commands=_UnavailableProjectCommands(),
-        audit_sink=_NoopAudit(),
+        project_commands=AuthoritativeProjectCommandService(projects, events),
+        audit_sink=WorkflowEventCommandAuditSink(connection, events),
         health=health or _LocalHealth(),
         project_creation=creation,
         gate_commands=gate_commands,
