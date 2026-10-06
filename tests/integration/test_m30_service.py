@@ -20,6 +20,7 @@ from syntra_build.domain import (
     ProjectId,
     ProjectState,
 )
+from syntra_build.domain.jobs import WorkerClass
 from syntra_build.infrastructure.config import load_config
 from syntra_build.infrastructure.config.models import (
     ApplicationConfig,
@@ -29,7 +30,7 @@ from syntra_build.infrastructure.config.models import (
 from syntra_build.infrastructure.persistence import bootstrap_database
 from syntra_build.infrastructure.persistence.milestones import SQLiteMilestoneRepository
 from syntra_build.infrastructure.persistence.projects import SQLiteProjectRepository
-from syntra_build.service import ServiceRuntime
+from syntra_build.service import ServiceRuntime, _run_service
 
 
 def _port() -> int:
@@ -348,3 +349,98 @@ def test_runtime_readiness_barrier_exposes_all_lifecycle_phases(
     runtime.stop()
     projection = runtime.health.projection()
     assert projection.state.value == "DRAINING" and not projection.ready
+
+
+def test_fatal_control_failure_terminates_lifecycle_with_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from syntra_build.application.scheduler import Scheduler
+
+    config = _config(tmp_path, metrics=False)
+    control_entered, release_failure, cleanup_complete = Event(), Event(), Event()
+    original_run_once = Scheduler.run_once
+    calls = 0
+
+    def fail_after_readiness(self: Scheduler) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_run_once(self)
+        control_entered.set()
+        assert release_failure.wait(2)
+        raise RuntimeError("synthetic post-start control failure")
+
+    monkeypatch.setattr(Scheduler, "run_once", fail_after_readiness)
+    runtime = ServiceRuntime(
+        tmp_path / "config.json",
+        config_loader=lambda _path: config,
+        loop_interval=0.01,
+        shutdown_grace=1,
+        configure_runtime_logging=False,
+        executor_factory=lambda _config: {},
+    )
+    original_stop = runtime.stop
+
+    def observed_stop() -> None:
+        original_stop()
+        cleanup_complete.set()
+
+    monkeypatch.setattr(runtime, "stop", observed_stop)
+    statuses: list[int] = []
+    process_owner = Thread(target=lambda: statuses.append(_run_service(runtime)))
+    process_owner.start()
+
+    assert control_entered.wait(2)
+    assert runtime.ready_event.is_set()
+    release_failure.set()
+    process_owner.join(2)
+
+    assert not process_owner.is_alive()
+    assert statuses == [1]
+    assert runtime.failed_event.is_set()
+    assert cleanup_complete.is_set()
+    assert runtime.health.projection().state.value == "UNHEALTHY"
+
+
+def test_requested_shutdown_terminates_lifecycle_cleanly(tmp_path: Path) -> None:
+    config = _config(tmp_path, metrics=False)
+    runtime = ServiceRuntime(
+        tmp_path / "config.json",
+        config_loader=lambda _path: config,
+        loop_interval=0.01,
+        shutdown_grace=1,
+        configure_runtime_logging=False,
+        executor_factory=lambda _config: {},
+    )
+    statuses: list[int] = []
+    process_owner = Thread(target=lambda: statuses.append(_run_service(runtime)))
+    process_owner.start()
+
+    assert runtime.ready_event.wait(2)
+    runtime.request_shutdown()
+    process_owner.join(2)
+
+    assert not process_owner.is_alive()
+    assert statuses == [0]
+    assert not runtime.failed_event.is_set()
+
+
+def test_startup_composition_failure_terminates_lifecycle_with_failure(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path, metrics=False)
+
+    def fail_composition(_config: ApplicationConfig) -> dict[WorkerClass, object]:
+        raise RuntimeError("synthetic startup composition failure")
+
+    runtime = ServiceRuntime(
+        tmp_path / "config.json",
+        config_loader=lambda _path: config,
+        shutdown_grace=1,
+        configure_runtime_logging=False,
+        executor_factory=fail_composition,
+    )
+
+    assert _run_service(runtime) == 1
+    assert runtime.failed_event.is_set()
+    assert runtime.health.projection().state.value == "UNHEALTHY"
