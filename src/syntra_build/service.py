@@ -86,6 +86,7 @@ class ServiceRuntime:
         self.stop_event = Event()
         self.ready_event = Event()
         self.failed_event = Event()
+        self._lifecycle_event = Event()
         self.capacity = WorkerCapacity(self.config.scheduler.worker_class_limits())
         self.recorder = PrometheusRecorder()
         self.health = OperationalHealth(
@@ -168,9 +169,7 @@ class ServiceRuntime:
             )
         except Exception:
             connection.close()
-            self.health.recovery_failed()
-            self.failed_event.set()
-            self.ready_event.set()
+            self._control_failed()
             _LOGGER.exception(
                 "Production composition failed",
                 extra={"event": "production_composition_failed"},
@@ -264,15 +263,29 @@ class ServiceRuntime:
                 poll_interval_seconds=min(self._loop_interval, 0.1),
             )
         except Exception:
-            self.health.recovery_failed()
-            self.failed_event.set()
-            self.ready_event.set()
+            self._control_failed()
             _LOGGER.exception(
                 "Control plane failed", extra={"event": "control_plane_failed"}
             )
         finally:
             scheduler.close(wait=False)
             connection.close()
+
+    def _control_failed(self) -> None:
+        """Publish a fatal control-plane failure to startup and process lifecycle."""
+        self.health.recovery_failed()
+        self.failed_event.set()
+        self.ready_event.set()
+        self._lifecycle_event.set()
+
+    def request_shutdown(self) -> None:
+        """Wake the process owner for a normal operator-requested shutdown."""
+        self._lifecycle_event.set()
+
+    def wait_for_termination(self) -> bool:
+        """Wait for operator shutdown or failure; return whether failure won."""
+        self._lifecycle_event.wait()
+        return self.failed_event.is_set()
 
     def _recovery_services(
         self, connection: sqlite3.Connection
@@ -317,7 +330,8 @@ class ServiceRuntime:
             self.stop_event.wait(self._backup_interval)
 
     def stop(self) -> None:
-        self.health.draining()
+        if not self.failed_event.is_set():
+            self.health.draining()
         if self.scheduler is not None:
             self.scheduler.enter_drain()
         self.stop_event.set()
@@ -330,20 +344,26 @@ class ServiceRuntime:
             self.http.stop()
 
 
+def _run_service(runtime: ServiceRuntime) -> int:
+    """Own startup, lifecycle waiting, cleanup, and the eventual process status."""
+    try:
+        try:
+            runtime.start()
+        except Exception:
+            return 1
+        return 1 if runtime.wait_for_termination() else 0
+    finally:
+        runtime.stop()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=DEFAULT_HOST_CONFIG_PATH)
     args = parser.parse_args(argv)
     runtime = ServiceRuntime(args.config)
-    stopped = Event()
-    signal.signal(signal.SIGTERM, lambda _signum, _frame: stopped.set())
-    signal.signal(signal.SIGINT, lambda _signum, _frame: stopped.set())
-    try:
-        runtime.start()
-        stopped.wait()
-    finally:
-        runtime.stop()
-    return 0
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: runtime.request_shutdown())
+    signal.signal(signal.SIGINT, lambda _signum, _frame: runtime.request_shutdown())
+    return _run_service(runtime)
 
 
 if __name__ == "__main__":
