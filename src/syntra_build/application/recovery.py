@@ -500,6 +500,23 @@ class RecoveryCoordinator:
     def _completed_route_evidence(self, job: Job) -> dict[str, object] | None:
         """Prove one released route handed off before its Future was harvested."""
         if job.milestone_id is None:
+            if job.job_type == "SPECIFICATION_DRAFT":
+                package = self.connection.execute(
+                    """SELECT d.id,d.approval_gate_id FROM design_packages d
+                       JOIN architect_requests q ON q.id=d.architect_request_id
+                       JOIN human_gates g ON g.id=d.approval_gate_id
+                       WHERE d.project_id=? AND q.project_id=d.project_id
+                         AND q.request_type='SPECIFICATION_DRAFT'
+                         AND q.correlation_id=? AND q.status='SUCCEEDED'
+                         AND g.project_id=d.project_id
+                         AND g.artifact_reference='design-package:' || d.id""",
+                    (str(job.project_id), job.correlation_id),
+                ).fetchone()
+                if package is not None:
+                    return {
+                        "design_package_id": package["id"],
+                        "gate_id": package["approval_gate_id"],
+                    }
             return None
         milestone = self.connection.execute(
             "SELECT state FROM milestones WHERE project_id=? AND id=?",

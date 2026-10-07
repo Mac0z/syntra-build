@@ -1,17 +1,40 @@
 """Telegram transport bridge for application-level human-gate notification."""
 
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from syntra_build.adapters.telegram.client import TelegramClient
+from syntra_build.adapters.telegram.errors import (
+    TelegramAPIError,
+    TelegramConfigurationError,
+    TelegramTransportError,
+)
 from syntra_build.adapters.telegram.human_intervention import human_gate_callback_data
 from syntra_build.domain import GateId, GateType
+from syntra_build.domain.failures import FailureClassification, classify_failure
 from syntra_build.infrastructure.persistence import (
     SQLiteHumanGateRepository,
     SQLiteTelegramGateNotificationRepository,
 )
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def classify_notification_failure(error: BaseException) -> FailureClassification:
+    """Translate Telegram failures for the Scheduler's bounded notification retries."""
+    if isinstance(error, TelegramTransportError):
+        return FailureClassification.TRANSIENT
+    if isinstance(error, TelegramAPIError):
+        code = error.error_code or error.http_status
+        if code == 429 or (code is not None and code >= 500):
+            return FailureClassification.TRANSIENT
+        return FailureClassification.PERMANENT
+    if isinstance(error, TelegramConfigurationError):
+        return FailureClassification.PERMANENT
+    return classify_failure(error)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +66,7 @@ class TelegramGateNotifier:
                         raise ValueError(
                             "existing Telegram gate notification destination conflicts"
                         )
+                    self._log("gate_notification_reused", GateId.from_string(gate))
                     return existing.message_id
         if match and "design-package:" in text:
             gate = match.group(1)
@@ -119,4 +143,20 @@ class TelegramGateNotifier:
                 str(sent.message_id),
                 self.clock(),
             )
+            self._log("gate_notification_sent", GateId.from_string(match.group(1)))
         return str(sent.message_id)
+
+    def _log(self, event: str, gate_id: GateId) -> None:
+        assert self.notifications is not None
+        gate = SQLiteHumanGateRepository(
+            self.notifications.connection, lambda: "unused"
+        ).get(gate_id)
+        _LOGGER.info(
+            "Telegram gate notification confirmed",
+            extra={
+                "event": event,
+                "project_id": str(gate.project_id),
+                "gate_id": str(gate_id),
+                "correlation_id": gate.correlation_id,
+            },
+        )
