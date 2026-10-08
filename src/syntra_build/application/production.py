@@ -254,10 +254,16 @@ def build_production_executors(
     codex = JobTypeDispatcher(
         {
             "CODEX_RUN": InitialCodexExecutor(
-                database, runner, timeout_seconds=config.codex.execution_timeout_seconds
+                database,
+                runner,
+                timeout_seconds=config.codex.execution_timeout_seconds,
+                cycle_limit=config.retries.codex_cycle_limit,
             ).execute,
             "CODEX_REVIEW_REWORK": ReviewReworkCodexExecutor(
-                database, runner, timeout_seconds=config.codex.execution_timeout_seconds
+                database,
+                runner,
+                timeout_seconds=config.codex.execution_timeout_seconds,
+                cycle_limit=config.retries.codex_cycle_limit,
             ).execute,
         }
     )
@@ -265,7 +271,10 @@ def build_production_executors(
         {
             "WORKSPACE_PREPARE": WorkspacePrepareExecutor(database, workspace).execute,
             "CHANGE_VALIDATE": ChangeValidationExecutor(
-                database, trusted_git, data_root
+                database,
+                trusted_git,
+                data_root,
+                cycle_limit=config.retries.codex_cycle_limit,
             ).execute,
             "GIT_COMMIT": TrustedCommitExecutor(
                 database, trusted_git, data_root

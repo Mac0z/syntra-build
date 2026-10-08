@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -164,6 +165,24 @@ def seed(
         (str(PID), str(worktree.parent / "repo.git"), stamp, stamp),
     )
     worktree.mkdir(parents=True)
+
+    def local_git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=worktree, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    local_git("init", "--initial-branch=main")
+    local_git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "baseline",
+    )
+    head = local_git("rev-parse", "HEAD")
     db.execute(
         "INSERT INTO git_workspaces (id,project_id,milestone_id,git_repository_id,branch_name,worktree_path,base_branch,base_sha,current_head_sha,state,created_at,last_validated_at) VALUES (?,?,?,'repo','syntra/m00-implement',?,'main',?,?,?, ?,?)",
         (
@@ -171,8 +190,8 @@ def seed(
             str(PID),
             str(MID),
             str(worktree),
-            HEAD,
-            HEAD,
+            head,
+            head,
             workspace_state,
             stamp,
             stamp,
@@ -211,8 +230,12 @@ class RecordingRunner:
         ):
             raise ValueError("workspace is not authoritative")
 
-    def run(self, request: CodexRunRequest) -> CodexRunResult:
+    def run(
+        self, request: CodexRunRequest, *, require_clean: bool = True
+    ) -> CodexRunResult:
         self.requests.append(request)
+        if self.status is CodexProcessStatus.SUCCEEDED:
+            (request.worktree_path / "implementation.py").write_text("answer = 42\n")
         records = SQLiteCodexRunRepository(self.connection)
         records.start(
             f"run-{request.attempt_number}",
@@ -403,7 +426,9 @@ def test_unsuccessful_outcomes_are_durable_and_do_not_advance(
     assert state(control) == "CODING"
 
 
-def persist_success(db: sqlite3.Connection, request: CodexRunRequest) -> None:
+def persist_success(
+    db: sqlite3.Connection, request: CodexRunRequest, summary: str = ""
+) -> None:
     records = SQLiteCodexRunRepository(db)
     records.start("replay", request, WORKTREE_ID, "f" * 64, NOW, "stdout", "stderr")
     records.complete(
@@ -423,6 +448,7 @@ def persist_success(db: sqlite3.Connection, request: CodexRunRequest) -> None:
             exit_code=0,
             stdout_reference="stdout",
             stderr_reference="stderr",
+            summary=summary,
         ),
     )
 
@@ -461,6 +487,7 @@ def test_successful_replay_repairs_only_missing_transition(
 ) -> None:
     path, worktree = tmp_path / "state.db", tmp_path / "worktree"
     control = seed(path, worktree)
+    (worktree / "implementation.py").write_text("answer = 42\n")
     persist_success(control, replay_request(worktree))
     if already_advanced:
         control.execute(
@@ -470,7 +497,7 @@ def test_successful_replay_repairs_only_missing_transition(
     runners: list[RecordingRunner] = []
     result = executor(path, runners).execute(job())
     assert result.disposition is JobExecutionDisposition.SUCCEEDED
-    assert not runners[0].requests and runners[0].validations == [False]
+    assert not runners[0].requests and runners[0].validations == [False, False]
     assert control.execute("SELECT count(*) FROM codex_runs").fetchone()[0] == 1
     assert state(control) == "VALIDATING_CHANGES"
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -426,14 +427,34 @@ def test_provider_failure_is_audited_without_successful_review(tmp_path: Path) -
 
 
 def test_durable_job_runs_through_scheduler_codex_boundary(tmp_path: Path) -> None:
-    db, project, milestone, _, descriptor = seeded(tmp_path)
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=workspace, capture_output=True, check=True, text=True
+        ).stdout.strip()
+
+    git("init", "--initial-branch=main")
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "baseline",
+    )
+    head = git("rev-parse", "HEAD")
+    db, project, milestone, _, descriptor = seeded(tmp_path, ci_sha=head)
+    db.execute("UPDATE pull_requests SET head_sha=?", (head,))
+    descriptor = replace(descriptor, head_sha=head)
     service(
         db,
         GitHubFake(descriptor),
         ArchitectFake(ArchitectReviewVerdict.CHANGES_REQUIRED),
     ).review(project, milestone, "scheduled-rework")
-    workspace = tmp_path / "worktree"
-    workspace.mkdir()
     repository_id, workspace_id = str(uuid4()), str(uuid4())
     db.execute(
         """INSERT INTO git_repositories (id,project_id,github_repository_id,repository_path,remote_name,remote_url,default_branch,created_at,updated_at) VALUES (?,?,(SELECT id FROM github_repositories WHERE project_id=?),?,'origin','https://github.com/owner/repo.git','main',?,?)""",
@@ -455,8 +476,8 @@ def test_durable_job_runs_through_scheduler_codex_boundary(tmp_path: Path) -> No
             repository_id,
             "syntra/m24",
             str(workspace),
-            SHA_A,
-            SHA_A,
+            head,
+            head,
             NOW.isoformat(),
         ),
     )
@@ -475,8 +496,11 @@ def test_durable_job_runs_through_scheduler_codex_boundary(tmp_path: Path) -> No
             clean_requirements.append(require_clean)
             assert request.worktree_path == workspace
 
-        def run(self, request: CodexRunRequest) -> CodexRunResult:
+        def run(
+            self, request: CodexRunRequest, *, require_clean: bool = True
+        ) -> CodexRunResult:
             requests.append(request)
+            (request.worktree_path / "correction.py").write_text("correct = True\n")
             assert request.task["task_type"] == "REVIEW_REWORK"
             assert "github" not in request.task
             runs = SQLiteCodexRunRepository(self.connection)
@@ -557,7 +581,7 @@ def test_durable_job_runs_through_scheduler_codex_boundary(tmp_path: Path) -> No
         )
         assert replay.disposition.value == "SUCCEEDED"
         assert len(requests) == 1
-        assert clean_requirements == [True, False]
+        assert clean_requirements == [True, False, False, False]
         assert requests[0].job_id == JobId.from_string(job_row[0])
         assert db.execute("SELECT count(*) FROM codex_runs").fetchone()[0] == 1
         assert db.execute("SELECT count(*) FROM change_sets").fetchone()[0] == 0

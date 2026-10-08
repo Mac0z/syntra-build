@@ -210,7 +210,9 @@ class FakeCodexProcess:
             WorkspaceService(self.connection, self.trusted_git, self.data_root), self
         ).validate_workspace(request, require_clean=require_clean)
 
-    def run(self, request: CodexRunRequest) -> CodexRunResult:
+    def run(
+        self, request: CodexRunRequest, *, require_clean: bool = True
+    ) -> CodexRunResult:
         runs = SQLiteCodexRunRepository(self.connection)
         runs.start(
             str(uuid4()),

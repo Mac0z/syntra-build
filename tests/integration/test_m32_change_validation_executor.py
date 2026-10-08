@@ -314,7 +314,7 @@ def test_empty_change_set_is_durable_permanent_rework(tmp_path: Path) -> None:
             db.execute("SELECT decision FROM change_sets").fetchone()[0]
             == "REWORK_REQUIRED"
         )
-    assert milestone_state(database) == MilestoneState.VALIDATING_CHANGES.value
+    assert milestone_state(database) == MilestoneState.CODING.value
 
 
 @pytest.mark.parametrize(
@@ -354,7 +354,7 @@ def test_policy_findings_do_not_advance(
             == finding.value
         )
         assert db.execute("SELECT blocking FROM security_events").fetchone()[0] == 1
-    assert milestone_state(database) == MilestoneState.VALIDATING_CHANGES.value
+    assert milestone_state(database) == MilestoneState.CODING.value
 
 
 def test_repository_identity_and_history_fail_closed(tmp_path: Path) -> None:
@@ -366,7 +366,7 @@ def test_repository_identity_and_history_fail_closed(tmp_path: Path) -> None:
     with open_database(database) as db:
         assert db.execute("SELECT decision FROM change_sets").fetchone()[0] == "BLOCKED"
         assert db.execute("SELECT count(*) FROM security_events").fetchone()[0] >= 1
-    assert milestone_state(database) == MilestoneState.VALIDATING_CHANGES.value
+    assert milestone_state(database) == MilestoneState.BLOCKED.value
 
 
 def test_unexpected_history_and_workspace_escape_are_blocked(tmp_path: Path) -> None:
@@ -381,7 +381,7 @@ def test_unexpected_history_and_workspace_escape_are_blocked(tmp_path: Path) -> 
         }
         assert FindingCode.UNEXPECTED_GIT_HISTORY_CHANGE.value in codes
         assert FindingCode.WORKSPACE_ESCAPE_ATTEMPT.value in codes
-    assert milestone_state(database) == MilestoneState.VALIDATING_CHANGES.value
+    assert milestone_state(database) == MilestoneState.BLOCKED.value
 
 
 def test_exact_replay_repairs_transition_without_duplicate(tmp_path: Path) -> None:
@@ -420,7 +420,7 @@ def test_accept_replay_after_branch_tamper_is_blocked(tmp_path: Path) -> None:
 
     assert result.disposition is JobExecutionDisposition.FAILED
     assert result.failure_classification is FailureClassification.POLICY
-    assert milestone_state(database) == MilestoneState.VALIDATING_CHANGES.value
+    assert milestone_state(database) == MilestoneState.BLOCKED.value
     with open_database(database) as db:
         assert db.execute("SELECT count(*) FROM change_sets").fetchone()[0] == 2
         latest = db.execute(
@@ -451,7 +451,7 @@ def test_accept_replay_after_repository_identity_tamper_is_blocked(
 
     assert result.disposition is JobExecutionDisposition.FAILED
     assert result.failure_classification is FailureClassification.POLICY
-    assert milestone_state(database) == MilestoneState.VALIDATING_CHANGES.value
+    assert milestone_state(database) == MilestoneState.BLOCKED.value
     with open_database(database) as db:
         assert db.execute("SELECT count(*) FROM change_sets").fetchone()[0] == 2
         latest = db.execute(

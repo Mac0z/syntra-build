@@ -148,7 +148,7 @@ class SQLiteCodexRunRepository:
                WHERE r.project_id=? AND r.milestone_id=? AND r.worktree_id=?
                  AND r.process_status=? AND r.completed_at IS NOT NULL
                  AND j.project_id=r.project_id AND j.milestone_id=r.milestone_id
-                 AND j.job_type='CODEX_RUN'
+                 AND j.job_type IN ('CODEX_RUN','CODEX_REVIEW_REWORK')
                ORDER BY r.completed_at DESC,r.id DESC LIMIT 1""",
             (
                 str(project_id),

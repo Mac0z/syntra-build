@@ -65,6 +65,9 @@ def parser() -> argparse.ArgumentParser:
     restore = commands.add_parser("restore-verify")
     restore.add_argument("backup", type=Path)
     commands.add_parser("reconcile")
+    recovery = commands.add_parser("recover-empty-implementation")
+    recovery.add_argument("project_id")
+    recovery.add_argument("milestone_id")
     return result
 
 
@@ -89,6 +92,32 @@ def main(argv: list[str] | None = None) -> int:
                 f"path={backup.path} schema={backup.schema_version} bytes={backup.byte_size} integrity=ok"
             )
             return 0
+        if args.command == "recover-empty-implementation":
+            from syntra_build.application.implementation_recovery import (
+                recover_empty_implementation,
+            )
+            from syntra_build.domain import MilestoneId, ProjectId
+            from syntra_build.infrastructure.git_workspace import TrustedGit
+            from syntra_build.infrastructure.persistence.connection import open_database
+
+            # Require schema compatibility before opening for the explicitly requested mutation.
+            _open_observation_database(config.database.sqlite_path).close()
+            connection = open_database(config.database.sqlite_path)
+            try:
+                recovered_job = recover_empty_implementation(
+                    connection,
+                    TrustedGit(config.filesystem.data_root / "git-auth"),
+                    config.filesystem.data_root,
+                    ProjectId.from_string(args.project_id),
+                    MilestoneId.from_string(args.milestone_id),
+                    cycle_limit=config.retries.codex_cycle_limit,
+                )
+                print(
+                    f"job={recovered_job} project_remains_paused=true provider_invoked=false"
+                )
+                return 0
+            finally:
+                connection.close()
         connection = _open_observation_database(config.database.sqlite_path)
         try:
             if args.command == "version":

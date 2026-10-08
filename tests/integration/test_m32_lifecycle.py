@@ -197,7 +197,7 @@ def test_historical_review_rework_never_falls_back_to_initial_codex(
         db.execute(
             "SELECT state FROM milestones WHERE id=?", (str(milestone),)
         ).fetchone()[0]
-        == MilestoneState.CODING.value
+        == MilestoneState.BLOCKED.value
     )
     assert (
         db.execute(

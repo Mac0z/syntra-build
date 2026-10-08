@@ -12,6 +12,11 @@ from typing import cast
 from uuid import uuid4
 
 from syntra_build.application.codex import WorkspaceBoundCodexRunner
+from syntra_build.application.implementation_policy import (
+    block_implementation,
+    codex_cycles,
+    validation_feedback,
+)
 from syntra_build.application.scheduler import (
     JobExecutionDisposition,
     JobExecutionResult,
@@ -26,6 +31,7 @@ from syntra_build.domain.projects import ProjectState
 from syntra_build.domain.pull_requests import PullRequestState
 from syntra_build.domain.reviews import ArchitectReviewVerdict, ArchitectReworkTask
 from syntra_build.domain.workspaces import WorkspaceError, WorkspaceState
+from syntra_build.infrastructure.change_validation import ChangeCollector
 from syntra_build.infrastructure.persistence.codex import SQLiteCodexRunRepository
 from syntra_build.infrastructure.persistence.connection import open_database
 from syntra_build.infrastructure.persistence.jobs import SQLiteJobRepository
@@ -130,11 +136,13 @@ class ReviewReworkCodexExecutor:
         runner_factory: Callable[[sqlite3.Connection], WorkspaceBoundCodexRunner],
         *,
         timeout_seconds: float,
+        cycle_limit: int = 5,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
     ) -> None:
         self.database_path, self.runner_factory = database_path, runner_factory
         self.timeout_seconds, self.clock = timeout_seconds, clock
+        self.cycle_limit = cycle_limit
         self.connection_factory = connection_factory
 
     def execute(self, job: Job) -> JobExecutionResult:
@@ -148,11 +156,14 @@ class ReviewReworkCodexExecutor:
             raise ValueError("review rework execution requires a milestone-scoped job")
         payload = job.payload
         fields = {"task_type", "review_id", "rework_task_id", "pull_request_id"}
-        if not isinstance(payload, Mapping) or set(payload) != fields:
+        if not isinstance(payload, Mapping) or set(payload) not in (
+            fields,
+            fields | {"validation_id"},
+        ):
             raise ValueError("review rework job payload has an invalid envelope")
         if payload["task_type"] != "REVIEW_REWORK" or any(
             not isinstance(payload[name], str) or not str(payload[name]).strip()
-            for name in fields - {"task_type"}
+            for name in set(payload) - {"task_type"}
         ):
             raise ValueError("review rework job payload has invalid identity fields")
         with closing(self.connection_factory(self.database_path)) as connection:
@@ -327,6 +338,7 @@ class ReviewReworkCodexExecutor:
             raise ReviewReworkTrustError("workspace does not match reviewed revision")
         # This existing rework job is the sole local Codex owner. M32.15 must keep
         # global composition from enqueueing a generic CODEX_RUN for this milestone.
+        feedback = validation_feedback(connection, job)
         request = CodexRunRequest(
             "1.0",
             job.correlation_id,
@@ -338,20 +350,39 @@ class ReviewReworkCodexExecutor:
             task.to_dict(),
             str(task.agents_instructions["content"]),
             self.timeout_seconds,
+            previous_run_summary=feedback,
         )
         runs = SQLiteCodexRunRepository(connection)
         result = runs.completed_for_request(request)
-        if result is None and workspace.state is not WorkspaceState.READY:
+        if (
+            result is None
+            and feedback is None
+            and workspace.state is not WorkspaceState.READY
+        ):
             raise ReviewReworkTrustError(
                 "workspace is not READY for a new Codex process"
             )
-        runner.validate_workspace(request, require_clean=result is None)
+        runner.validate_workspace(
+            request, require_clean=result is None and feedback is None
+        )
         if result is None:
             if milestone.state is not MilestoneState.CODING:
                 raise ReviewReworkTrustError(
                     "advanced milestone lacks durable Codex success"
                 )
-            returned = runner.run(request)
+            if codex_cycles(connection, job) >= self.cycle_limit:
+                block_implementation(
+                    connection,
+                    job,
+                    "Rework attempts exhausted; human intervention required",
+                    self.clock(),
+                )
+                return JobExecutionResult(
+                    JobExecutionDisposition.FAILED,
+                    error_id="codex-cycle-limit",
+                    failure_classification=FailureClassification.PERMANENT,
+                )
+            returned = runner.run(request, require_clean=feedback is None)
             result = runs.completed_for_request(request)
             if result is None:
                 raise ReviewReworkTrustError("Codex result was not durably persisted")
@@ -364,6 +395,50 @@ class ReviewReworkCodexExecutor:
         else:
             self._require_result_identity(request, result)
         if result.process_status is CodexProcessStatus.SUCCEEDED:
+            # A successful process cannot establish implementation completion.
+            # Run these checks for fresh output and durable replay alike.
+            runner.validate_workspace(request, require_clean=False)
+            current_pr = SQLitePullRequestRepository(connection).for_milestone(
+                job.milestone_id
+            )
+            current_workspace = SQLiteWorkspaceRepository(
+                connection
+            ).workspace_for_milestone(job.milestone_id)
+            if (
+                current_pr is None
+                or current_pr.id != pull_request_id
+                or current_pr.head_sha != task.reviewed_sha
+                or current_pr.head_branch != task.branch
+                or current_pr.state is not PullRequestState.OPEN
+                or current_workspace is None
+                or current_workspace.id != workspace.id
+                or current_workspace.path != workspace.path
+                or current_workspace.current_head_sha != task.reviewed_sha
+                or SQLiteArchitectReviewRepository(connection).get(review_id) != review
+            ):
+                raise ReviewReworkTrustError(
+                    "review rework revision changed during execution"
+                )
+            changes = ChangeCollector().collect(workspace.path, task.reviewed_sha)
+            unchanged_rework = (
+                feedback is not None
+                and changes.canonical_hash == json.loads(feedback)["diff_hash"]
+            )
+            if not changes.files or unchanged_rework:
+                block_implementation(
+                    connection,
+                    job,
+                    "Architect review rework process completed "
+                    "but produced no code changes; "
+                    "human intervention required",
+                    self.clock(),
+                )
+                return JobExecutionResult(
+                    JobExecutionDisposition.FAILED,
+                    error_id="codex-empty-review-rework",
+                    exit_code=result.exit_code,
+                    failure_classification=FailureClassification.PERMANENT,
+                )
             if milestone.state is MilestoneState.CODING:
                 now = self.clock()
                 if now.tzinfo is None or now.utcoffset() is None:
@@ -374,7 +449,8 @@ class ReviewReworkCodexExecutor:
                         job.project_id,
                         MilestoneState.CODING,
                         MilestoneState.VALIDATING_CHANGES,
-                        "successful Architect review rework Codex run durably recorded",
+                        "Architect review rework process and effective worktree "
+                        "changes verified",
                         "SYSTEM",
                         "review-rework-codex-executor",
                         job.correlation_id,
@@ -384,6 +460,8 @@ class ReviewReworkCodexExecutor:
                             "rework_task_id": task_id,
                             "review_id": review_id,
                             "reviewed_sha": task.reviewed_sha,
+                            "diff_hash": changes.canonical_hash,
+                            "changed_file_count": len(changes.files),
                         },
                     )
                 )

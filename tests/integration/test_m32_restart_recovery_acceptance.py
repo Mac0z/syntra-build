@@ -399,7 +399,7 @@ def test_completed_unharvested_route_is_reconciled_before_workspace_safety(
 
     def runner(connection: sqlite3.Connection) -> WorkspaceBoundCodexRunner:
         class CountingCodex(FakeCodexProcess):
-            def run(self, request):
+            def run(self, request, *, require_clean=True):
                 nonlocal codex_executions
                 codex_executions += 1
                 return super().run(request)
@@ -845,7 +845,7 @@ def test_repeated_real_restarts_complete_one_production_composed_milestone(
 
     def runner(connection: sqlite3.Connection) -> WorkspaceBoundCodexRunner:
         class CountingCodex(FakeCodexProcess):
-            def run(self, request):
+            def run(self, request, *, require_clean=True):
                 nonlocal codex_executions
                 codex_executions += 1
                 return super().run(request)

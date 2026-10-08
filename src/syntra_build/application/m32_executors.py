@@ -32,6 +32,12 @@ from syntra_build.application.gatekeeper import (
     MergeBusy,
     MergeIdentityError,
 )
+from syntra_build.application.implementation_policy import (
+    block_implementation,
+    codex_cycles,
+    queue_validation_rework,
+    validation_feedback,
+)
 from syntra_build.application.provisioning import (
     ProvisioningError,
     ProvisioningFailure,
@@ -87,6 +93,7 @@ from syntra_build.domain.workspaces import (
     WorkspaceError,
     WorkspaceState,
 )
+from syntra_build.infrastructure.change_validation import ChangeCollector
 from syntra_build.infrastructure.git_workspace import TrustedGit
 from syntra_build.infrastructure.persistence.architect import (
     SQLiteArchitectInteractionRepository,
@@ -621,12 +628,14 @@ class InitialCodexExecutor:
         runner_factory: Callable[[sqlite3.Connection], WorkspaceBoundCodexRunner],
         *,
         timeout_seconds: float,
+        cycle_limit: int = 5,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
     ) -> None:
         self.database_path = database_path
         self.runner_factory = runner_factory
         self.timeout_seconds = timeout_seconds
+        self.cycle_limit = cycle_limit
         self.clock = clock
         self.connection_factory = connection_factory
 
@@ -637,7 +646,11 @@ class InitialCodexExecutor:
             raise ValueError("initial Codex execution requires a Codex worker")
         if job.milestone_id is None:
             raise ValueError("initial Codex execution requires a milestone-scoped job")
-        if job.payload:
+        if set(job.payload or {}) - {
+            "lifecycle_generation",
+            "validation_id",
+            "operator_recovery",
+        }:
             raise ValueError("initial Codex execution does not accept workflow payload")
         with closing(self.connection_factory(self.database_path)) as connection:
             milestones = SQLiteMilestoneRepository(connection, lambda: str(uuid4()))
@@ -681,6 +694,7 @@ class InitialCodexExecutor:
                 or row["document_status"] != DocumentStatus.APPROVED.value
             ):
                 raise ValueError("approved AGENTS identity is inconsistent")
+            feedback = validation_feedback(connection, job)
             request = CodexRunRequest(
                 "1.0",
                 job.correlation_id,
@@ -692,21 +706,40 @@ class InitialCodexExecutor:
                 task.to_dict(),
                 row["content"],
                 self.timeout_seconds,
+                previous_run_summary=feedback,
             )
             runner = self.runner_factory(connection)
             runs = SQLiteCodexRunRepository(connection)
             result = runs.completed_for_request(request)
-            if result is None and row["workspace_state"] != WorkspaceState.READY.value:
+            if (
+                result is None
+                and feedback is None
+                and row["workspace_state"] != WorkspaceState.READY.value
+            ):
                 raise ValueError("assigned workspace is not READY for Codex")
             # Replay permits expected uncommitted Codex output; a new untrusted
             # process additionally requires a clean READY workspace.
-            runner.validate_workspace(request, require_clean=result is None)
+            runner.validate_workspace(
+                request, require_clean=result is None and feedback is None
+            )
             if result is None:
                 if milestone.state is not MilestoneState.CODING:
                     raise ValueError(
                         "advanced milestone has no successful Codex evidence"
                     )
-                result = runner.run(request)
+                if codex_cycles(connection, job) >= self.cycle_limit:
+                    block_implementation(
+                        connection,
+                        job,
+                        "Rework attempts exhausted; human intervention required",
+                        self.clock(),
+                    )
+                    return JobExecutionResult(
+                        JobExecutionDisposition.FAILED,
+                        error_id="codex-cycle-limit",
+                        failure_classification=FailureClassification.PERMANENT,
+                    )
+                result = runner.run(request, require_clean=feedback is None)
                 persisted = runs.completed_for_request(request)
                 if persisted is None:
                     raise RuntimeError("Codex result was not durably persisted")
@@ -719,6 +752,33 @@ class InitialCodexExecutor:
                 self._require_result_identity(request, result)
 
             if result.process_status is CodexProcessStatus.SUCCEEDED:
+                # Process evidence and implementation evidence are separate. Recheck
+                # identity after untrusted execution, including on durable replay.
+                runner.validate_workspace(request, require_clean=False)
+                workspace = SQLiteWorkspaceRepository(
+                    connection
+                ).workspace_for_milestone(job.milestone_id)
+                assert workspace is not None
+                changes = ChangeCollector().collect(
+                    workspace.path, workspace.current_head_sha or workspace.base_sha
+                )
+                unchanged_rework = (
+                    feedback is not None
+                    and changes.canonical_hash == json.loads(feedback)["diff_hash"]
+                )
+                if not changes.files or unchanged_rework:
+                    block_implementation(
+                        connection,
+                        job,
+                        "Codex process completed but produced no code changes; human intervention required",
+                        self.clock(),
+                    )
+                    return JobExecutionResult(
+                        JobExecutionDisposition.FAILED,
+                        error_id="codex-empty-implementation",
+                        exit_code=result.exit_code,
+                        failure_classification=FailureClassification.PERMANENT,
+                    )
                 if milestone.state is MilestoneState.CODING:
                     occurred_at = self.clock()
                     if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
@@ -731,11 +791,16 @@ class InitialCodexExecutor:
                             job.project_id,
                             MilestoneState.CODING,
                             MilestoneState.VALIDATING_CHANGES,
-                            "successful Codex run durably recorded",
+                            "Codex process and effective worktree changes verified",
                             "SYSTEM",
                             "initial-codex-executor",
                             job.correlation_id,
                             occurred_at.astimezone(UTC),
+                            metadata={
+                                "job_id": str(job.id),
+                                "diff_hash": changes.canonical_hash,
+                                "changed_file_count": len(changes.files),
+                            },
                         )
                     )
                 disposition = JobExecutionDisposition.SUCCEEDED
@@ -757,6 +822,13 @@ class InitialCodexExecutor:
             if disposition is JobExecutionDisposition.SUCCEEDED
             else result.stderr_reference,
             failure_classification=classification,
+            error_id=(
+                "codex-execution-environment-unavailable"
+                if result.exit_code == 66
+                else "codex-process-failed"
+            )
+            if disposition is JobExecutionDisposition.FAILED
+            else None,
         )
 
     @staticmethod
@@ -784,6 +856,7 @@ class ChangeValidationExecutor:
         git: TrustedGit,
         data_root: Path,
         *,
+        cycle_limit: int = 5,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
     ) -> None:
@@ -791,6 +864,7 @@ class ChangeValidationExecutor:
         self.git = git
         self.data_root = data_root
         self.clock = clock
+        self.cycle_limit = cycle_limit
         self.connection_factory = connection_factory
 
     def execute(self, job: Job) -> JobExecutionResult:
@@ -800,7 +874,7 @@ class ChangeValidationExecutor:
             raise ValueError("change validation requires a Git worker")
         if job.milestone_id is None:
             raise ValueError("change validation requires a milestone-scoped job")
-        if job.payload:
+        if set(job.payload or {}) - {"lifecycle_generation"}:
             raise ValueError("change validation does not accept workflow payload")
 
         occurred_at = self.clock()
@@ -814,6 +888,17 @@ class ChangeValidationExecutor:
             project = SQLiteProjectRepository(connection, lambda: str(uuid4())).get(
                 job.project_id
             )
+            if milestone.state is MilestoneState.CODING:
+                handed_off = connection.execute(
+                    "SELECT c.id FROM change_sets c JOIN jobs j ON json_extract(j.payload_json,'$.validation_id')=c.id WHERE c.project_id=? AND c.milestone_id=? AND c.correlation_id=? AND c.decision='REWORK_REQUIRED' AND j.job_type IN ('CODEX_RUN','CODEX_REVIEW_REWORK') AND j.project_id=c.project_id AND j.milestone_id=c.milestone_id",
+                    (str(job.project_id), str(job.milestone_id), job.correlation_id),
+                ).fetchone()
+                if handed_off is not None:
+                    return JobExecutionResult(
+                        JobExecutionDisposition.FAILED,
+                        error_id="change-validation-rework_required",
+                        failure_classification=FailureClassification.PERMANENT,
+                    )
             if project.state is not ProjectState.BUILDING:
                 raise ValueError("change validation project must be BUILDING")
             if milestone.state not in {
@@ -860,6 +945,25 @@ class ChangeValidationExecutor:
                     "COMMITTING milestone has no accepted evidence for current diff"
                 )
 
+            prior = connection.execute(
+                "SELECT id,decision,diff_hash FROM change_sets WHERE project_id=? AND milestone_id=? AND correlation_id=? ORDER BY rowid DESC LIMIT 1",
+                (str(job.project_id), str(job.milestone_id), job.correlation_id),
+            ).fetchone()
+            if (
+                prior is not None
+                and current is not None
+                and prior["diff_hash"] == current.canonical_hash
+                and prior["decision"] == ValidationDecision.REWORK_REQUIRED.value
+            ):
+                queue_validation_rework(
+                    connection, job, prior["id"], self.cycle_limit, occurred_at
+                )
+                return JobExecutionResult(
+                    JobExecutionDisposition.FAILED,
+                    error_id="change-validation-rework_required",
+                    failure_classification=FailureClassification.PERMANENT,
+                )
+
             change_set = service.validate(
                 job.project_id,
                 job.milestone_id,
@@ -891,6 +995,17 @@ class ChangeValidationExecutor:
                 self._advance(milestones, job, occurred_at)
                 return JobExecutionResult(JobExecutionDisposition.SUCCEEDED)
 
+            if change_set.decision is ValidationDecision.REWORK_REQUIRED:
+                queue_validation_rework(
+                    connection, job, change_set.id, self.cycle_limit, occurred_at
+                )
+            else:
+                block_implementation(
+                    connection,
+                    job,
+                    "Unsafe implementation validation; human intervention required",
+                    occurred_at,
+                )
             return JobExecutionResult(
                 JobExecutionDisposition.FAILED,
                 error_id=f"change-validation-{change_set.decision.value.casefold()}",

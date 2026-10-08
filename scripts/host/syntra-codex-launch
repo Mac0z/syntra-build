@@ -5,6 +5,7 @@ set -euo pipefail
 workspace_root=/var/lib/syntra-build/workspaces
 repository_root=/var/lib/syntra-build/repositories
 worker=syntra-codex
+runtime_check=/usr/local/libexec/check-codex-runtime
 
 validate_workspace() {
   local candidate project milestone
@@ -38,6 +39,10 @@ remove_worker_acl() {
     "$repository_root/$project" 2>/dev/null || true
 }
 
+if [[ $# -eq 2 && $1 == --check-runtime ]]; then
+  exec "$runtime_check" "$2"
+fi
+
 if [[ $# -eq 2 && $1 == --cleanup ]]; then
   workspace=$(validate_workspace "$2")
   exec 9>/run/lock/syntra-codex.lock
@@ -60,12 +65,14 @@ esac
   exit 66
 }
 
+"$runtime_check" "$executable"
+
 project=${workspace#"$workspace_root"/}
 project=${project%%/*}
 repository="$repository_root/$project/repo.git"
 [[ -d $repository ]] || { echo "managed repository is unavailable" >&2; exit 66; }
-home=$(getent passwd "$worker" | cut -d: -f6)
-[[ -n $home && -d $home ]] || { echo "worker home is unavailable" >&2; exit 66; }
+worker_home=$(getent passwd "$worker" | cut -d: -f6)
+[[ -n $worker_home && -d $worker_home ]] || { echo "worker home is unavailable" >&2; exit 66; }
 
 # One shared Unix identity cannot isolate two simultaneous ACL grants. Serialize
 # at this privilege boundary, reconcile stale access left by interruption, then
@@ -85,13 +92,22 @@ find "$workspace" -type d -exec setfacl -m "d:u:$worker:rwX" {} +
 setfacl -Rm "u:$worker:rX" "$repository"
 trap 'remove_worker_acl "$workspace"' EXIT
 
+# Prove effective OS access under the same identity before invoking Codex.
+# mktemp creates only one reversible probe in the granted worktree.
+/usr/bin/setpriv --reuid="$worker" --regid="$worker" --init-groups --no-new-privs \
+  /usr/bin/env -i PATH=/usr/bin:/bin \
+  /usr/local/libexec/check-codex-workspace "$workspace" "$repository"
+
 cd -- "$workspace"
 /usr/bin/prlimit --nproc=128 --nofile=1024 --fsize=104857600 \
   /usr/bin/setpriv --reuid="$worker" --regid="$worker" --init-groups --no-new-privs \
-  /usr/bin/env -i HOME="$home" USER="$worker" LOGNAME="$worker" \
-  XDG_CONFIG_HOME="$home/.config" PATH=/usr/local/bin:/usr/bin:/bin \
+  /usr/bin/env -i HOME="$worker_home" USER="$worker" LOGNAME="$worker" \
+  XDG_CONFIG_HOME="$worker_home/.config" PATH=/usr/local/bin:/usr/bin:/bin \
   LANG=C.UTF-8 LC_ALL=C.UTF-8 TMPDIR=/tmp \
-  GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 "$executable" exec - <&0 &
+  GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 "$executable" exec \
+  --ignore-user-config --sandbox workspace-write -c 'approval_policy="never"' \
+  --enable code_mode --enable code_mode_only --enable code_mode_host \
+  - <&0 &
 child=$!
 trap 'kill -TERM "$child" 2>/dev/null || true' TERM INT HUP
 wait "$child"
