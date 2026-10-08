@@ -36,6 +36,45 @@ project to `DESIGNING`; reconstructed feedback is included in the next draft req
 After restart, package, gate, exact document links, feedback, and approved hashes are read from
 SQLite. A notification failure therefore retries notification, not generation.
 
+## Production M32 notification handoff
+
+`SPECIFICATION_DRAFT` ends after the package transaction. The production lifecycle
+coordinator discovers each `DESIGN_APPROVAL` project's pending package/gate and
+queues a separate `DESIGN_APPROVAL_NOTIFY` job on the existing `MESSAGING` worker.
+The check-and-enqueue runs in a SQLite write transaction; active jobs deduplicate
+ticks, and a terminal failure for the same gate cannot reset its retry budget.
+This discovery also repairs packages stranded by the former missing M32 handoff,
+without manual database edits or another Architect request.
+
+The notification executor validates the exact project/package/gate binding and reads
+the destination from `project_creation_context`. Production composition supplies
+`TelegramGateNotifier` with that chat/thread and the existing durable notification
+repository. `HumanGateService.notify()` alone advances `PENDING -> NOTIFIED` after
+the send or persisted-binding reconciliation succeeds. The project remains in
+`DESIGN_APPROVAL`. A genuinely pending gate command reports that notification is
+still pending; it does not accept a response early or describe that gate as closed.
+
+Transport failures, rate limits, and server errors use the Scheduler's bounded,
+persisted notification-job backoff. Permanent/unknown errors and exhausted retries
+remain failed for operator investigation; no automatic fresh job resets the budget.
+Notification execution has no Architect/generation dependency. If a process exits
+after the binding is saved but before the gate transition, startup recovery restores
+the messaging job, and the M17 notifier reuses the same message without sending again.
+An unharvested specification job is reconciled from its exact audited package rather
+than replayed or treated as an ambiguous local worker.
+
+Structured events include `design_approval_notification_recovery`,
+`design_approval_notification_started`, `gate_notification_sent`,
+`gate_notification_reused`, `design_approval_gate_notified`, and
+`design_approval_notification_failed`, correlated by project/gate/job where applicable.
+They exclude document contents, feedback, provider descriptions and credentials.
+
+No migration or configuration change is required: the existing jobs, messaging worker,
+creation context, packages, gates and notification bindings store the entire handoff.
+This retains M17's existing transport limitation: a send whose message identity was
+never durably saved cannot be reconciled by Telegram history lookup. The guaranteed
+no-duplicate restart boundary is the persisted notification binding.
+
 ## M18 boundary and host acceptance
 
 M17 creates no GitHub repository and performs no Git, push, PR, CI, or merge operation. M18

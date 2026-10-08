@@ -118,11 +118,39 @@ class LifecycleCoordinator:
                     count += self._enqueue(
                         project_id, None, "REPOSITORY_PROVISION", WorkerClass.GITHUB
                     )
+            elif project["state"] == "DESIGN_APPROVAL":
+                with transaction_scope(self._db):
+                    count += self._design_notification(project_id)
             elif project["state"] == "READY":
                 count += self._materialise(project_id)
             elif project["state"] == "BUILDING":
                 count += self._building(project_id)
         return count
+
+    def _design_notification(self, project_id: ProjectId) -> int:
+        # Discover committed intent, including packages stranded before this route existed.
+        # A terminal failure must not reset the bounded notification retry budget each tick.
+        row = self._db.execute(
+            """SELECT g.id FROM design_packages d
+               JOIN human_gates g ON g.id=d.approval_gate_id AND g.project_id=d.project_id
+               WHERE d.project_id=? AND d.status='PENDING_APPROVAL'
+                 AND g.state='PENDING' AND g.gate_type='DESIGN_APPROVAL'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM jobs j WHERE j.project_id=d.project_id
+                       AND j.job_type='DESIGN_APPROVAL_NOTIFY' AND j.state='FAILED'
+                       AND json_extract(j.payload_json,'$.gate_id')=g.id)
+               ORDER BY d.created_at,d.id LIMIT 1""",
+            (str(project_id),),
+        ).fetchone()
+        if row is None:
+            return 0
+        return self._enqueue(
+            project_id,
+            None,
+            "DESIGN_APPROVAL_NOTIFY",
+            WorkerClass.MESSAGING,
+            {"gate_id": row["id"]},
+        )
 
     def _enqueue(
         self,

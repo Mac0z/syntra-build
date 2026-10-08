@@ -291,6 +291,11 @@ class HumanGateCommandHandler:
         try:
             gate_id = GateId.from_string(command.gate_reference)
             gate = self._gates.get(gate_id)
+            if gate.state is GateState.PENDING:
+                return (
+                    "Human gate notification is still pending; "
+                    "it cannot be answered yet."
+                )
             if gate.gate_type is GateType.DESIGN_APPROVAL and self._design_decisions:
                 if gate.state is not GateState.NOTIFIED:
                     raise ClosedGateError("gate is not answerable")

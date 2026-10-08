@@ -14,6 +14,8 @@ from syntra_build.adapters.architect import OpenAIArchitectProvider
 from syntra_build.adapters.github.actions import GitHubActionsAdapter
 from syntra_build.adapters.github.provisioning import GitHubProvisioningAdapter
 from syntra_build.adapters.github.pull_requests import GitHubPullRequestAdapter
+from syntra_build.adapters.telegram import TelegramClient, TelegramGateNotifier
+from syntra_build.adapters.telegram.gates import classify_notification_failure
 from syntra_build.application.architect import ArchitectDesignService, ArchitectProvider
 from syntra_build.application.architect_review import (
     ArchitectReviewService,
@@ -28,6 +30,9 @@ from syntra_build.application.ci_scheduler import (
 )
 from syntra_build.application.codex import BoundCodexRunner, WorkspaceBoundCodexRunner
 from syntra_build.application.design import ProjectDesignContextService
+from syntra_build.application.design_notifications import (
+    DesignApprovalNotificationExecutor,
+)
 from syntra_build.application.gatekeeper import Gatekeeper, GitHubMergeGateway
 from syntra_build.application.human_intervention import HumanInterventionService
 from syntra_build.application.lifecycle import JobTypeDispatcher, LifecycleCoordinator
@@ -54,6 +59,7 @@ from syntra_build.application.review_rework import ReviewReworkCodexExecutor
 from syntra_build.application.security import SecurityPolicy
 from syntra_build.application.specification import SpecificationDraftService
 from syntra_build.application.workspaces import WorkspaceService
+from syntra_build.domain import ProjectCreationContext
 from syntra_build.domain.jobs import WorkerClass
 from syntra_build.infrastructure.codex_runner import LocalCodexCliRunner
 from syntra_build.infrastructure.config.models import (
@@ -71,6 +77,7 @@ from syntra_build.infrastructure.persistence import (
     SQLiteProjectDecisionRepository,
     SQLiteProjectDocumentRepository,
     SQLiteProjectRepository,
+    SQLiteTelegramGateNotificationRepository,
 )
 from syntra_build.m22_smoke import trusted_git_from_host_config
 
@@ -89,6 +96,7 @@ PRODUCTION_JOB_TYPES: Mapping[WorkerClass, frozenset[str]] = {
     ),
     WorkerClass.GITHUB: frozenset({"REPOSITORY_PROVISION", "PR_CREATE", "PR_MERGE"}),
     WorkerClass.CI: frozenset({"CI_RECONCILE"}),
+    WorkerClass.MESSAGING: frozenset({"DESIGN_APPROVAL_NOTIFY"}),
 }
 
 
@@ -103,6 +111,7 @@ class ProductionDependencies:
     trusted_git: TrustedGit | None = None
     github_pull_requests: GitHubPullRequestGateway | None = None
     github_actions_factory: Callable[[], CIActionsGateway] | None = None
+    telegram_client_factory: Callable[[], TelegramClient] | None = None
 
 
 def _context(connection: sqlite3.Connection) -> ProjectDesignContextService:
@@ -189,6 +198,20 @@ def build_production_executors(
 
     def workspace(connection: sqlite3.Connection) -> WorkspaceService:
         return WorkspaceService(connection, trusted_git, data_root)
+
+    def design_notifier(
+        connection: sqlite3.Connection, context: ProjectCreationContext
+    ) -> TelegramGateNotifier:
+        if context.messaging_platform != "telegram":
+            raise ValueError("design approval requires persisted Telegram context")
+        return TelegramGateNotifier(
+            dependencies.telegram_client_factory()
+            if dependencies.telegram_client_factory is not None
+            else TelegramClient(config, metrics=recorder),
+            chat_id=int(context.conversation_id),
+            thread_id=int(context.thread_id) if context.thread_id is not None else None,
+            notifications=SQLiteTelegramGateNotificationRepository(connection),
+        )
 
     def runner(connection: sqlite3.Connection) -> WorkspaceBoundCodexRunner:
         if dependencies.codex_runner_factory is not None:
@@ -303,6 +326,15 @@ def build_production_executors(
         WorkerClass.GIT: git,
         WorkerClass.GITHUB: github,
         WorkerClass.CI: ci,
+        WorkerClass.MESSAGING: JobTypeDispatcher(
+            {
+                "DESIGN_APPROVAL_NOTIFY": DesignApprovalNotificationExecutor(
+                    database,
+                    design_notifier,
+                    failure_classifier=classify_notification_failure,
+                ).execute
+            }
+        ),
     }
     validate_production_executors(result)
     return result
