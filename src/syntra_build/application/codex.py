@@ -18,6 +18,10 @@ class CodexRunner(Protocol):
 class WorkspaceBoundCodexRunner(CodexRunner, Protocol):
     """Coding runner that can prove its released M19 workspace binding."""
 
+    def run(
+        self, request: CodexRunRequest, *, require_clean: bool = True
+    ) -> CodexRunResult: ...
+
     def validate_workspace(
         self, request: CodexRunRequest, *, require_clean: bool
     ) -> None: ...
@@ -43,8 +47,10 @@ class BoundCodexRunner:
         # inspect() also proves root containment, repository registration, remote,
         # branch and authoritative HEAD before any untrusted process is started.
 
-    def run(self, request: CodexRunRequest) -> CodexRunResult:
-        self.validate_workspace(request, require_clean=True)
+    def run(
+        self, request: CodexRunRequest, *, require_clean: bool = True
+    ) -> CodexRunResult:
+        self.validate_workspace(request, require_clean=require_clean)
         return self._provider.run(request)
 
     def cancel(self, job_id: str, attempt_number: int) -> bool:

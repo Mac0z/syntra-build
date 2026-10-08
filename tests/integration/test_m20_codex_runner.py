@@ -172,9 +172,16 @@ def test_host_helper_is_syntax_valid_and_declares_isolated_acl_plan() -> None:
     assert "flock 9" in source
     assert 'setfacl -Rm "u:$worker:rwX" "$workspace"' in source
     assert 'setfacl -Rm "u:$worker:rX" "$repository"' in source
-    assert '/usr/bin/env -i HOME="$home" USER="$worker"' in source
+    assert '/usr/bin/env -i HOME="$worker_home" USER="$worker"' in source
     assert "if [[ $# -ne 4 || $3 != exec || $4 != - ]]" in source
-    assert '"$executable" exec - <&0 &' in source
+    assert '"$executable" exec' in source
+    assert "--sandbox workspace-write" in source
+    assert 'approval_policy="never"' in source
+    assert "--ignore-user-config" in source
+    assert (
+        "--enable code_mode --enable code_mode_only --enable code_mode_host" in source
+    )
+    assert "- <&0 &" in source
 
 
 def test_async_helper_structure_preserves_parent_stdin_for_worker(

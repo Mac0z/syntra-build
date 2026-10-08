@@ -12,6 +12,10 @@ from typing import cast
 from uuid import uuid4
 
 from syntra_build.application.codex import WorkspaceBoundCodexRunner
+from syntra_build.application.implementation_policy import (
+    block_implementation,
+    codex_cycles,
+)
 from syntra_build.application.scheduler import (
     JobExecutionDisposition,
     JobExecutionResult,
@@ -130,11 +134,13 @@ class ReviewReworkCodexExecutor:
         runner_factory: Callable[[sqlite3.Connection], WorkspaceBoundCodexRunner],
         *,
         timeout_seconds: float,
+        cycle_limit: int = 5,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         connection_factory: Callable[[Path], sqlite3.Connection] = open_database,
     ) -> None:
         self.database_path, self.runner_factory = database_path, runner_factory
         self.timeout_seconds, self.clock = timeout_seconds, clock
+        self.cycle_limit = cycle_limit
         self.connection_factory = connection_factory
 
     def execute(self, job: Job) -> JobExecutionResult:
@@ -350,6 +356,18 @@ class ReviewReworkCodexExecutor:
             if milestone.state is not MilestoneState.CODING:
                 raise ReviewReworkTrustError(
                     "advanced milestone lacks durable Codex success"
+                )
+            if codex_cycles(connection, job) >= self.cycle_limit:
+                block_implementation(
+                    connection,
+                    job,
+                    "Rework attempts exhausted; human intervention required",
+                    self.clock(),
+                )
+                return JobExecutionResult(
+                    JobExecutionDisposition.FAILED,
+                    error_id="codex-cycle-limit",
+                    failure_classification=FailureClassification.PERMANENT,
                 )
             returned = runner.run(request)
             result = runs.completed_for_request(request)

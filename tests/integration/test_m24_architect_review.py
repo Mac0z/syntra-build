@@ -475,7 +475,9 @@ def test_durable_job_runs_through_scheduler_codex_boundary(tmp_path: Path) -> No
             clean_requirements.append(require_clean)
             assert request.worktree_path == workspace
 
-        def run(self, request: CodexRunRequest) -> CodexRunResult:
+        def run(
+            self, request: CodexRunRequest, *, require_clean: bool = True
+        ) -> CodexRunResult:
             requests.append(request)
             assert request.task["task_type"] == "REVIEW_REWORK"
             assert "github" not in request.task

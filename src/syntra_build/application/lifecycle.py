@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from typing import cast
 from uuid import uuid4
 
+from syntra_build.application.implementation_policy import block_implementation
 from syntra_build.domain import (
     Job,
     JobId,
@@ -160,6 +161,33 @@ class LifecycleCoordinator:
         worker: WorkerClass,
         payload: Mapping[str, str] | None = None,
     ) -> int:
+        # A state-entry identity scopes automatic work. Terminal jobs consume
+        # that entry's budget; only an authoritative transition opens a new one.
+        with transaction_scope(self._db):
+            return self._enqueue_locked(
+                project_id, milestone_id, job_type, worker, payload
+            )
+
+    def _enqueue_locked(
+        self,
+        project_id: ProjectId,
+        milestone_id: MilestoneId | None,
+        job_type: str,
+        worker: WorkerClass,
+        payload: Mapping[str, str] | None,
+    ) -> int:
+        if milestone_id and job_type in {"CODEX_RUN", "CHANGE_VALIDATE"}:
+            current = self._db.execute(
+                "SELECT m.state,p.state AS project_state FROM milestones m JOIN projects p ON p.id=m.project_id WHERE m.id=? AND m.project_id=?",
+                (str(milestone_id), str(project_id)),
+            ).fetchone()
+            expected = "CODING" if job_type == "CODEX_RUN" else "VALIDATING_CHANGES"
+            if (
+                current is None
+                or current["state"] != expected
+                or current["project_state"] != "BUILDING"
+            ):
+                return 0
         scope = "milestone_id=?" if milestone_id else "milestone_id IS NULL"
         parameters: list[object] = [str(project_id), job_type]
         if milestone_id:
@@ -170,6 +198,27 @@ class LifecycleCoordinator:
             (*parameters, *ACTIVE_JOB_STATES),
         ).fetchone():
             return 0
+        if milestone_id and job_type in {"CODEX_RUN", "CHANGE_VALIDATE"}:
+            entry = self._db.execute(
+                "SELECT id,created_at FROM state_transitions WHERE entity_type='MILESTONE' AND entity_id=? ORDER BY rowid DESC LIMIT 1",
+                (str(milestone_id),),
+            ).fetchone()
+            generation = entry["id"] if entry else str(milestone_id)
+            boundary = entry["created_at"] if entry else ""
+            terminal = self._db.execute(
+                f"SELECT id FROM jobs WHERE project_id=? AND job_type=? AND {scope} AND state IN ('FAILED','ABANDONED','CANCELLED','SUCCEEDED') AND (json_extract(payload_json,'$.lifecycle_generation')=? OR (json_extract(payload_json,'$.lifecycle_generation') IS NULL AND updated_at>=?)) ORDER BY rowid DESC LIMIT 1",
+                (*parameters, generation, boundary),
+            ).fetchone()
+            if terminal:
+                failed = self._jobs.get(JobId.from_string(terminal["id"]), project_id)
+                block_implementation(
+                    self._db,
+                    failed,
+                    "Terminal implementation job requires operator reconciliation; human intervention required",
+                    self._clock(),
+                )
+                return 0
+            payload = {**(payload or {}), "lifecycle_generation": generation}
         now, raw_id = self._clock(), self._ids()
         self._jobs.add(
             Job(
@@ -182,7 +231,7 @@ class LifecycleCoordinator:
                 now,
                 milestone_id,
                 correlation_id=raw_id,
-                max_attempts=3,
+                max_attempts=1 if job_type == "CODEX_RUN" else 3,
                 scheduled_at=now,
                 worker_class=worker,
                 payload=payload,
@@ -366,6 +415,15 @@ class LifecycleCoordinator:
 
     def _review_rework_owns_coding(self, milestone_id: str) -> bool:
         """Never reinterpret review-rework CODING provenance as initial work."""
+        entry = self._db.execute(
+            "SELECT actor_id FROM state_transitions WHERE entity_type='MILESTONE' AND entity_id=? AND new_state='CODING' ORDER BY rowid DESC LIMIT 1",
+            (milestone_id,),
+        ).fetchone()
+        if entry is not None and entry["actor_id"] in {
+            "implementation-policy",
+            "syntra-build-admin",
+        }:
+            return False
         return (
             self._db.execute(
                 """SELECT 1 FROM jobs WHERE milestone_id=?

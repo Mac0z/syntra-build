@@ -238,8 +238,20 @@ class SQLiteStatusService:
             pr = self._pr(pr_row) if pr_row else None
             ci = self._ci(pr_row["id"], pr) if pr_row and pr else None
             architect = self._architect(pr_row["id"], pr) if pr_row and pr else None
-            activity = self._activity(
-                project.state, jobs, actions, milestone, project.activity
+            blocker = (
+                self._one(
+                    "SELECT reason FROM state_transitions WHERE project_id=? AND new_state='BLOCKED' ORDER BY rowid DESC LIMIT 1",
+                    (str(project_id),),
+                )
+                if project.state is ProjectState.BLOCKED
+                else None
+            )
+            activity = (
+                blocker["reason"]
+                if blocker
+                else self._activity(
+                    project.state, jobs, actions, milestone, project.activity
+                )
             )
             latest_error = self._latest_error(jobs, str(project_id))
             return ProjectStatusProjection(
@@ -474,6 +486,10 @@ class SQLiteStatusService:
     ) -> str:
         if jobs:
             job = jobs[0]
+            if job.state in {"FAILED", "ABANDONED", "CANCELLED"}:
+                return "Human intervention required — " + (
+                    job.last_error_id or "terminal implementation failure"
+                )
             if job.worker_class == "CODEX":
                 return f"Codex {job.state.lower()} — {job.job_type}"
             return f"{job.worker_class.title()} {job.state.lower()} — {job.job_type}"
@@ -503,6 +519,8 @@ class SQLiteStatusService:
         milestone: MilestoneStatusProjection | None,
         ci: CIStatus | None,
     ) -> str:
+        if state is ProjectState.BLOCKED:
+            return "Resolve the recorded blocker before work can continue."
         if jobs:
             job = jobs[0]
             if job.state == "RETRY_WAIT":
@@ -528,8 +546,6 @@ class SQLiteStatusService:
             )
         if state is ProjectState.PAUSED:
             return "Resume the project to continue."
-        if state is ProjectState.BLOCKED:
-            return "Resolve the recorded blocker before work can continue."
         if state is ProjectState.FAILED:
             return "No recovery action is currently recorded."
         if state is ProjectState.COMPLETE:
