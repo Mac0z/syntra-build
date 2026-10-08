@@ -135,7 +135,7 @@ def queue_validation_rework(
     assert job.milestone_id is not None
     with transaction_scope(connection):
         if connection.execute(
-            "SELECT 1 FROM jobs WHERE project_id=? AND milestone_id=? AND job_type='CODEX_RUN' AND json_extract(payload_json,'$.validation_id')=?",
+            "SELECT 1 FROM jobs WHERE project_id=? AND milestone_id=? AND job_type IN ('CODEX_RUN','CODEX_REVIEW_REWORK') AND json_extract(payload_json,'$.validation_id')=?",
             (str(job.project_id), str(job.milestone_id), validation_id),
         ).fetchone():
             return
@@ -147,6 +147,50 @@ def queue_validation_rework(
                 now,
             )
             return
+        # Prefer the authoritative completion transition's producing job. This
+        # preserves the review task across validation correction, including replay.
+        producer = connection.execute(
+            """SELECT j.job_type,j.payload_json FROM state_transitions t
+               JOIN jobs j ON j.id=json_extract(t.metadata_json,'$.job_id')
+               WHERE t.entity_type='MILESTONE' AND t.entity_id=?
+                 AND t.new_state='VALIDATING_CHANGES' AND t.project_id=?
+                 AND t.rowid=(SELECT max(latest.rowid) FROM state_transitions latest
+                     WHERE latest.entity_type='MILESTONE' AND latest.entity_id=t.entity_id
+                     AND latest.new_state='VALIDATING_CHANGES')
+                 AND j.project_id=t.project_id AND j.milestone_id=t.entity_id
+               ORDER BY t.rowid DESC LIMIT 1""",
+            (str(job.milestone_id), str(job.project_id)),
+        ).fetchone()
+        if producer is None:
+            # Released legacy evidence has no transition job locator. Bind to
+            # the successful process for the validation's exact worktree.
+            producer = connection.execute(
+                """SELECT j.job_type,j.payload_json FROM codex_runs r
+                   JOIN jobs j ON j.id=r.job_id JOIN change_sets c ON c.id=?
+                   WHERE r.project_id=c.project_id AND r.milestone_id=c.milestone_id
+                     AND r.worktree_id=c.worktree_id AND r.process_status='SUCCEEDED'
+                     AND r.completed_at IS NOT NULL AND j.project_id=r.project_id
+                     AND j.milestone_id=r.milestone_id ORDER BY r.rowid DESC LIMIT 1""",
+                (validation_id,),
+            ).fetchone()
+        if producer is None or producer["job_type"] not in {
+            "CODEX_RUN",
+            "CODEX_REVIEW_REWORK",
+        }:
+            raise ValueError("validation rework has no authoritative coding provenance")
+        job_type = producer["job_type"]
+        payload = {"validation_id": validation_id}
+        if job_type == "CODEX_REVIEW_REWORK":
+            original = json.loads(producer["payload_json"])
+            fields = {"task_type", "review_id", "rework_task_id", "pull_request_id"}
+            if (
+                not fields.issubset(original)
+                or original["task_type"] != "REVIEW_REWORK"
+            ):
+                raise ValueError(
+                    "review rework provenance has an invalid task envelope"
+                )
+            payload.update({field: original[field] for field in fields})
         milestones = SQLiteMilestoneRepository(connection, lambda: str(uuid4()))
         milestones.apply_transition(
             MilestoneTransitionRequest(
@@ -165,7 +209,7 @@ def queue_validation_rework(
         queued = Job(
             JobId.generate(),
             job.project_id,
-            "CODEX_RUN",
+            job_type,
             JobState.QUEUED,
             0,
             now,
@@ -175,7 +219,7 @@ def queue_validation_rework(
             max_attempts=1,
             scheduled_at=now,
             worker_class=WorkerClass.CODEX,
-            payload={"validation_id": validation_id},
+            payload=payload,
         )
         SQLiteJobRepository(connection, lambda: str(uuid4())).add(queued)
         validation_feedback(

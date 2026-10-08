@@ -890,7 +890,7 @@ class ChangeValidationExecutor:
             )
             if milestone.state is MilestoneState.CODING:
                 handed_off = connection.execute(
-                    "SELECT c.id FROM change_sets c JOIN jobs j ON json_extract(j.payload_json,'$.validation_id')=c.id WHERE c.project_id=? AND c.milestone_id=? AND c.correlation_id=? AND c.decision='REWORK_REQUIRED' AND j.job_type='CODEX_RUN' AND j.project_id=c.project_id AND j.milestone_id=c.milestone_id",
+                    "SELECT c.id FROM change_sets c JOIN jobs j ON json_extract(j.payload_json,'$.validation_id')=c.id WHERE c.project_id=? AND c.milestone_id=? AND c.correlation_id=? AND c.decision='REWORK_REQUIRED' AND j.job_type IN ('CODEX_RUN','CODEX_REVIEW_REWORK') AND j.project_id=c.project_id AND j.milestone_id=c.milestone_id",
                     (str(job.project_id), str(job.milestone_id), job.correlation_id),
                 ).fetchone()
                 if handed_off is not None:

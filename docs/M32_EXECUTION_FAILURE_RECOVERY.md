@@ -28,12 +28,20 @@ Pi configuration or a verified compatible ARM64 tool-host release exists.
   collector observes the effective filesystem against the trusted HEAD, including
   untracked files and staged state. An empty result blocks the milestone and
   project, with `codex-empty-implementation`. Prose is never parsed as authority.
+- Architect review rework uses the same post-execution and replay identity and
+  effective-delta checks against the reviewed head. Empty output blocks with
+  `codex-empty-review-rework`; unchanged rejected output also blocks. Terminal
+  review jobs cannot be replaced with an original IMPLEMENT job.
 - Normal first implementation still requires a clean READY worktree. Durable
   successful replay permits existing uncommitted output and never discards it.
 - A correctable validation rejection transitions `VALIDATING_CHANGES -> CODING`
-  and atomically queues one `CODEX_RUN` bound to its immutable validation ID.
+  and atomically queues one correction bound to its immutable validation ID.
+  Initial implementation uses `CODEX_RUN`; Architect review corrections retain
+  `CODEX_REVIEW_REWORK`, the authoritative rework task and original findings,
+  and exact review/PR/head binding.
   Findings and remediation are reconstructed from durable evidence as prior-run
-  feedback alongside the accepted IMPLEMENT task and approved AGENTS. The
+  feedback alongside the authoritative implementation or review-rework task and
+  approved AGENTS. The
   original uncommitted work is retained. An unchanged rejected diff blocks rather
   than creating another identical validation/rework loop.
 - Identity/history/escape failures block for human intervention. Secret/protected

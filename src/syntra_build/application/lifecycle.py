@@ -388,6 +388,20 @@ class LifecycleCoordinator:
             if active["state"] == "CODING" and self._review_rework_owns_coding(
                 active["id"]
             ):
+                owner = self._db.execute(
+                    "SELECT id,state FROM jobs WHERE milestone_id=? AND job_type='CODEX_REVIEW_REWORK' ORDER BY rowid DESC LIMIT 1",
+                    (active["id"],),
+                ).fetchone()
+                if owner is not None and owner["state"] not in ACTIVE_JOB_STATES:
+                    blocked_job = self._jobs.get(
+                        JobId.from_string(owner["id"]), project_id
+                    )
+                    block_implementation(
+                        self._db,
+                        blocked_job,
+                        "Terminal Architect review rework requires human intervention",
+                        self._clock(),
+                    )
                 return 0
             return (
                 self._enqueue(project_id, MilestoneId.from_string(active["id"]), *job)
@@ -416,13 +430,22 @@ class LifecycleCoordinator:
     def _review_rework_owns_coding(self, milestone_id: str) -> bool:
         """Never reinterpret review-rework CODING provenance as initial work."""
         entry = self._db.execute(
-            "SELECT actor_id FROM state_transitions WHERE entity_type='MILESTONE' AND entity_id=? AND new_state='CODING' ORDER BY rowid DESC LIMIT 1",
+            "SELECT actor_id,metadata_json FROM state_transitions WHERE entity_type='MILESTONE' AND entity_id=? AND new_state='CODING' ORDER BY rowid DESC LIMIT 1",
             (milestone_id,),
         ).fetchone()
-        if entry is not None and entry["actor_id"] in {
-            "implementation-policy",
-            "syntra-build-admin",
-        }:
+        if entry is not None and entry["actor_id"] == "implementation-policy":
+            validation_id = json.loads(entry["metadata_json"] or "{}").get(
+                "validation_id"
+            )
+            return (
+                validation_id is not None
+                and self._db.execute(
+                    "SELECT 1 FROM jobs WHERE milestone_id=? AND job_type='CODEX_REVIEW_REWORK' AND json_extract(payload_json,'$.validation_id')=?",
+                    (milestone_id, validation_id),
+                ).fetchone()
+                is not None
+            )
+        if entry is not None and entry["actor_id"] == "syntra-build-admin":
             return False
         return (
             self._db.execute(
