@@ -16,6 +16,7 @@ from syntra_build.application.scheduler import (
     JobExecutionResult,
     Scheduler,
     WorkerCapacity,
+    WorkerExecutionError,
 )
 from syntra_build.domain import (
     Job,
@@ -366,12 +367,21 @@ def test_non_local_and_terminal_outcomes_release_capacity(
     connection.close()
 
 
-def test_worker_exception_is_durable_and_does_not_leak_slot(tmp_path: Path) -> None:
+def test_worker_exception_is_durable_and_does_not_leak_slot(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     connection, _, jobs, project_id = database(tmp_path / "worker-failure.db")
     job_id = add_job(jobs, project_id)
     capacity = capacities(codex_concurrency=1)
     scheduler = Scheduler(
-        jobs, capacity, {WorkerClass.CODEX: RaisingExecutor()}, clock=lambda: NOW
+        jobs,
+        capacity,
+        {
+            WorkerClass.CODEX: RaisingExecutor(
+                RuntimeError("raw-prompt-token-file-content")
+            )
+        },
+        clock=lambda: NOW,
     )
 
     scheduler.run_once()
@@ -379,9 +389,68 @@ def test_worker_exception_is_durable_and_does_not_leak_slot(tmp_path: Path) -> N
     result = scheduler.run_once()
 
     assert result.worker_start_failures == 1
+    assert len(result.errors) == 1
+    assert isinstance(result.errors[0], WorkerExecutionError)
+    assert result.errors[0].error_type == "RuntimeError"
+    assert result.errors[0].safe_category == FailureClassification.UNKNOWN.value
+    assert "raw-prompt-token-file-content" not in caplog.text
+    record = next(
+        r
+        for r in caplog.records
+        if getattr(r, "event", None) == "scheduler_worker_execution_failed"
+    )
+    assert record.metadata["error_type"] == "RuntimeError"  # type: ignore[attr-defined]
+    assert record.metadata["safe_category"] == "UNKNOWN"  # type: ignore[attr-defined]
+    assert record.exc_info is None
     assert jobs.get(job_id, project_id).state is JobState.FAILED
     assert len(jobs.attempts(job_id, project_id)) == 1
     assert capacity.available(WorkerClass.CODEX) == 1
+    scheduler.close()
+    connection.close()
+
+
+def test_caught_execution_exception_preserves_already_terminal_job(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    database_path = tmp_path / "terminal.db"
+    connection, _, jobs, project_id = database(database_path)
+    job_id = add_job(jobs, project_id)
+
+    class TerminalExecutor:
+        def execute(self, job: Job) -> JobExecutionResult:
+            with open_database(database_path) as worker_db:
+                SQLiteJobRepository(
+                    worker_db, lambda: "terminal-history"
+                ).apply_transition(
+                    JobTransitionRequest(
+                        job.id,
+                        job.project_id,
+                        JobState.RUNNING,
+                        JobState.SUCCEEDED,
+                        "terminal fixture",
+                        "SYSTEM",
+                        "fixture",
+                        job.correlation_id,
+                        NOW,
+                    )
+                )
+            raise PermissionError("raw-prompt-token-file-content")
+
+    scheduler = Scheduler(
+        jobs,
+        capacities(codex_concurrency=1),
+        {WorkerClass.CODEX: TerminalExecutor()},
+        clock=lambda: NOW,
+    )
+    scheduler.run_once()
+    scheduler.wait_for_wake(2)
+    result = scheduler.run_once()
+    assert isinstance(result.errors[0], WorkerExecutionError)
+    assert result.errors[0].error_type == "PermissionError"
+    assert result.errors[0].safe_category == "FILESYSTEM_ACCESS_DENIED"
+    assert jobs.get(job_id, project_id).state is JobState.SUCCEEDED
+    assert jobs.attempts(job_id, project_id)[0].state.value == "SUCCEEDED"
+    assert "raw-prompt-token-file-content" not in caplog.text
     scheduler.close()
     connection.close()
 

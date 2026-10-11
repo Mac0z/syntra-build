@@ -17,6 +17,7 @@ from syntra_build.application.scheduler.errors import (
     SchedulerCapacityExhaustedError,
     SchedulerDrainingError,
     SchedulerError,
+    WorkerExecutionError,
     WorkerStartError,
 )
 
@@ -35,6 +36,7 @@ __all__ = [
     "SchedulerError",
     "SchedulerLoop",
     "WorkerCapacity",
+    "WorkerExecutionError",
     "WorkerStartError",
     "is_implementation_work",
 ]

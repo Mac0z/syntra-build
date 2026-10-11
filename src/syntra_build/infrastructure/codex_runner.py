@@ -21,6 +21,7 @@ from syntra_build.domain.codex import (
     CodexRunRequest,
     CodexRunResult,
 )
+from syntra_build.domain.failures import PermanentFailure
 from syntra_build.infrastructure.persistence.codex import SQLiteCodexRunRepository
 
 _MAX_PROMPT_BYTES = 1_048_576
@@ -49,6 +50,9 @@ class SudoCodexLauncher:
     def cleanup_command(self, worktree: Path) -> Sequence[str]:
         return ("sudo", "-n", str(self.helper), "--cleanup", str(worktree))
 
+    def repair_handoff_command(self, worktree: Path) -> Sequence[str]:
+        return ("sudo", "-n", str(self.helper), "--repair-handoff", str(worktree))
+
 
 class DirectProcessLauncher:
     """Non-privileged test/development seam; never changes OS identity."""
@@ -60,6 +64,10 @@ class DirectProcessLauncher:
     def cleanup_command(self, worktree: Path) -> None:
         del worktree
         return None
+
+
+class CodexHandoffError(PermanentFailure):
+    """Process evidence is durable, but trusted handoff did not complete."""
 
 
 def sanitised_codex_environment(
@@ -140,6 +148,7 @@ class LocalCodexCliRunner:
         process: subprocess.Popen[bytes] | None = None
         status = CodexProcessStatus.FAILED
         exit_code: int | None = None
+        cleanup_returncode: int | None = None
         try:
             with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
                 stdout_path.chmod(0o600)
@@ -194,18 +203,19 @@ class LocalCodexCliRunner:
             cleanup = self._launcher.cleanup_command(request.worktree_path)
             if cleanup is not None:
                 try:
-                    subprocess.run(
+                    cleanup_result = subprocess.run(
                         cleanup,
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                         check=False,
-                        timeout=self._grace,
+                        timeout=max(60.0, self._grace),
                     )
+                    cleanup_returncode = cleanup_result.returncode
                 except OSError, subprocess.TimeoutExpired:
                     # A stale ACL is reconciled under the global helper lock on
                     # the next launch; M27 can also retry explicit cleanup.
-                    pass
+                    cleanup_returncode = 70
             with self._lock:
                 self._cancellations.pop(key, None)
         completed = datetime.now(UTC)
@@ -228,6 +238,8 @@ class LocalCodexCliRunner:
             self._safe_summary(status),
         )
         self._records.complete(run_id, result)
+        if cleanup_returncode not in {None, 0}:
+            raise CodexHandoffError("trusted filesystem handoff failed")
         return result
 
     def _authoritative_worktree(self, request: CodexRunRequest) -> str:

@@ -68,6 +68,10 @@ def parser() -> argparse.ArgumentParser:
     recovery = commands.add_parser("recover-empty-implementation")
     recovery.add_argument("project_id")
     recovery.add_argument("milestone_id")
+    handoff = commands.add_parser("recover-successful-implementation-handoff")
+    handoff.add_argument("project_id")
+    handoff.add_argument("milestone_id")
+    handoff.add_argument("failed_job_id")
     return result
 
 
@@ -114,6 +118,33 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(
                     f"job={recovered_job} project_remains_paused=true provider_invoked=false"
+                )
+                return 0
+            finally:
+                connection.close()
+        if args.command == "recover-successful-implementation-handoff":
+            from syntra_build.application.implementation_recovery import (
+                recover_successful_implementation_handoff,
+            )
+            from syntra_build.domain import JobId, MilestoneId, ProjectId
+            from syntra_build.infrastructure.codex_runner import SudoCodexLauncher
+            from syntra_build.infrastructure.git_workspace import TrustedGit
+            from syntra_build.infrastructure.persistence.connection import open_database
+
+            _open_observation_database(config.database.sqlite_path).close()
+            connection = open_database(config.database.sqlite_path)
+            try:
+                change_set = recover_successful_implementation_handoff(
+                    connection,
+                    TrustedGit(config.filesystem.data_root / "git-auth"),
+                    config.filesystem.data_root,
+                    ProjectId.from_string(args.project_id),
+                    MilestoneId.from_string(args.milestone_id),
+                    JobId.from_string(args.failed_job_id),
+                    repair_command=SudoCodexLauncher().repair_handoff_command,
+                )
+                print(
+                    f"change_set={change_set} project_remains_paused=true provider_invoked=false"
                 )
                 return 0
             finally:

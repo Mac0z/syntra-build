@@ -163,6 +163,13 @@ def test_production_launcher_has_exact_fixed_operation_and_cleanup_contract(
         "--cleanup",
         str(workspace),
     )
+    assert launcher.repair_handoff_command(workspace) == (
+        "sudo",
+        "-n",
+        str(helper),
+        "--repair-handoff",
+        str(workspace),
+    )
 
 
 def test_host_helper_is_syntax_valid_and_declares_isolated_acl_plan() -> None:
@@ -170,8 +177,19 @@ def test_host_helper_is_syntax_valid_and_declares_isolated_acl_plan() -> None:
     subprocess.run(["bash", "-n", helper], check=True)
     source = helper.read_text(encoding="utf-8")
     assert "flock 9" in source
-    assert 'setfacl -Rm "u:$worker:rwX" "$workspace"' in source
-    assert 'setfacl -Rm "u:$worker:rX" "$repository"' in source
+    assert '"$acl_helper" grant "$workspace"' in source
+    assert 'setfacl -P -Rm "u:$worker:rX" "$repository"' in source
+    assert "control_plane=syntra-build" in source
+    assert "repair_control_plane_handoff" in source
+    acl = Path("scripts/host/syntra-codex-acl.py").read_text()
+    assert "os.O_NOFOLLOW" in acl
+    assert "entries[self.MASK, None] = rights" in acl
+    assert 'ctypes.CDLL("libacl.so.1"' in acl
+    assert "self.lib.acl_set_fd(fd, handle)" in acl
+    assert "/usr/bin/setfacl" not in acl
+    assert "verify_source_links(fd, path, links)" in acl
+    assert 'name == ".git"' in acl
+    assert "--repair-handoff" in source
     assert '/usr/bin/env -i HOME="$worker_home" USER="$worker"' in source
     assert "if [[ $# -ne 4 || $3 != exec || $4 != - ]]" in source
     assert '"$executable" exec' in source
@@ -182,6 +200,46 @@ def test_host_helper_is_syntax_valid_and_declares_isolated_acl_plan() -> None:
         "--enable code_mode --enable code_mode_only --enable code_mode_host" in source
     )
     assert "- <&0 &" in source
+
+
+class FailingCleanupLauncher:
+    def __init__(self, cleanup: Path) -> None:
+        self.cleanup = cleanup
+
+    def command(self, executable: str, worktree: Path) -> tuple[str, ...]:
+        return tuple(DirectProcessLauncher().command(executable, worktree))
+
+    def cleanup_command(self, worktree: Path) -> tuple[str, ...]:
+        del worktree
+        return (str(self.cleanup),)
+
+
+def test_cleanup_handoff_failure_fails_closed_after_successful_process(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    command = executable(tmp_path, "printf changed > changed.txt\nexit 0\n")
+    cleanup = tmp_path / "failing-cleanup"
+    cleanup.write_text("#!/bin/sh\nexit 70\n", encoding="utf-8")
+    cleanup.chmod(0o755)
+    with database(tmp_path, workspace) as db:
+        from syntra_build.infrastructure.codex_runner import CodexHandoffError
+
+        process_runner = LocalCodexCliRunner(
+            db,
+            executable=str(command),
+            worker_identity="syntra-codex",
+            artifact_root=tmp_path / "artifacts",
+            launcher=FailingCleanupLauncher(cleanup),
+        )
+        with pytest.raises(
+            CodexHandoffError, match="trusted filesystem handoff failed"
+        ):
+            process_runner.run(request(workspace))
+        row = db.execute("SELECT process_status,exit_code FROM codex_runs").fetchone()
+    assert tuple(row) == ("SUCCEEDED", 0)
+    assert (workspace / "changed.txt").read_text() == "changed"
 
 
 def test_async_helper_structure_preserves_parent_stdin_for_worker(

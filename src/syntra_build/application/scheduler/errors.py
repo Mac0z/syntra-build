@@ -27,3 +27,18 @@ class SchedulerDrainingError(SchedulerError):
 
 class WorkerStartError(SchedulerError):
     """A claimed worker could not begin or complete local execution."""
+
+
+class WorkerExecutionError(SchedulerError):
+    """A worker raised after dispatch; details are limited to safe categories."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str,
+        safe_category: str,
+    ) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+        self.safe_category = safe_category
