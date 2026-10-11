@@ -25,12 +25,18 @@ command -v setfacl >/dev/null || {
   echo "install the Ubuntu 'acl' package before configuring the Codex worker" >&2
   exit 1
 }
+[[ -x /usr/bin/python3 ]] || {
+  echo "install the Ubuntu 'python3' package before configuring the Codex worker" >&2
+  exit 1
+}
 install -o root -g root -m 0755 scripts/host/check-codex-workspace.sh \
   /usr/local/libexec/check-codex-workspace
 install -o root -g root -m 0755 scripts/host/check-codex-runtime.sh \
   /usr/local/libexec/check-codex-runtime
 install -o root -g root -m 0755 scripts/host/syntra-codex-launch \
   /usr/local/libexec/syntra-codex-launch
+install -o root -g root -m 0755 scripts/host/syntra-codex-acl.py \
+  /usr/local/libexec/syntra-codex-acl.py
 install -d -o syntra-build -g syntra-build -m 0700 \
   /var/lib/syntra-build/workspaces
 cat >/etc/sudoers.d/syntra-codex-launch <<'EOF'

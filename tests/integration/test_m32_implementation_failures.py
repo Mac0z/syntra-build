@@ -160,7 +160,9 @@ def test_cycle_limit_blocks_without_resetting_historical_invocations(
     assert workspace.is_dir()
 
 
-def prepared_application(tmp_path: Path) -> tuple[Path, Path, TrustedGit]:
+def prepared_application(
+    tmp_path: Path, *, handoff_failure: str | None = None
+) -> tuple[Path, Path, TrustedGit]:
     from collections.abc import Mapping
     from typing import cast
 
@@ -185,18 +187,59 @@ def prepared_application(tmp_path: Path) -> tuple[Path, Path, TrustedGit]:
         WorkerCapacity,
     )
     from syntra_build.domain import WorkerClass
+    from syntra_build.domain.codex import CodexRunRequest
+
+    class HandoffProcess(FakeCodexProcess):
+        def validate_workspace(
+            self, request: CodexRunRequest, *, require_clean: bool
+        ) -> None:
+            if (
+                handoff_failure == "CODING"
+                and self.connection.execute(
+                    "SELECT 1 FROM codex_runs WHERE process_status='SUCCEEDED'"
+                ).fetchone()
+            ):
+                raise PermissionError("synthetic unreadable worker output")
+            super().validate_workspace(request, require_clean=require_clean)
 
     database, data, git = seed(tmp_path)
     dependencies = ProductionDependencies(
         architect_provider_factory=lambda: cast(ArchitectProvider, FakeArchitect()),
-        codex_runner_factory=lambda connection: FakeCodexProcess(connection, git, data),
+        codex_runner_factory=lambda connection: HandoffProcess(connection, git, data),
         trusted_git=git,
         github_pull_requests=FakeGitHub(),
         github_actions_factory=FakeActions,
     )
-    executors = build_production_executors(
-        config(tmp_path, database, data), dependencies=dependencies
+    executors: dict[WorkerClass, JobExecutor] = dict(
+        cast(
+            Mapping[WorkerClass, JobExecutor],
+            build_production_executors(
+                config(tmp_path, database, data), dependencies=dependencies
+            ),
+        )
     )
+    if handoff_failure == "VALIDATING_CHANGES":
+        from datetime import UTC, datetime
+
+        from syntra_build.application.implementation_policy import block_implementation
+        from syntra_build.application.scheduler import JobExecutionResult
+        from syntra_build.domain import Job
+
+        inner = executors[WorkerClass.CODEX]
+
+        class FailedCompletionExecutor:
+            def execute(self, job: Job) -> JobExecutionResult:
+                inner.execute(job)
+                with open_database(database) as connection:
+                    block_implementation(
+                        connection,
+                        job,
+                        "synthetic completion failure",
+                        datetime.now(UTC),
+                    )
+                raise PermissionError("synthetic post-completion handoff failure")
+
+        executors[WorkerClass.CODEX] = FailedCompletionExecutor()
     db = open_database(database)
     scheduler = Scheduler(
         SQLiteJobRepository(db, lambda: str(uuid4())),
@@ -206,9 +249,8 @@ def prepared_application(tmp_path: Path) -> tuple[Path, Path, TrustedGit]:
     )
     try:
         for _ in range(40):
-            if (
-                db.execute("SELECT state FROM milestones").fetchone()[0]
-                == "VALIDATING_CHANGES"
+            if db.execute("SELECT state FROM milestones").fetchone()[0] == (
+                "BLOCKED" if handoff_failure else "VALIDATING_CHANGES"
             ):
                 scheduler.enter_drain()
                 if scheduler.active_execution_count:

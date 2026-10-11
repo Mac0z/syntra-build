@@ -37,6 +37,10 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 
+[tool.ruff.per-file-target-version]
+# The root helper runs with Ubuntu's system Python, outside the application venv.
+"scripts/host/syntra-codex-acl.py" = "py310"
+
 [tool.mypy]
 python_version = "3.14"
 strict = true

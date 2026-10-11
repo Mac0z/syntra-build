@@ -24,6 +24,7 @@ from syntra_build.application.scheduler.errors import (
     ExecutorUnavailableError,
     SchedulerCapacityExhaustedError,
     SchedulerError,
+    WorkerExecutionError,
     WorkerStartError,
 )
 from syntra_build.domain.failures import (
@@ -414,15 +415,45 @@ class Scheduler:
                 self._log(active.job, outcome.target_state.value.casefold())
             except Exception as error:
                 failures += 1
-                errors.append(WorkerStartError("worker execution failed"))
+                classification = classify_failure(error)
+                safe_category = (
+                    "FILESYSTEM_ACCESS_DENIED"
+                    if isinstance(error, PermissionError)
+                    else classification.value
+                )
+                errors.append(
+                    WorkerExecutionError(
+                        "worker execution failed",
+                        error_type=type(error).__name__,
+                        safe_category=safe_category,
+                    )
+                )
+                _LOGGER.error(
+                    "Worker execution failed",
+                    extra={
+                        "event": "scheduler_worker_execution_failed",
+                        "project_id": str(active.job.project_id),
+                        "milestone_id": str(active.job.milestone_id)
+                        if active.job.milestone_id
+                        else None,
+                        "job_id": str(active.job.id),
+                        "correlation_id": active.job.correlation_id,
+                        "metadata": {
+                            "error_type": type(error).__name__,
+                            "safe_category": safe_category,
+                            "failure_classification": classification.value,
+                            "error_id": "scheduler-worker-execution-failure",
+                        },
+                    },
+                )
                 try:
                     self._persist_failure(
                         active.job,
-                        classify_failure(error),
+                        classification,
                         "scheduler-worker-execution-failure",
                     )
                 except PersistenceError:
-                    _LOGGER.exception(
+                    _LOGGER.error(
                         "Worker failure could not be persisted",
                         extra={"event": "scheduler_worker_persistence_failed"},
                     )

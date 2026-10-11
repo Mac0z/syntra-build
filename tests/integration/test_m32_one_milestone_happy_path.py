@@ -186,18 +186,22 @@ class FakeCodexProcess:
         self, request: CodexRunRequest, *, require_clean: bool = True
     ) -> CodexRunResult:
         runs = SQLiteCodexRunRepository(self.connection)
+        run_id = str(uuid4())
         runs.start(
-            str(uuid4()),
+            run_id,
             request,
             self.connection.execute(
                 "SELECT id FROM git_workspaces WHERE milestone_id=?",
                 (str(request.milestone_id),),
             ).fetchone()[0],
-            "f" * 64,
+            hashlib.sha256(
+                json.dumps(request.task, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
             NOW,
             "fake-stdout",
             "fake-stderr",
         )
+        runs.record_process(run_id, os.getpid(), "syntra-codex")
         (request.worktree_path / "generated.py").write_text("answer = 42\n")
         result = CodexRunResult(
             request.interface_version,
@@ -209,7 +213,7 @@ class FakeCodexProcess:
             CodexProcessStatus.SUCCEEDED,
             NOW,
             NOW,
-            "fake-codex-process",
+            "syntra-codex",
             request.timeout_seconds,
             exit_code=0,
         )

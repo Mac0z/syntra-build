@@ -25,6 +25,12 @@ jobs:
       - name: Run unit tests
         run: python -m pytest
 
+      - name: Verify Linux worker filesystem handoff as separate users
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y acl
+          sudo "$(command -v python)" -m pytest tests/integration/test_codex_filesystem_handoff.py -q
+
       - name: Validate host shell syntax
         run: |
           bash -n scripts/host/*.sh

@@ -1,4 +1,123 @@
-# M32 empty implementation and terminal scheduling repair
+# M32 implementation execution and handoff recovery
+
+## Successful process with unreadable generated files
+
+Confirmed incident: project `b1fde722-ecd7-46a6-91c2-f0f6e69d193a`, milestone
+`c7c688c3-4844-4def-982f-017483ff5b12`, failed job
+`afb29226-032d-4d1d-b884-953cfed5bbb0`. The durable Codex process succeeded with
+exit zero, but worker-owned `0700` directories and `0600` files were inaccessible
+to `syntra-build`. The scheduler exception blocked implementation completion.
+This is a filesystem handoff failure with existing code, not empty output.
+
+The launcher now repairs existing source ACLs and their masks explicitly, checks
+effective access as `syntra-build`, and then removes temporary worker grants.
+Repair runs on success, nonzero exit, signals, explicit cleanup, and stale-grant
+reconciliation before another launch. The global isolation lock covers every
+operation. A failed repair or revocation exits 70 and prevents a new launch.
+SIGKILL cannot run a trap; explicit cleanup or the next launch reconciles it.
+Root operations use `O_NOFOLLOW` directory/file descriptors and reject escaping
+symlinks, hard links and unexpected filesystems. Source content and ownership are
+preserved. `.git` is excluded from source repair; protected repository metadata
+gets only temporary worker read access. Worker access to the control plane is
+not expanded. The Code Mode profile and runtime attestation remain required.
+
+A service-side cleanup failure raises `CodexHandoffError` after recording the
+original process result. It does not replace a durable success with failure or
+ignore an incomplete handoff. Scheduler exception events include `error_type`,
+`safe_category`, job/project/milestone/correlation identifiers and the fixed
+error ID. They omit exception messages, tracebacks, prompts and file contents.
+
+### Operator deployment and recovery procedure
+
+Perform these steps only after this PR has been reviewed and separately approved
+for deployment. No step below has been executed against the live project.
+
+1. Leave the incident project `BLOCKED`. Drain and stop the service using the
+   existing maintenance procedure (`sudo systemctl stop syntra-build`); confirm
+   no worker remains. Reconcile stale active jobs with the supported M27 route
+   before recovery. Do not edit SQLite, delete history, reset counters, or use
+   `recover-empty-implementation` for this incident.
+2. As the service identity, run `syntra-build-admin backup --reason pre-upgrade`,
+   note its returned path, then `syntra-build-admin restore-verify <backup-path>`.
+   Preserve a root-readable copy of the worktree and protected run artifacts.
+   Record the exact source revision, failed job, run/worktree IDs and Git HEAD /
+   branch from the operator's existing protected incident evidence.
+3. Deploy the reviewed exact source SHA through
+   `scripts/host/upgrade.sh <reviewed-40-character-sha>` as the service user from
+   that checkout. Deploy the host helpers separately, as root from the same
+   checkout: `scripts/host/setup-codex-worker.sh`. This installs both
+   `syntra-codex-launch` and `syntra-codex-acl.py`, root owned and mode 0755.
+   Require Ubuntu's `acl` and `python3` packages. Do not run a paid Codex smoke
+   invocation against the incident. Existing runtime/tool-host compatibility
+   attestation and worker isolation requirements still apply.
+4. With the service stopped, explicitly run as `syntra-build` (using the deployed
+   venv's CLI and existing config):
+
+   ```sh
+   syntra-build-admin recover-successful-implementation-handoff \
+     b1fde722-ecd7-46a6-91c2-f0f6e69d193a \
+     c7c688c3-4844-4def-982f-017483ff5b12 \
+     afb29226-032d-4d1d-b884-953cfed5bbb0
+   ```
+
+   The command requires the failed scheduler job/attempt, exactly matching
+   successful run, approved IMPLEMENT task and documents, exact managed
+   worktree, and the correlated persisted blockers. Supported milestone resume
+   states are `CODING` and `VALIDATING_CHANGES`; the project must have blocked
+   from `BUILDING`. Active jobs and unresolved security blockers are rejected.
+   The root launcher performs `--repair-handoff` under its isolation lock.
+   Trusted Git registration, common repository, remote, HEAD and branch and
+   non-empty effective changes are verified after repair. Normal M21 validation
+   must accept the current diff. Findings are retained on rejection; no correction
+   invocation is scheduled by this command.
+5. Confirm the command reports
+   `change_set=<id> project_remains_paused=true provider_invoked=false`. Inspect
+   `syntra-build-admin status b1fde722-ecd7-46a6-91c2-f0f6e69d193a`: project must
+   be `PAUSED` with resume state `BUILDING`, milestone `COMMITTING`. The transition
+   history binds the failed job, successful run, worktree, accepted change set and
+   exact diff. Process evidence, failed attempts and retry/cycle counts remain
+   unchanged. No job, Codex invocation, implementation regeneration, commit,
+   push, PR or merge is performed by recovery.
+6. Repeating the same command before resume rechecks live identity/access and
+   returns the same accepted change set. A changed diff or conflicting state
+   fails closed. A crash before the atomic transition leaves the project blocked;
+   repeating recovery reuses matching persisted validation. Restarting the
+   service leaves this recovered project paused. Only a **later, explicit owner
+   resume through the existing authorised project command** permits lifecycle
+   scheduling of one trusted commit continuation. Do not resume as part of this
+   deployment or recovery procedure.
+
+For permission/validation rejection, preserve the output and fix the diagnosed
+host or security issue through its supported procedure. Do not widen permissions
+outside the worktree or force workflow state to make recovery pass.
+
+### Regression verification
+
+Run the full credential-free suite and required static checks:
+
+```sh
+python -m pytest -q
+python -m ruff check .
+python -m ruff format --check .
+python -m mypy
+bash -n scripts/host/syntra-codex-launch
+bash -n scripts/host/setup-codex-worker.sh
+```
+
+On a disposable Linux root host with `acl`, `python3`, `setpriv`, and pytest:
+
+```sh
+python -m pytest tests/integration/test_codex_filesystem_handoff.py -q
+```
+
+That suite executes the actual launcher and descriptor-based helper with real
+separate users, restrictive worker-created source, effective read/traverse
+checks, nonzero exits, SIGTERM/SIGKILL, repeated cleanup, masked ACLs, protected
+Git metadata, escaping `.git`/source symlinks, hard links and injected ACL failure.
+Ordinary non-root runs skip these tests; CI runs them explicitly as root.
+`test_m32_handoff_recovery.py` covers recovery rejection, history/budget
+preservation, interrupted atomic transitions, idempotent validation, 3,000 paused
+ticks, restart, and exactly one continuation after fixture-only explicit resume.
 
 ## Confirmed causes and limits of the evidence
 

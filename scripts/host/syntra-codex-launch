@@ -5,7 +5,9 @@ set -euo pipefail
 workspace_root=/var/lib/syntra-build/workspaces
 repository_root=/var/lib/syntra-build/repositories
 worker=syntra-codex
+control_plane=syntra-build
 runtime_check=/usr/local/libexec/check-codex-runtime
+acl_helper=/usr/local/libexec/syntra-codex-acl.py
 
 validate_workspace() {
   local candidate project milestone
@@ -29,25 +31,44 @@ validate_workspace() {
 
 remove_worker_acl() {
   local candidate=$1 project=${1#"$workspace_root"/}
+  local rc=0
   project=${project%%/*}
-  setfacl -R -x "u:$worker" "$candidate" 2>/dev/null || true
-  find "$candidate" -type d -exec setfacl -x "d:u:$worker" {} + 2>/dev/null || true
+  /usr/bin/python3 -I "$acl_helper" revoke "$candidate" || rc=70
   if [[ -d $repository_root/$project/repo.git ]]; then
-    setfacl -R -x "u:$worker" "$repository_root/$project/repo.git" 2>/dev/null || true
+    setfacl -P -R -x "u:$worker" "$repository_root/$project/repo.git" 2>/dev/null || rc=70
   fi
   setfacl -x "u:$worker" "$workspace_root/$project" \
-    "$repository_root/$project" 2>/dev/null || true
+    "$repository_root/$project" 2>/dev/null || rc=70
+  return "$rc"
+}
+
+repair_control_plane_handoff() {
+  /usr/bin/python3 -I "$acl_helper" handoff "$1"
+}
+
+finish() {
+  local rc=$? handoff_rc=0 cleanup_rc=0
+  trap - EXIT
+  set +e
+  repair_control_plane_handoff "$workspace" || handoff_rc=70
+  # Revoke even when repair fails. The parent traversal grant is removed last.
+  remove_worker_acl "$workspace" || cleanup_rc=70
+  if [[ $handoff_rc -ne 0 || $cleanup_rc -ne 0 ]]; then
+    echo "trusted filesystem handoff or isolation cleanup failed" >&2
+    exit 70
+  fi
+  exit "$rc"
 }
 
 if [[ $# -eq 2 && $1 == --check-runtime ]]; then
   exec "$runtime_check" "$2"
 fi
 
-if [[ $# -eq 2 && $1 == --cleanup ]]; then
+if [[ $# -eq 2 && ( $1 == --cleanup || $1 == --repair-handoff ) ]]; then
   workspace=$(validate_workspace "$2")
   exec 9>/run/lock/syntra-codex.lock
   flock 9
-  remove_worker_acl "$workspace"
+  trap finish EXIT
   exit 0
 fi
 
@@ -79,18 +100,30 @@ worker_home=$(getent passwd "$worker" | cut -d: -f6)
 # grant only this persisted workspace and its project-specific Git metadata.
 exec 9>/run/lock/syntra-codex.lock
 flock 9
-find "$workspace_root" -mindepth 2 -maxdepth 2 -type d \
-  -exec setfacl -R -x "u:$worker" {} + 2>/dev/null || true
-find "$workspace_root" -mindepth 2 -type d \
-  -exec setfacl -x "d:u:$worker" {} + 2>/dev/null || true
-find "$repository_root" -mindepth 2 -maxdepth 2 -type d \
-  -exec setfacl -R -x "u:$worker" {} + 2>/dev/null || true
+trap finish EXIT
+# Close every project traversal grant, including orphaned repositories whose
+# worktree was removed. No worker may inherit another project's stale access.
+find -P "$workspace_root" "$repository_root" -mindepth 1 -maxdepth 1 -type d \
+  -exec setfacl -x "u:$worker" {} +
+# Repair interrupted work before removing stale grants; valuable output must
+# survive normal cleanup. No new worker is started if any handoff fails.
+stale_workspaces=$(find -P "$workspace_root" -mindepth 2 -maxdepth 2 -type d -print)
+while IFS= read -r stale; do
+  [[ -n $stale ]] || continue
+  workspace=$(validate_workspace "$stale")
+  trap finish EXIT
+  repair_control_plane_handoff "$workspace"
+  remove_worker_acl "$workspace"
+  trap - EXIT
+done <<< "$stale_workspaces"
+workspace=$(validate_workspace "$1")
+trap finish EXIT
+find -P "$repository_root" -mindepth 2 -maxdepth 2 -type d \
+  -exec setfacl -P -R -x "u:$worker" {} +
 setfacl -m "u:$worker:x" /var/lib/syntra-build "$workspace_root" \
   "$workspace_root/$project" "$repository_root" "$repository_root/$project"
-setfacl -Rm "u:$worker:rwX" "$workspace"
-find "$workspace" -type d -exec setfacl -m "d:u:$worker:rwX" {} +
-setfacl -Rm "u:$worker:rX" "$repository"
-trap 'remove_worker_acl "$workspace"' EXIT
+/usr/bin/python3 -I "$acl_helper" grant "$workspace"
+setfacl -P -Rm "u:$worker:rX" "$repository"
 
 # Prove effective OS access under the same identity before invoking Codex.
 # mktemp creates only one reversible probe in the granted worktree.
@@ -109,5 +142,11 @@ cd -- "$workspace"
   --enable code_mode --enable code_mode_only --enable code_mode_host \
   - <&0 &
 child=$!
-trap 'kill -TERM "$child" 2>/dev/null || true' TERM INT HUP
+stop_child() {
+  trap '' TERM INT HUP
+  kill -TERM "$child" 2>/dev/null || true
+  wait "$child" 2>/dev/null || true
+  exit 143
+}
+trap stop_child TERM INT HUP
 wait "$child"
