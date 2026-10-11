@@ -387,7 +387,9 @@ class ProductionDueWorkCoordinator:
         rows = self.connection.execute(
             """SELECT m.project_id,m.id,p.id AS pull_request_id,p.head_sha
                FROM milestones m JOIN pull_requests p ON p.id=m.active_pull_request_id
-               WHERE m.state='CI_RUNNING' AND p.state='OPEN' ORDER BY m.id"""
+               JOIN projects project ON project.id=m.project_id
+               WHERE project.state='BUILDING' AND m.state='CI_RUNNING'
+                 AND p.state='OPEN' ORDER BY m.id"""
         ).fetchall()
         for row in rows:
             from syntra_build.domain.identifiers import MilestoneId, ProjectId

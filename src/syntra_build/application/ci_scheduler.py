@@ -104,7 +104,9 @@ class CIJobCoordinator:
             """SELECT r.project_id,r.milestone_id
             FROM ci_runs r JOIN milestones m ON m.id=r.milestone_id
             JOIN pull_requests p ON p.id=r.pull_request_id
-            WHERE m.state='CI_RUNNING' AND r.next_check_at IS NOT NULL
+            JOIN projects project ON project.id=m.project_id
+            WHERE project.state='BUILDING' AND m.state='CI_RUNNING'
+              AND r.next_check_at IS NOT NULL
               AND m.active_pull_request_id=p.id AND p.state='OPEN'
               AND r.head_sha=p.head_sha
               AND r.next_check_at<=?
