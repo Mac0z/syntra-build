@@ -300,6 +300,26 @@ def test_repair_failure_and_changed_idempotent_diff_leave_project_non_dispatchin
         )
 
 
+def test_idempotent_recovery_uses_its_bound_validation_record(tmp_path: Path) -> None:
+    database, data, git, job = blocked_application(tmp_path)
+    with open_database(database) as db:
+        accepted = recover(db, git, data, job)
+        # Another interrupted operator can append equivalent validation evidence.
+        row = dict(
+            db.execute("SELECT * FROM change_sets WHERE id=?", (accepted,)).fetchone()
+        )
+        row["id"] = str(uuid4())
+        columns = ",".join(row)
+        placeholders = ",".join("?" for _ in row)
+        db.execute(
+            f"INSERT INTO change_sets ({columns}) VALUES ({placeholders})",
+            tuple(row.values()),
+        )
+        assert recover(db, git, data, job) == accepted
+        assert LifecycleCoordinator(db).enqueue_due() == 0
+        assert db.execute("SELECT count(*) FROM codex_runs").fetchone()[0] == 1
+
+
 def test_interrupted_transition_reuses_validation_without_partial_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

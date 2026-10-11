@@ -324,26 +324,37 @@ def recover_successful_implementation_handoff(
         or not live.collected.files
     ):
         raise ValueError("recovery requires identity-verified effective source changes")
-    accepted = connection.execute(
-        """SELECT id FROM change_sets
+
+    diff_hash = live.collected.canonical_hash
+
+    def accepted_record(record_id: str | None = None) -> sqlite3.Row | None:
+        row: sqlite3.Row | None = connection.execute(
+            """SELECT id FROM change_sets
            WHERE project_id=? AND milestone_id=? AND worktree_id=?
              AND branch_name=? AND base_sha=? AND head_sha_before_commit=?
              AND diff_hash=? AND decision='ACCEPT' AND is_empty=0
              AND correlation_id=? AND scanner_version=? AND policy_version=?
+             AND (? IS NULL OR id=?)
            ORDER BY rowid DESC LIMIT 1""",
-        (
-            str(project_id),
-            str(milestone_id),
-            run["worktree_id"],
-            live.workspace.branch_name,
-            live.workspace.base_sha,
-            live.trusted_head,
-            live.collected.canonical_hash,
-            correlation,
-            service.scanner.version,
-            service.protected_paths.version,
-        ),
-    ).fetchone()
+            (
+                str(project_id),
+                str(milestone_id),
+                run["worktree_id"],
+                live.workspace.branch_name,
+                live.workspace.base_sha,
+                live.trusted_head,
+                diff_hash,
+                correlation,
+                service.scanner.version,
+                service.protected_paths.version,
+                record_id,
+                record_id,
+            ),
+        ).fetchone()
+
+        return row
+
+    accepted = accepted_record(completed_id)
     if completed_id is not None:
         if accepted is None or accepted["id"] != completed_id:
             raise ValueError(
@@ -365,10 +376,6 @@ def recover_successful_implementation_handoff(
         current_run, already_completed = guarded_evidence()
         if current_run["id"] != run["id"]:
             raise ValueError("run identity changed during recovery")
-        if already_completed is not None:
-            if already_completed != change_set_id:
-                raise ValueError("conflicting recovery evidence")
-            return already_completed
         current = service.replay_evidence(project_id, milestone_id)
         if (
             current is None
@@ -379,6 +386,10 @@ def recover_successful_implementation_handoff(
             raise ValueError(
                 "worktree identity or effective diff changed during recovery"
             )
+        if already_completed is not None:
+            if accepted_record(already_completed) is None:
+                raise ValueError("conflicting recovery evidence")
+            return already_completed
         metadata = {
             "operator_recovery": "successful-implementation-handoff",
             "job_id": str(failed_job_id),
