@@ -8,6 +8,7 @@ from uuid import UUID
 
 import pytest
 
+from syntra_build.application.ci_profiles import select_ci_profile
 from syntra_build.application.provisioning import (
     AmbiguousGitHubResult,
     AmbiguousPushResult,
@@ -17,7 +18,13 @@ from syntra_build.application.provisioning import (
     RepositoryProvisioningService,
 )
 from syntra_build.application.security import SecurityPolicy
-from syntra_build.domain import ProjectId, ProjectState, RepositoryVisibility
+from syntra_build.domain import (
+    ProjectDocumentId,
+    ProjectId,
+    ProjectState,
+    RepositoryVisibility,
+)
+from syntra_build.domain.provisioning import RepositoryCIIntent
 from syntra_build.domain.security import (
     SecurityActorType,
     SecurityEventType,
@@ -38,8 +45,16 @@ AGENTS_ID = "00000000-0000-0000-0000-000000000003"
 PACKAGE_ID = "00000000-0000-0000-0000-000000000004"
 GATE_ID = "00000000-0000-0000-0000-000000000005"
 SHA = "a" * 40
-SPEC = "# Approved specification\n"
+SPEC = (
+    "# Approved specification\n\n"
+    '```syntra-ci\nprofile = "python-pytest-v1"\npython-version = "3.12"\n```\n'
+)
 AGENTS = "# Approved agent rules\n"
+BASELINE_FILES = {
+    "SPEC.md": SPEC.encode(),
+    "AGENTS.md": AGENTS.encode(),
+    **select_ci_profile(SPEC).workflow_files(),
+}
 
 
 def _hash(content: str) -> str:
@@ -271,7 +286,7 @@ def test_successfully_provisions_and_independently_verifies_baseline(
     assert project.state is ProjectState.READY
     assert github.create_calls == git.push_calls == 1
     assert git.remote_url == "https://github.com/Mac0z/my-cool-app.git"
-    assert git.files == {"SPEC.md": SPEC.encode(), "AGENTS.md": AGENTS.encode()}
+    assert git.files == dict(BASELINE_FILES)
     assert repository is not None
     assert repository.external_repository_id == 123
     assert repository.visibility is visibility
@@ -417,6 +432,7 @@ def test_restart_reconciles_persisted_ambiguous_create(
     intent = records.ensure_intent(
         PID, "Mac0z", "my-cool-app", RepositoryVisibility.PUBLIC, NOW
     )
+    _save_ci_intent(records, intent.id)
     records.mark_ambiguous(intent.id, NOW)
     database.commit()
     service, github, _ = _service(database)
@@ -479,6 +495,7 @@ def test_persisted_identity_mismatch_fails_closed(
     intent = records.ensure_intent(
         PID, "Mac0z", "my-cool-app", RepositoryVisibility.PUBLIC, NOW
     )
+    _save_ci_intent(records, intent.id)
     records.identify(intent.id, 123, "main", NOW)
     database.commit()
     service, github, git = _service(database)
@@ -490,6 +507,30 @@ def test_persisted_identity_mismatch_fails_closed(
         ProvisioningFailure.VISIBILITY_MISMATCH,
     }
     assert git.push_calls == 0
+
+
+def _save_ci_intent(records: SQLiteProvisioningRepository, repository_id: str) -> None:
+    profile = select_ci_profile(SPEC)
+    workflow = profile.workflow_content()
+    records.save_ci_intent(
+        RepositoryCIIntent(
+            project_id=PID,
+            github_repository_id=repository_id,
+            spec_document_id=ProjectDocumentId.from_string(SPEC_ID),
+            spec_revision=1,
+            spec_content_hash=_hash(SPEC),
+            agents_document_id=ProjectDocumentId.from_string(AGENTS_ID),
+            agents_revision=1,
+            agents_content_hash=_hash(AGENTS),
+            profile_id=profile.profile_id,
+            python_version=profile.python_version,
+            workflow_path=".github/workflows/ci.yml",
+            workflow_content=workflow.decode(),
+            workflow_content_hash=_hash(workflow.decode()),
+            default_branch="main",
+            created_at=NOW,
+        )
+    )
 
 
 def _identified_with_baseline(
@@ -508,6 +549,7 @@ def _identified_with_baseline(
     intent = records.ensure_intent(
         PID, "Mac0z", "my-cool-app", RepositoryVisibility.PUBLIC, NOW
     )
+    _save_ci_intent(records, intent.id)
     records.identify(intent.id, 123, "main", NOW)
     database.commit()
     return service, github, git
@@ -518,7 +560,7 @@ def test_existing_expected_remote_main_is_not_rewritten(
 ) -> None:
     service, github, git = _identified_with_baseline(database)
     github.main = SHA
-    github.contents = {"SPEC.md": SPEC.encode(), "AGENTS.md": AGENTS.encode()}
+    github.contents = dict(BASELINE_FILES)
     service.provision(PID, NOW, "correlation")
     assert git.push_calls == 0
 
@@ -537,7 +579,7 @@ def test_retry_reuses_attributed_empty_repository_and_pushes_baseline(
     assert github.create_calls == 0
     assert git.commit_calls == 1
     assert git.push_calls == 1
-    assert git.files == {"SPEC.md": SPEC.encode(), "AGENTS.md": AGENTS.encode()}
+    assert git.files == dict(BASELINE_FILES)
     assert github.main == SHA
     assert github.contents == git.files
     assert repository is not None
@@ -614,13 +656,13 @@ def test_unexpected_or_unconfirmed_remote_sha_blocks_ready(
             ProvisioningFailure.DOCUMENT_MISMATCH,
         ),
         (
-            {"SPEC.md": SPEC.encode(), "AGENTS.md": AGENTS.encode()},
+            dict(BASELINE_FILES),
             "master",
             False,
             ProvisioningFailure.REMOTE_MISMATCH,
         ),
         (
-            {"SPEC.md": SPEC.encode(), "AGENTS.md": AGENTS.encode()},
+            dict(BASELINE_FILES),
             "main",
             True,
             ProvisioningFailure.IDENTITY_MISMATCH,
@@ -802,3 +844,211 @@ def test_security_condition_appearing_after_discovery_blocks_create(
         observed_github.configure_calls,
         git.push_calls,
     ) == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "spec_content",
+    [
+        "# Python project without an approved CI profile\n",
+        SPEC.replace("python-pytest-v1", "node-test-v1"),
+        SPEC.replace("3.12", "3.11"),
+        SPEC + "\n" + SPEC,
+    ],
+)
+def test_missing_or_unsupported_profile_has_no_repository_side_effects(
+    tmp_path: Path, spec_content: str
+) -> None:
+    with open_database(tmp_path / "unsupported.db") as database:
+        apply_migrations(database)
+        _approved_project(database, spec_content=spec_content)
+        service, github, git = _service(database)
+        with pytest.raises(ProvisioningError) as error:
+            service.provision(PID, NOW, "unsupported-profile")
+        assert error.value.failure is ProvisioningFailure.CI_PROFILE_REQUIRED
+        assert "approved CI profile" in str(error.value)
+        assert github.lookup_calls == github.create_calls == github.configure_calls == 0
+        assert git.commit_calls == git.push_calls == 0
+        assert SQLiteProvisioningRepository(database).for_project(PID) is None
+
+
+def test_legacy_baseline_requires_explicit_recovery_without_rewrite(
+    database: sqlite3.Connection,
+) -> None:
+    records = SQLiteProvisioningRepository(database)
+    repository = records.ensure_intent(
+        PID, "Mac0z", "my-cool-app", RepositoryVisibility.PUBLIC, NOW
+    )
+    records.identify(repository.id, 123, "main", NOW)
+    database.execute(
+        """INSERT INTO repository_baselines VALUES
+        ('legacy',?,?,?,?,1,?,?,1,?,?,NULL)""",
+        (
+            str(PID),
+            repository.id,
+            SHA,
+            SPEC_ID,
+            _hash(SPEC),
+            AGENTS_ID,
+            _hash(AGENTS),
+            NOW.isoformat(),
+        ),
+    )
+    database.commit()
+    original_baseline = records.baseline(PID)
+    original_repository = records.for_project(PID)
+    service, github, git = _service(database)
+    with pytest.raises(
+        ProvisioningError, match="separately approved recovery"
+    ) as error:
+        service.provision(PID, NOW, "legacy")
+    assert error.value.failure is ProvisioningFailure.CI_BASELINE_MISMATCH
+    assert records.baseline(PID) == original_baseline
+    assert records.for_project(PID) == original_repository
+    assert records.ci_intent(PID) is None
+    assert github.lookup_calls == github.configure_calls == github.create_calls == 0
+    assert git.commit_calls == git.push_calls == 0
+
+
+@pytest.mark.parametrize("mutation", ["workflow", "hash", "path", "branch", "profile"])
+def test_persisted_ci_corruption_blocks_before_provider_calls(
+    database: sqlite3.Connection, mutation: str
+) -> None:
+    _, _, _ = _identified_with_baseline(database)
+    records = SQLiteProvisioningRepository(database)
+    intent = records.ci_intent(PID)
+    assert intent is not None
+    # Model damaged persistent evidence, beyond the ordinary immutable SQL boundary.
+    database.execute("DROP TRIGGER repository_ci_intents_no_update")
+    database.execute("PRAGMA ignore_check_constraints=ON")
+    if mutation == "workflow":
+        content = intent.workflow_content + "# substituted template\n"
+        database.execute(
+            "UPDATE repository_ci_intents "
+            "SET workflow_content=?,workflow_content_hash=?",
+            (content, _hash(content)),
+        )
+    elif mutation == "hash":
+        database.execute(
+            "UPDATE repository_ci_intents SET workflow_content_hash=?", ("0" * 64,)
+        )
+    elif mutation == "path":
+        database.execute(
+            "UPDATE repository_ci_intents "
+            "SET workflow_path='.github/workflows/other.yml'"
+        )
+    elif mutation == "branch":
+        database.execute("UPDATE repository_ci_intents SET default_branch='develop'")
+    else:
+        database.execute("UPDATE repository_ci_intents SET profile_id='node-test-v1'")
+    database.commit()
+    service, github, git = _service(database)
+    with pytest.raises(ProvisioningError) as error:
+        service.provision(PID, NOW, "damaged-evidence")
+    assert error.value.failure is ProvisioningFailure.CI_BASELINE_MISMATCH
+    assert github.lookup_calls == github.create_calls == github.configure_calls == 0
+    assert git.commit_calls == git.push_calls == 0
+
+
+def test_persisted_baseline_replay_checks_local_sha_before_push(
+    database: sqlite3.Connection,
+) -> None:
+    service, github, git = _service(database)
+    git.ambiguous_push = True
+    git.publish_on_ambiguous = False
+    with pytest.raises(ProvisioningError):
+        service.provision(PID, NOW, "persist-first")
+    persisted = SQLiteProvisioningRepository(database).baseline(PID)
+    assert persisted is not None
+    original_pushes = git.push_calls
+
+    class WrongLocalGit(FakeGit):
+        def create_commit(
+            self, project_id: ProjectId, files: dict[str, bytes], message: str
+        ) -> str:
+            super().create_commit(project_id, files, message)
+            return "c" * 40
+
+    wrong_git = WrongLocalGit(github)
+    with pytest.raises(ProvisioningError, match="local replay") as error:
+        RepositoryProvisioningService(
+            database, github, wrong_git, owner="Mac0z"
+        ).provision(PID, NOW, "reject-stale-local")
+    assert error.value.failure is ProvisioningFailure.REMOTE_MISMATCH
+    assert git.push_calls == original_pushes
+    assert wrong_git.push_calls == 0
+    assert SQLiteProvisioningRepository(database).baseline(PID) == persisted
+
+
+def test_wrong_default_branch_is_rejected_before_push_or_configuration(
+    database: sqlite3.Connection,
+) -> None:
+    service, github, git = _identified_with_baseline(database)
+    assert github.remote is not None
+    from dataclasses import replace
+
+    github.remote = replace(github.remote, default_branch="develop")
+    with pytest.raises(ProvisioningError) as error:
+        service.provision(PID, NOW, "wrong-default")
+    assert error.value.failure is ProvisioningFailure.REMOTE_MISMATCH
+    assert git.commit_calls == git.push_calls == github.configure_calls == 0
+
+
+def test_security_condition_during_workflow_verification_blocks_ready(
+    database: sqlite3.Connection,
+) -> None:
+    class BlockingWorkflowRead(FakeGitHub):
+        def file_content(
+            self, owner: str, name: str, sha: str, path: str
+        ) -> bytes | None:
+            content = super().file_content(owner, name, sha, path)
+            if path == ".github/workflows/ci.yml":
+                SecurityPolicy(self.connection).record(
+                    SecurityEventType.REPOSITORY_IDENTITY_MISMATCH,
+                    SecuritySeverity.HIGH,
+                    project_id=PID,
+                    source_component="final-workflow-verification",
+                    correlation_id="late-security-condition",
+                    blocking=True,
+                    created_at=NOW,
+                )
+            return content
+
+    service, github, git = _service(database, BlockingWorkflowRead(database))
+    with pytest.raises(ProvisioningError) as error:
+        service.provision(PID, NOW, "late-security-condition")
+    assert error.value.failure is ProvisioningFailure.SECURITY_BLOCKED
+    assert github.create_calls == git.commit_calls == git.push_calls == 1
+    records = SQLiteProvisioningRepository(database)
+    baseline = records.baseline(PID)
+    repository = records.for_project(PID)
+    assert baseline is not None and baseline.verified_at is None
+    assert repository is not None and repository.verified_at is None
+    assert SQLiteProjectRepository(database, lambda: "unused").get(PID).state is (
+        ProjectState.PROVISIONING
+    )
+
+
+def test_main_changed_during_workflow_verification_cannot_be_verified(
+    database: sqlite3.Connection,
+) -> None:
+    class ChangingMain(FakeGitHub):
+        def file_content(
+            self, owner: str, name: str, sha: str, path: str
+        ) -> bytes | None:
+            content = super().file_content(owner, name, sha, path)
+            if path == ".github/workflows/ci.yml":
+                self.main = "d" * 40
+            return content
+
+    service, _, _ = _service(database, ChangingMain(database))
+    with pytest.raises(ProvisioningError, match="changed during") as error:
+        service.provision(PID, NOW, "changed-main")
+    assert error.value.failure is ProvisioningFailure.REMOTE_MISMATCH
+    records = SQLiteProvisioningRepository(database)
+    baseline = records.baseline(PID)
+    repository = records.for_project(PID)
+    assert baseline is not None and baseline.verified_at is None
+    assert repository is not None and repository.verified_at is None
+    assert SQLiteProjectRepository(database, lambda: "unused").get(PID).state is (
+        ProjectState.PROVISIONING
+    )

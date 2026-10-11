@@ -156,6 +156,7 @@ and protected GitHub token configuration.
 
 - [M6A target-host development deployment](docs/DEVELOPMENT_DEPLOYMENT.md)
 - [M30 service, administration, backup, and systemd operations](docs/OPERATIONS_M30.md)
+- [Trusted CI bootstrap for generated repositories](docs/trusted-ci-bootstrap.md)
 - [Implementation specification](SPEC.md)
 - [Engineering instructions](AGENTS.md)
 - [Design documents](docs/)

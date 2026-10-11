@@ -9,6 +9,7 @@ from uuid import UUID
 
 import pytest
 
+from syntra_build.application.ci_profiles import select_ci_profile
 from syntra_build.application.m32_executors import RepositoryProvisioningExecutor
 from syntra_build.application.provisioning import (
     AmbiguousGitHubResult,
@@ -46,7 +47,10 @@ SPEC_ID = "00000000-0000-0000-0000-000000000102"
 AGENTS_ID = "00000000-0000-0000-0000-000000000103"
 PACKAGE_ID = "00000000-0000-0000-0000-000000000104"
 GATE_ID = "00000000-0000-0000-0000-000000000105"
-SPEC = "# Approved specification\n"
+SPEC = (
+    '# Approved specification\n```syntra-ci\nprofile = "python-pytest-v1"\n'
+    'python-version = "3.12"\n```\n'
+)
 AGENTS = "# Approved agent rules\n"
 SHA = "b" * 40
 
@@ -239,7 +243,11 @@ class FakeGit:
         self.state.calls.append("create_commit")
         assert project_id == PID
         assert message == "Initial approved project design"
-        assert files == {"SPEC.md": SPEC.encode(), "AGENTS.md": AGENTS.encode()}
+        assert files == {
+            "SPEC.md": SPEC.encode(),
+            "AGENTS.md": AGENTS.encode(),
+            **select_ci_profile(SPEC).workflow_files(),
+        }
         self.state.contents = dict(files)
         return SHA
 
@@ -313,7 +321,11 @@ def test_provisions_approved_baseline_on_worker_owned_connection(
     assert baseline.spec_content_hash == _hash(SPEC)
     assert baseline.agents_content_hash == _hash(AGENTS)
     assert baseline.verified_at == NOW
-    assert state.contents == {"SPEC.md": SPEC.encode(), "AGENTS.md": AGENTS.encode()}
+    assert state.contents == {
+        "SPEC.md": SPEC.encode(),
+        "AGENTS.md": AGENTS.encode(),
+        **select_ci_profile(SPEC).workflow_files(),
+    }
     project = SQLiteProjectRepository(control, lambda: "unused").get(PID)
     assert project.state is ProjectState.READY
     transition = control.execute(

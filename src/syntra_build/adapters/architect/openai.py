@@ -416,6 +416,16 @@ class OpenAIArchitectProvider:
                 "persistence, security, interfaces, milestones, dependencies and acceptance. AGENTS "
                 "defines durable implementation, architecture, dependency, testing, CI and security "
                 "rules. Do not invent blocking requirements: fail rather than misrepresent them. "
+                "Repository provisioning requires one human-approved trusted CI profile in SPEC.md. "
+                "For a Python project using pytest, include exactly one fenced syntra-ci block: "
+                '```syntra-ci\nprofile = "python-pytest-v1"\npython-version = "3.12"\n```. '
+                "Choose python-version from 3.12, 3.13, or 3.14 to match the approved project runtime; "
+                "the example is not a default for every project. Require pyproject.toml with declared "
+                "dependencies (and a dev extra when needed) and real pytest tests. Syntra generates "
+                "the protected workflow; do not supply executable CI commands or custom workflow YAML. "
+                "For non-Python or otherwise unsupported targets, explicitly surface the need for an "
+                "approved supported trusted CI profile in design_summary before provisioning; never "
+                "pretend the target is Python or select a profile incompatible with its requirements. "
                 "Echo required_repository_visibility exactly. Do not execute operations or use tools."
             ),
             "input": json.dumps(

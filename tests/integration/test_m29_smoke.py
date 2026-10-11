@@ -6,7 +6,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from syntra_build.infrastructure.persistence import apply_migrations, open_database
+from syntra_build.infrastructure.persistence import (
+    MIGRATIONS,
+    apply_migrations,
+    open_database,
+)
 
 
 def test_m29_probe_loads_real_host_configuration(tmp_path: Path) -> None:
@@ -14,7 +18,7 @@ def test_m29_probe_loads_real_host_configuration(tmp_path: Path) -> None:
     data.mkdir()
     database = data / "state.sqlite3"
     with open_database(database) as connection:
-        assert apply_migrations(connection) == 28
+        assert apply_migrations(connection) == len(MIGRATIONS)
     config = tmp_path / "config.json"
     config.write_text(
         json.dumps(

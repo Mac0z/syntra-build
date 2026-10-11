@@ -14,6 +14,7 @@ from syntra_build.domain.security import (
 )
 from syntra_build.infrastructure.config import load_config
 from syntra_build.infrastructure.persistence import (
+    MIGRATIONS,
     bootstrap_database,
     current_schema_version,
 )
@@ -40,7 +41,7 @@ def _db(tmp_path: Path) -> sqlite3.Connection:
 
 def test_migration_26_and_active_resolution_history(tmp_path: Path) -> None:
     db = _db(tmp_path)
-    assert current_schema_version(db) == 28
+    assert current_schema_version(db) == len(MIGRATIONS)
     project = Project(
         ProjectId.from_string("00000000-0000-4000-8000-000000000001"),
         "project",
