@@ -15,11 +15,28 @@ Repair runs on success, nonzero exit, signals, explicit cleanup, and stale-grant
 reconciliation before another launch. The global isolation lock covers every
 operation. A failed repair or revocation exits 70 and prevents a new launch.
 SIGKILL cannot run a trap; explicit cleanup or the next launch reconciles it.
-Root operations use `O_NOFOLLOW` directory/file descriptors and reject escaping
-symlinks, hard links and unexpected filesystems. Source content and ownership are
-preserved. `.git` is excluded from source repair; protected repository metadata
-gets only temporary worker read access. Worker access to the control plane is
-not expanded. The Code Mode profile and runtime attestation remain required.
+Root operations use `O_NOFOLLOW` directory/file descriptors and reject hard links,
+unsupported file types and unexpected filesystems. Symlinks are always opaque to
+root ACL edits; no external target is opened or modified. As `syntra-build`, the
+verifier enumerates tracked and non-ignored source using Git with a clean
+environment and fsmonitor disabled, then rejects escaping source links (including
+cached descendants of a replaced directory). Ignored disposable environments
+such as `.venv` may retain ordinary absolute system-interpreter links. A tracked
+link remains source even when force-added under an ignored directory; M21 change
+validation independently rejects unsafe source before evidence adoption. Source
+content and ownership are preserved. `.git` is excluded from source repair;
+protected repository metadata gets only temporary worker read access. Worker
+access to the control plane is not expanded. The Code Mode profile and runtime
+attestation remain required.
+
+Existing ignored environments are not deleted or rebuilt. Their regular files,
+directories and nested `.gitignore` files receive effective control-plane access
+so Git enumeration produces no permission warnings. Linux `libacl.so.1` (provided
+by Ubuntu's existing `acl` dependency) edits pinned inode ACLs in-process, including
+explicit access/default masks, and skips unchanged ACL writes. There is no
+subprocess per inode. Git failures or warnings and access/default ACL repair
+failures still fail closed. The operator-recovery timeout remains **60 seconds**;
+it has not been widened to conceal slow handoffs.
 
 A service-side cleanup failure raises `CodexHandoffError` after recording the
 original process result. It does not replace a durable success with failure or
@@ -107,13 +124,22 @@ bash -n scripts/host/setup-codex-worker.sh
 On a disposable Linux root host with `acl`, `python3`, `setpriv`, and pytest:
 
 ```sh
-python -m pytest tests/integration/test_codex_filesystem_handoff.py -q
+python -m pytest tests/integration/test_codex_filesystem_handoff.py -q -s
 ```
 
 That suite executes the actual launcher and descriptor-based helper with real
 separate users, restrictive worker-created source, effective read/traverse
 checks, nonzero exits, SIGTERM/SIGKILL, repeated cleanup, masked ACLs, protected
 Git metadata, escaping `.git`/source symlinks, hard links and injected ACL failure.
+Real `python -m venv --symlinks` fixtures contain pip, offline pytest dependencies,
+absolute interpreter links and nested ignore files. Completion, nonzero exits,
+explicit cleanup and SIGKILL/restart reconciliation retain ignored environments.
+The large recovery case includes 12,000 dependency-size fixture files in addition
+to the real installed packages (over 14,000 entries), exercises the actual
+operator-recovery subprocess with `timeout=60`, preserves the original successful
+run/jobs/attempts and code across repeated recovery/restart, and asserts constant
+helper subprocess count. It prints fixture size and elapsed recovery time for CI
+evidence; timing on a disposable Linux host is not a production ARM64 benchmark.
 Ordinary non-root runs skip these tests; CI runs them explicitly as root.
 `test_m32_handoff_recovery.py` covers recovery rejection, history/budget
 preservation, interrupted atomic transitions, idempotent validation, 3,000 paused

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from handoff_venv import populated_venv
 from test_m32_implementation_failures import prepared_application
 from test_m32_one_milestone_happy_path import MILESTONE, PROJECT
 
@@ -78,6 +80,47 @@ def recover(db: sqlite3.Connection, git: TrustedGit, data: Path, job: JobId) -> 
         job,
         repair_command=lambda path: ("/bin/true", str(path)),
     )
+
+
+@pytest.mark.parametrize("link_scope", ["ignored", "force-tracked", "source"])
+def test_recovery_validates_source_not_ignored_actual_virtualenv(
+    tmp_path: Path, link_scope: str
+) -> None:
+    database, data, git, job = blocked_application(tmp_path)
+    workspace = data / "workspaces" / str(PROJECT) / str(MILESTONE)
+    environment, _count = populated_venv(workspace)
+    interpreter = environment / "bin/python"
+    if link_scope == "force-tracked":
+        git.stage(workspace, (".gitignore",))
+        subprocess.run(
+            ["git", "-C", str(workspace), "add", "-f", ".venv/bin/python"],
+            check=True,
+            capture_output=True,
+        )
+    elif link_scope == "source":
+        (workspace / "source-python").symlink_to(interpreter.resolve())
+    with open_database(database) as db:
+        process_before = [tuple(row) for row in db.execute("SELECT * FROM codex_runs")]
+        if link_scope == "ignored":
+            accepted = recover(db, git, data, job)
+            assert recover(db, git, data, job) == accepted
+            assert db.execute("SELECT state FROM projects").fetchone()[0] == "PAUSED"
+            changes = db.execute("SELECT files_json FROM change_sets").fetchone()[0]
+            assert ".venv" not in changes
+        else:
+            with pytest.raises(ValueError, match="deterministic validation rejected"):
+                recover(db, git, data, job)
+            assert db.execute("SELECT state FROM projects").fetchone()[0] == "BLOCKED"
+            assert db.execute("SELECT state FROM milestones").fetchone()[0] == "BLOCKED"
+        assert [
+            tuple(row) for row in db.execute("SELECT * FROM codex_runs")
+        ] == process_before
+        assert (
+            db.execute(
+                "SELECT count(*) FROM jobs WHERE job_type='CODEX_RUN'"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 @pytest.mark.parametrize("resume", ["CODING", "VALIDATING_CHANGES"])

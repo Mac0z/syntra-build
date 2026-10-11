@@ -183,7 +183,11 @@ def test_host_helper_is_syntax_valid_and_declares_isolated_acl_plan() -> None:
     assert "repair_control_plane_handoff" in source
     acl = Path("scripts/host/syntra-codex-acl.py").read_text()
     assert "os.O_NOFOLLOW" in acl
-    assert "m::{rights}" in acl
+    assert "entries[self.MASK, None] = rights" in acl
+    assert 'ctypes.CDLL("libacl.so.1"' in acl
+    assert "self.lib.acl_set_fd(fd, handle)" in acl
+    assert "/usr/bin/setfacl" not in acl
+    assert "verify_source_links(fd, path, links)" in acl
     assert 'name == ".git"' in acl
     assert "--repair-handoff" in source
     assert '/usr/bin/env -i HOME="$worker_home" USER="$worker"' in source
