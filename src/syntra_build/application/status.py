@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import cast
 
+from syntra_build.application.ci_status import ci_diagnosis_action
 from syntra_build.application.commands.models import (
     Command,
     CommandType,
@@ -22,6 +23,7 @@ from syntra_build.application.commands.services import (
 )
 from syntra_build.application.projects import canonicalize_project_name
 from syntra_build.domain import Project, ProjectId, ProjectState
+from syntra_build.domain.ci import CIDiagnosis
 from syntra_build.infrastructure.logging import new_correlation_id
 from syntra_build.infrastructure.persistence.errors import PersistenceError
 from syntra_build.infrastructure.persistence.projects import SQLiteProjectRepository
@@ -91,6 +93,9 @@ class CIStatus:
     next_poll_at: str | None
     failure_classification: str | None
     current: bool
+    diagnosis: CIDiagnosis | None = None
+    diagnosis_summary: str | None = None
+    unknown_deadline_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +259,8 @@ class SQLiteStatusService:
                 )
             )
             latest_error = self._latest_error(jobs, str(project_id))
+            if ci and ci.current and ci.diagnosis and ci.next_poll_at is None:
+                latest_error = ci.diagnosis_summary or ci.diagnosis.value
             return ProjectStatusProjection(
                 project.id,
                 project.name,
@@ -438,6 +445,9 @@ class SQLiteStatusService:
             row["next_check_at"],
             row["failure_classification"],
             row["head_sha"] == pr.head_sha,
+            CIDiagnosis(row["diagnosis"]) if row["diagnosis"] else None,
+            row["diagnosis_summary"],
+            row["unknown_deadline_at"],
         )
 
     def _architect(
@@ -519,6 +529,10 @@ class SQLiteStatusService:
         milestone: MilestoneStatusProjection | None,
         ci: CIStatus | None,
     ) -> str:
+        if state is ProjectState.PAUSED:
+            return "Resume the project to continue."
+        if ci and ci.current and ci.diagnosis and ci.next_poll_at is None:
+            return ci_diagnosis_action(ci.diagnosis)
         if state is ProjectState.BLOCKED:
             return "Resolve the recorded blocker before work can continue."
         if jobs:
@@ -544,8 +558,6 @@ class SQLiteStatusService:
                 if action.gate_type == "HUMAN_TEST"
                 else "Waiting for your decision."
             )
-        if state is ProjectState.PAUSED:
-            return "Resume the project to continue."
         if state is ProjectState.FAILED:
             return "No recovery action is currently recorded."
         if state is ProjectState.COMPLETE:
@@ -642,7 +654,16 @@ def format_project_status(status: ProjectStatusProjection) -> str:
     if status.ci:
         freshness = "" if status.ci.current else " (stale; not current head)"
         lines.append(f"CI: {status.ci.status} @ {status.ci.head_sha[:10]}{freshness}")
+        if status.ci.diagnosis and status.ci.required_checks:
+            lines.append("Last observed checks:")
         lines.extend(f"  {check}" for check in status.ci.required_checks)
+        if status.ci.diagnosis:
+            lines.append(
+                f"CI diagnosis: {status.ci.diagnosis.value} — "
+                f"{status.ci.diagnosis_summary or status.ci.diagnosis.value}"
+            )
+            if status.ci.unknown_deadline_at and status.ci.next_poll_at:
+                lines.append(f"CI grace deadline: {status.ci.unknown_deadline_at}")
     if status.architect:
         freshness = "" if status.architect.current else " (stale; not current head)"
         lines.append(
@@ -679,7 +700,15 @@ def format_project_status(status: ProjectStatusProjection) -> str:
                 else:
                     lines.append("Human test binding: unavailable/incomplete")
     else:
-        lines.append("Human action: none")
+        ci_blocked = (
+            status.ci
+            and status.ci.current
+            and status.ci.diagnosis
+            and status.ci.next_poll_at is None
+        )
+        lines.append(
+            "Human action: resolve CI blocker" if ci_blocked else "Human action: none"
+        )
     lines.append(f"Latest error: {status.latest_error or 'none'}")
     lines.append(f"Next: {status.next_action}")
     return "\n".join(lines)

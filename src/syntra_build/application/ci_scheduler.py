@@ -112,6 +112,8 @@ class CIJobCoordinator:
               AND r.next_check_at<=?
               AND r.id=(SELECT newest.id FROM ci_runs newest
                         WHERE newest.milestone_id=r.milestone_id
+                          AND newest.pull_request_id=r.pull_request_id
+                          AND newest.head_sha=r.head_sha
                         ORDER BY newest.started_at DESC,newest.attempt_number DESC LIMIT 1)
               AND NOT EXISTS (SELECT 1 FROM jobs j
                     WHERE j.milestone_id=r.milestone_id AND j.job_type=?

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from math import isfinite
 from pathlib import Path
 from typing import ClassVar
 
@@ -206,6 +207,34 @@ class GitHubConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class CIConfig:
+    missing_grace_seconds: float = 600.0
+    missing_max_observations: int = 20
+
+    MAX_MISSING_GRACE_SECONDS: ClassVar[int] = 86_400
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.missing_grace_seconds, bool)
+            or not isinstance(self.missing_grace_seconds, (int, float))
+            or self.missing_grace_seconds <= 0
+            or self.missing_grace_seconds > self.MAX_MISSING_GRACE_SECONDS
+            or not isfinite(self.missing_grace_seconds)
+        ):
+            raise ConfigurationError(
+                "ci.missing_grace_seconds must be a finite positive number "
+                f"no greater than {self.MAX_MISSING_GRACE_SECONDS} seconds"
+            )
+        if (
+            type(self.missing_max_observations) is not int
+            or self.missing_max_observations <= 0
+        ):
+            raise ConfigurationError(
+                "ci.missing_max_observations must be a positive integer"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class SchedulerConfig:
     architect_concurrency: int = 2
     codex_concurrency: int = 2
@@ -359,6 +388,7 @@ class ApplicationConfig:
     architect: ArchitectConfig = field(default_factory=ArchitectConfig)
     codex: CodexConfig = field(default_factory=CodexConfig)
     github: GitHubConfig = field(default_factory=GitHubConfig)
+    ci: CIConfig = field(default_factory=CIConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     retries: RetryConfig = field(default_factory=RetryConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)

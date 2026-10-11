@@ -91,6 +91,7 @@ requires restoring the pre-migration backup together with the previous
 application version. Do not run an older daemon against a database containing
 new CI intents or delete intent records to force reprovisioning.
 
-Deliverables B and C of issue #73 are separate work. This bootstrap does not
+Missing checks are handled by [bounded CI monitoring](missing-ci-monitoring.md).
+Deliverable C of issue #73 remains separate work. This bootstrap does not
 retrofit existing repositories or authorize workflow-policy changes by coding
 agents.
