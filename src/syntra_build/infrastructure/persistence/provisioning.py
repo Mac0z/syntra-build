@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
+from hashlib import sha256
 from uuid import uuid4
 
 from syntra_build.domain import ProjectDocumentId, ProjectId, RepositoryVisibility
 from syntra_build.domain.provisioning import (
     GitHubRepository,
     RepositoryBaseline,
+    RepositoryCIIntent,
     RepositoryProvisioningStatus,
 )
 from syntra_build.infrastructure.persistence.errors import PersistenceError
@@ -138,7 +141,11 @@ class SQLiteProvisioningRepository:
     def save_baseline(self, baseline: RepositoryBaseline) -> None:
         try:
             self.connection.execute(
-                """INSERT INTO repository_baselines VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)
+                """INSERT INTO repository_baselines
+                (id,project_id,github_repository_id,commit_sha,spec_document_id,
+                 spec_revision,spec_content_hash,agents_document_id,agents_revision,
+                 agents_content_hash,created_at,verified_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL)
                 ON CONFLICT(project_id) DO NOTHING""",
                 (
                     baseline.id,
@@ -158,6 +165,17 @@ class SQLiteProvisioningRepository:
             raise PersistenceError(
                 "repository baseline could not be persisted"
             ) from error
+        existing = self.baseline(baseline.project_id)
+        if (
+            existing is None
+            or replace(
+                baseline,
+                created_at=existing.created_at,
+                verified_at=existing.verified_at,
+            )
+            != existing
+        ):
+            raise PersistenceError("persisted repository baseline does not match")
 
     def baseline(self, project_id: ProjectId) -> RepositoryBaseline | None:
         row = self.connection.execute(
@@ -180,6 +198,94 @@ class SQLiteProvisioningRepository:
             _time(row["verified_at"]),
         )
 
+    def save_ci_intent(self, intent: RepositoryCIIntent) -> None:
+        """Record exact approved bootstrap inputs; conflicting replay is an error."""
+        for document_id, revision, content_hash, document_type in (
+            (
+                intent.spec_document_id,
+                intent.spec_revision,
+                intent.spec_content_hash,
+                "SPEC",
+            ),
+            (
+                intent.agents_document_id,
+                intent.agents_revision,
+                intent.agents_content_hash,
+                "AGENTS",
+            ),
+        ):
+            row = self.connection.execute(
+                """SELECT revision,content,content_hash,document_type,status
+                FROM project_documents WHERE project_id=? AND id=?""",
+                (str(intent.project_id), str(document_id)),
+            ).fetchone()
+            if (
+                row is None
+                or row["revision"] != revision
+                or row["content_hash"] != content_hash
+                or row["document_type"] != document_type
+                or row["status"] != "APPROVED"
+                or sha256(row["content"].encode()).hexdigest() != content_hash
+            ):
+                raise PersistenceError("CI intent does not match approved documents")
+        existing = self.ci_intent(intent.project_id)
+        if existing is not None:
+            if replace(intent, created_at=existing.created_at) != existing:
+                raise PersistenceError("persisted CI intent does not match")
+            return
+        try:
+            self.connection.execute(
+                """INSERT INTO repository_ci_intents
+                (project_id,github_repository_id,spec_document_id,spec_revision,
+                 spec_content_hash,agents_document_id,agents_revision,agents_content_hash,
+                 profile_id,python_version,workflow_path,workflow_content,
+                 workflow_content_hash,default_branch,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(intent.project_id),
+                    intent.github_repository_id,
+                    str(intent.spec_document_id),
+                    intent.spec_revision,
+                    intent.spec_content_hash,
+                    str(intent.agents_document_id),
+                    intent.agents_revision,
+                    intent.agents_content_hash,
+                    intent.profile_id,
+                    intent.python_version,
+                    intent.workflow_path,
+                    intent.workflow_content,
+                    intent.workflow_content_hash,
+                    intent.default_branch,
+                    intent.created_at.isoformat(),
+                ),
+            )
+        except sqlite3.Error as error:
+            raise PersistenceError("CI intent could not be persisted") from error
+
+    def ci_intent(self, project_id: ProjectId) -> RepositoryCIIntent | None:
+        row = self.connection.execute(
+            "SELECT * FROM repository_ci_intents WHERE project_id=?", (str(project_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        return RepositoryCIIntent(
+            project_id,
+            row["github_repository_id"],
+            ProjectDocumentId.from_string(row["spec_document_id"]),
+            row["spec_revision"],
+            row["spec_content_hash"],
+            ProjectDocumentId.from_string(row["agents_document_id"]),
+            row["agents_revision"],
+            row["agents_content_hash"],
+            row["profile_id"],
+            row["python_version"],
+            row["workflow_path"],
+            row["workflow_content"],
+            row["workflow_content_hash"],
+            row["default_branch"],
+            _required_time(row["created_at"]),
+        )
+
     def verify(
         self, repository_id: str, baseline_id: str, occurred_at: datetime
     ) -> None:
@@ -189,7 +295,7 @@ class SQLiteProvisioningRepository:
                 (occurred_at.isoformat(), baseline_id),
             )
             self.connection.execute(
-                """UPDATE github_repositories SET status='VERIFIED',verified_at=?,updated_at=?
+                """UPDATE github_repositories SET status='VERIFIED',default_branch='main',verified_at=?,updated_at=?
                 WHERE id=?""",
                 (occurred_at.isoformat(), occurred_at.isoformat(), repository_id),
             )

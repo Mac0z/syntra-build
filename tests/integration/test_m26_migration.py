@@ -160,5 +160,5 @@ def test_m32_14_upgrade_adds_merge_mutation_crash_boundary(tmp_path: Path) -> No
             (attempt_id,),
         ).fetchone()
         assert tuple(row) == ("REQUESTED", None)
-        assert current_schema_version(db) == 28
+        assert current_schema_version(db) == len(MIGRATIONS)
         assert db.execute("PRAGMA foreign_key_check").fetchall() == []

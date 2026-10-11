@@ -18,7 +18,7 @@ from syntra_build.infrastructure.backup import (
 )
 from syntra_build.infrastructure.config import load_config
 from syntra_build.infrastructure.config.models import ApplicationConfig
-from syntra_build.infrastructure.persistence import bootstrap_database
+from syntra_build.infrastructure.persistence import MIGRATIONS, bootstrap_database
 
 
 def config(tmp_path: Path) -> ApplicationConfig:
@@ -61,7 +61,7 @@ def test_online_wal_backup_restore_and_retention(tmp_path: Path) -> None:
     now = datetime(2026, 9, 28, tzinfo=UTC)
     old = service.create(BackupReason.AUTOMATIC, now=now - timedelta(days=31))
     current = service.create(BackupReason.AUTOMATIC, now=now)
-    assert restore_verify(current.path) == 28
+    assert restore_verify(current.path) == len(MIGRATIONS)
     assert service.automatic_due(now + timedelta(hours=23)) is False
     assert service.retain(30, now=now, keep=current.path) == (old.path,)
     assert current.path.exists()

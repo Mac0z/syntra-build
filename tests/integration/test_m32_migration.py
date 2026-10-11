@@ -33,7 +33,7 @@ def test_schema_26_to_27_preserves_evidence_and_accepts_task(tmp_path: Path) -> 
     db.close()
 
 
-def test_fresh_schema_is_28(tmp_path: Path) -> None:
+def test_fresh_schema_is_current(tmp_path: Path) -> None:
     db = open_database(tmp_path / "fresh.db")
-    assert apply_migrations(db) == 28
+    assert apply_migrations(db) == len(MIGRATIONS)
     db.close()

@@ -4,18 +4,24 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 from hashlib import sha256
 from typing import Protocol
 from uuid import uuid4
 
+from syntra_build.application.ci_profiles import (
+    TRUSTED_CI_WORKFLOW_PATH,
+    GeneratedCIProfileError,
+    select_ci_profile,
+)
 from syntra_build.application.security import SecurityPolicy
 from syntra_build.domain import (
     DesignPackageStatus,
     DocumentStatus,
     DocumentType,
+    DomainValidationError,
     ProjectDocument,
     ProjectId,
     ProjectState,
@@ -25,6 +31,7 @@ from syntra_build.domain import (
 from syntra_build.domain.provisioning import (
     GitHubRepository,
     RepositoryBaseline,
+    RepositoryCIIntent,
     RepositoryProvisioningStatus,
 )
 from syntra_build.domain.security import SecurityEventType, SecuritySeverity
@@ -56,6 +63,8 @@ class ProvisioningFailure(StrEnum):
     LOCAL_GIT = "LOCAL_GIT"
     PERSISTENCE = "PERSISTENCE"
     SECURITY_BLOCKED = "SECURITY_BLOCKED"
+    CI_PROFILE_REQUIRED = "CI_PROFILE_REQUIRED"
+    CI_BASELINE_MISMATCH = "CI_BASELINE_MISMATCH"
 
 
 class ProvisioningError(RuntimeError):
@@ -115,6 +124,10 @@ class ProvisioningResult:
     agents_hash: str
     verified: bool
     project_state: ProjectState
+    ci_profile_id: str
+    ci_python_version: str
+    ci_workflow_path: str
+    ci_workflow_hash: str
 
 
 class RepositoryProvisioningService:
@@ -216,7 +229,35 @@ class RepositoryProvisioningService:
                 "active security policy prevents repository provisioning",
             )
 
-        # This commit is the mandatory persist-before-create boundary.
+        try:
+            profile = select_ci_profile(spec.content)
+        except GeneratedCIProfileError as error:
+            raise ProvisioningError(
+                ProvisioningFailure.CI_PROFILE_REQUIRED, str(error)
+            ) from error
+        workflow_files = profile.workflow_files()
+        workflow_path = TRUSTED_CI_WORKFLOW_PATH
+        workflow_bytes = workflow_files[workflow_path]
+        files = {
+            "SPEC.md": spec.content.encode(),
+            "AGENTS.md": agents.content.encode(),
+            **workflow_files,
+        }
+        existing_repository = records.for_project(project_id)
+        try:
+            existing_ci = records.ci_intent(project_id)
+        except DomainValidationError as error:
+            raise ProvisioningError(
+                ProvisioningFailure.CI_BASELINE_MISMATCH,
+                "persisted trusted CI baseline is invalid; recovery is required",
+            ) from error
+        if existing_repository is not None and existing_ci is None:
+            raise ProvisioningError(
+                ProvisioningFailure.CI_BASELINE_MISMATCH,
+                "existing repository intent has no trusted CI baseline; separately approved recovery is required",
+            )
+        # Persist the complete approved bytes and target branch before repository
+        # creation or a local commit. A crash can only replay this same intent.
         with transaction(self.connection):
             repository = records.ensure_intent(
                 project_id,
@@ -225,6 +266,32 @@ class RepositoryProvisioningService:
                 package.repository_visibility,
                 occurred_at,
             )
+            ci_intent = RepositoryCIIntent(
+                project_id=project_id,
+                github_repository_id=repository.id,
+                spec_document_id=spec.id,
+                spec_revision=spec.revision,
+                spec_content_hash=spec.content_hash,
+                agents_document_id=agents.id,
+                agents_revision=agents.revision,
+                agents_content_hash=agents.content_hash,
+                profile_id=profile.profile_id,
+                python_version=profile.python_version,
+                workflow_path=workflow_path,
+                workflow_content=workflow_bytes.decode(),
+                workflow_content_hash=sha256(workflow_bytes).hexdigest(),
+                default_branch="main",
+                created_at=occurred_at,
+            )
+            if (
+                existing_ci is not None
+                and replace(ci_intent, created_at=existing_ci.created_at) != existing_ci
+            ):
+                raise ProvisioningError(
+                    ProvisioningFailure.CI_BASELINE_MISMATCH,
+                    "persisted trusted CI baseline differs from the approved profile; recovery is required",
+                )
+            records.save_ci_intent(ci_intent)
         live = self.github.get_repository(repository.owner, repository.repository_name)
         if live is not None and repository.external_repository_id is None:
             if repository.status is not RepositoryProvisioningStatus.CREATE_AMBIGUOUS:
@@ -273,13 +340,12 @@ class RepositoryProvisioningService:
             repository = refreshed
         self._validate_live(repository, live)
         baseline = records.baseline(project_id)
+        baseline_was_persisted = baseline is not None
         if baseline is None:
+            self._require_unblocked(project_id)
             commit_sha = self.git.create_commit(
                 project_id,
-                {
-                    "SPEC.md": spec.content.encode(),
-                    "AGENTS.md": agents.content.encode(),
-                },
+                files,
                 "Initial approved project design",
             )
             baseline = RepositoryBaseline(
@@ -312,6 +378,18 @@ class RepositoryProvisioningService:
             )
         remote_sha = self.github.main_sha(repository.owner, repository.repository_name)
         if remote_sha is None:
+            # Reconcile a local commit lost between commit/persistence/push. Never
+            # push a stale or reconstructed SHA under earlier baseline evidence.
+            if baseline_was_persisted:
+                self._require_unblocked(project_id)
+                local_sha = self.git.create_commit(
+                    project_id, files, "Initial approved project design"
+                )
+                if local_sha != baseline.commit_sha:
+                    raise ProvisioningError(
+                        ProvisioningFailure.REMOTE_MISMATCH,
+                        "local replay does not match the persisted trusted baseline",
+                    )
             try:
                 self._require_unblocked(project_id)
                 self.git.push_main(
@@ -338,28 +416,42 @@ class RepositoryProvisioningService:
                 "repository disappeared during verification",
             )
         self._validate_live(repository, live)
-        if live.default_branch != "main":
+        if live.default_branch != ci_intent.default_branch:
             raise ProvisioningError(
                 ProvisioningFailure.REMOTE_MISMATCH, "default branch is not main"
             )
         for path, expected in (
             ("SPEC.md", spec.content_hash),
             ("AGENTS.md", agents.content_hash),
+            (ci_intent.workflow_path, ci_intent.workflow_content_hash),
         ):
             content = self.github.file_content(
                 repository.owner, repository.repository_name, baseline.commit_sha, path
             )
             if content is None or sha256(content).hexdigest() != expected:
                 raise ProvisioningError(
-                    ProvisioningFailure.DOCUMENT_MISMATCH,
+                    ProvisioningFailure.CI_BASELINE_MISMATCH
+                    if path == ci_intent.workflow_path
+                    else ProvisioningFailure.DOCUMENT_MISMATCH,
                     f"remote {path} differs from approval",
                 )
-        # Re-check the approval immediately before the atomic evidence/state transition.
-        if packages.get(package.id).status is not DesignPackageStatus.APPROVED:
+        if (
+            self.github.main_sha(repository.owner, repository.repository_name)
+            != baseline.commit_sha
+        ):
             raise ProvisioningError(
-                ProvisioningFailure.PRECONDITION, "design approval is no longer valid"
+                ProvisioningFailure.REMOTE_MISMATCH,
+                "remote main changed during trusted baseline verification",
             )
         with transaction(self.connection):
+            # Final observations may reveal a security condition or a revoked
+            # approval. Check both within the evidence/state transaction.
+            self._require_unblocked(project_id)
+            if packages.get(package.id).status is not DesignPackageStatus.APPROVED:
+                raise ProvisioningError(
+                    ProvisioningFailure.PRECONDITION,
+                    "design approval is no longer valid",
+                )
             records.verify(repository.id, baseline.id, occurred_at)
             project = projects.apply_transition(
                 ProjectTransitionRequest(
@@ -384,6 +476,10 @@ class RepositoryProvisioningService:
             agents.content_hash,
             True,
             project.state,
+            ci_intent.profile_id,
+            ci_intent.python_version,
+            ci_intent.workflow_path,
+            ci_intent.workflow_content_hash,
         )
 
     @staticmethod
@@ -421,6 +517,11 @@ class RepositoryProvisioningService:
             raise ProvisioningError(
                 ProvisioningFailure.VISIBILITY_MISMATCH,
                 "live repository visibility differs",
+            )
+        if live.default_branch not in {None, "main"}:
+            raise ProvisioningError(
+                ProvisioningFailure.REMOTE_MISMATCH,
+                "remote default branch differs from the trusted baseline",
             )
 
     def _require_unblocked(self, project_id: ProjectId) -> None:

@@ -1277,6 +1277,52 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE merge_attempts ADD COLUMN mutation_started_at TEXT",
         ),
     ),
+    Migration(
+        version=29,
+        name="029_trusted_ci_bootstrap",
+        statements=(
+            "CREATE UNIQUE INDEX github_repositories_project_identity ON github_repositories(project_id,id)",
+            "CREATE UNIQUE INDEX project_documents_project_identity ON project_documents(project_id,id)",
+            """CREATE TABLE repository_ci_intents (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id),
+                github_repository_id TEXT NOT NULL UNIQUE,
+                spec_document_id TEXT NOT NULL,
+                spec_revision INTEGER NOT NULL CHECK(spec_revision>=1),
+                spec_content_hash TEXT NOT NULL CHECK(length(spec_content_hash)=64),
+                agents_document_id TEXT NOT NULL,
+                agents_revision INTEGER NOT NULL CHECK(agents_revision>=1),
+                agents_content_hash TEXT NOT NULL CHECK(length(agents_content_hash)=64),
+                profile_id TEXT NOT NULL CHECK(length(trim(profile_id))>0),
+                python_version TEXT NOT NULL CHECK(length(trim(python_version))>0),
+                workflow_path TEXT NOT NULL CHECK(workflow_path='.github/workflows/ci.yml'),
+                workflow_content TEXT NOT NULL CHECK(length(workflow_content)>0),
+                workflow_content_hash TEXT NOT NULL CHECK(length(workflow_content_hash)=64),
+                default_branch TEXT NOT NULL CHECK(default_branch='main'),
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id,github_repository_id)
+                    REFERENCES github_repositories(project_id,id),
+                FOREIGN KEY(project_id,spec_document_id)
+                    REFERENCES project_documents(project_id,id),
+                FOREIGN KEY(project_id,agents_document_id)
+                    REFERENCES project_documents(project_id,id)
+            ) STRICT""",
+            """CREATE TRIGGER repository_ci_intents_approved_documents BEFORE INSERT
+                ON repository_ci_intents WHEN
+                NOT EXISTS (SELECT 1 FROM project_documents WHERE id=NEW.spec_document_id
+                    AND project_id=NEW.project_id AND document_type='SPEC' AND status='APPROVED'
+                    AND revision=NEW.spec_revision AND content_hash=NEW.spec_content_hash)
+                OR NOT EXISTS (SELECT 1 FROM project_documents WHERE id=NEW.agents_document_id
+                    AND project_id=NEW.project_id AND document_type='AGENTS' AND status='APPROVED'
+                    AND revision=NEW.agents_revision AND content_hash=NEW.agents_content_hash)
+                BEGIN SELECT RAISE(ABORT,'CI intent requires exact approved documents'); END""",
+            """CREATE TRIGGER repository_ci_intents_no_update BEFORE UPDATE
+                ON repository_ci_intents BEGIN
+                SELECT RAISE(ABORT,'CI intent is immutable'); END""",
+            """CREATE TRIGGER repository_ci_intents_no_delete BEFORE DELETE
+                ON repository_ci_intents BEGIN
+                SELECT RAISE(ABORT,'CI intents are preservation-oriented'); END""",
+        ),
+    ),
 )
 
 

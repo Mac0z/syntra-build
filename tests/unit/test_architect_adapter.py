@@ -1,6 +1,7 @@
 # ruff: noqa: E501
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -26,8 +27,10 @@ from syntra_build.domain import (
     ProjectDesignContext,
     ProjectId,
     ProjectState,
+    RepositoryVisibility,
 )
 from syntra_build.domain.errors import DomainValidationError
+from syntra_build.domain.specification import SpecificationDraftRequest
 from syntra_build.infrastructure.persistence import (
     SQLiteProjectRepository,
     apply_migrations,
@@ -252,3 +255,68 @@ def test_specification_schema_is_strict_at_every_object_level() -> None:
     item = cast(dict[str, object], milestones["items"])
     assert item["additionalProperties"] is False
     assert "tools" not in SPECIFICATION_DRAFT_SCHEMA
+
+
+def test_specification_prompt_requests_explicit_supported_ci_profile() -> None:
+    seen: dict[str, object] = {}
+
+    def transport(
+        payload: dict[str, object], key: str, timeout: float
+    ) -> dict[str, object]:
+        seen.update(payload)
+        return {
+            "output": [
+                {
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": json.dumps(
+                                {
+                                    "interface_version": "1.0",
+                                    "correlation_id": "corr",
+                                    "project_id": str(PID),
+                                    "design_summary": "Python pytest project",
+                                    "repository_visibility": "public",
+                                    "spec_markdown": '# SPEC\n```syntra-ci\nprofile = "python-pytest-v1"\npython-version = "3.13"\n```\n',
+                                    "agents_markdown": "# AGENTS",
+                                    "assumptions": [],
+                                    "non_blocking_issues": [],
+                                    "planned_milestones": [],
+                                }
+                            ),
+                        }
+                    ]
+                }
+            ]
+        }
+
+    provider = OpenAIArchitectProvider(
+        api_key="secret", model="configured", transport=transport
+    )
+    draft = provider.draft_specification(
+        SpecificationDraftRequest(
+            "1.0",
+            "corr",
+            PID,
+            "Demo",
+            "Build a Python 3.13 project",
+            RepositoryVisibility.PUBLIC,
+            (),
+            (),
+            (),
+            (),
+        )
+    )
+
+    instructions = cast(str, seen["instructions"])
+    assert (
+        '```syntra-ci\nprofile = "python-pytest-v1"\npython-version = "3.12"\n```'
+        in instructions
+    )
+    assert "Choose python-version from 3.12, 3.13, or 3.14" in instructions
+    assert "non-Python or otherwise unsupported targets" in instructions
+    assert "approved supported trusted CI profile in design_summary" in instructions
+    assert "never pretend the target is Python" in instructions
+    assert "Syntra generates the protected workflow" in instructions
+    assert 'python-version = "3.13"' in draft.spec_markdown
+    assert "secret" not in str(seen)

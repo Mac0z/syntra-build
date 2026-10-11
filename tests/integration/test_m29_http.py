@@ -18,7 +18,11 @@ from syntra_build.infrastructure.config.models import (
 )
 from syntra_build.infrastructure.health_http import HealthHTTPServer
 from syntra_build.infrastructure.metrics import MetricsService, PrometheusRecorder
-from syntra_build.infrastructure.persistence import apply_migrations, open_database
+from syntra_build.infrastructure.persistence import (
+    MIGRATIONS,
+    apply_migrations,
+    open_database,
+)
 
 
 class Sampler:
@@ -32,7 +36,7 @@ class Sampler:
 def test_real_http_endpoints_and_observation_only_metrics(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     connection = open_database(database)
-    assert apply_migrations(connection) == 28
+    assert apply_migrations(connection) == len(MIGRATIONS)
     before = connection.total_changes
     observed_tables = (
         "projects",
