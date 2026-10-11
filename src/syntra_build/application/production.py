@@ -24,6 +24,7 @@ from syntra_build.application.architect_review import (
     ReviewPullRequestGateway,
 )
 from syntra_build.application.ci_monitor import CIActionsGateway, CIMonitor
+from syntra_build.application.ci_polling import MissingCIPolicy
 from syntra_build.application.ci_scheduler import (
     CIJobCoordinator,
     CIReconciliationExecutor,
@@ -325,6 +326,10 @@ def build_production_executors(
                     dependencies.github_actions_factory()
                     if dependencies.github_actions_factory is not None
                     else GitHubActionsAdapter(config, metrics=recorder),
+                    missing_ci=MissingCIPolicy(
+                        grace_seconds=config.ci.missing_grace_seconds,
+                        max_observations=config.ci.missing_max_observations,
+                    ),
                 ),
             ).execute
         }

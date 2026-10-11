@@ -13,6 +13,7 @@ from syntra_build.domain.ci import (
     CICheck,
     CICheckConclusion,
     CICheckStatus,
+    CIDiagnosis,
     CIFailureClassification,
     CIOverallStatus,
 )
@@ -34,6 +35,11 @@ class CIRunRecord:
     next_check_at: datetime | None
     checks: tuple[CICheck, ...]
     external_workflow_run_ids: tuple[str, ...]
+    unknown_since: datetime | None = None
+    unknown_deadline_at: datetime | None = None
+    unknown_observation_count: int = 0
+    diagnosis: CIDiagnosis | None = None
+    diagnosis_summary: str | None = None
 
 
 class SQLiteCIRepository:
@@ -56,7 +62,38 @@ class SQLiteCIRepository:
         next_check_at: datetime | None = None,
         summary: dict[str, object] | None = None,
         new_attempt: bool = False,
+        unknown_since: datetime | None = None,
+        unknown_deadline_at: datetime | None = None,
+        unknown_observation_count: int = 0,
+        diagnosis: CIDiagnosis | None = None,
+        diagnosis_summary: str | None = None,
     ) -> CIRunRecord:
+        if (unknown_since is None) != (unknown_deadline_at is None):
+            raise sqlite3.IntegrityError("CI grace period requires both timestamps")
+        for timestamp in (unknown_since, unknown_deadline_at):
+            if timestamp is not None and timestamp.utcoffset() is None:
+                raise sqlite3.IntegrityError(
+                    "CI grace timestamps must be timezone-aware"
+                )
+        if (
+            unknown_since is not None
+            and unknown_deadline_at is not None
+            and unknown_deadline_at < unknown_since
+        ):
+            raise sqlite3.IntegrityError("CI grace deadline precedes its start")
+        if unknown_observation_count < 0:
+            raise sqlite3.IntegrityError("CI observation count cannot be negative")
+
+        def timestamp_value(timestamp: datetime | None) -> str | None:
+            return timestamp.astimezone(UTC).isoformat() if timestamp else None
+
+        unknown_values = (
+            timestamp_value(unknown_since),
+            timestamp_value(unknown_deadline_at),
+            unknown_observation_count,
+            diagnosis,
+            diagnosis_summary,
+        )
         row = self.connection.execute(
             """SELECT * FROM ci_runs WHERE pull_request_id=? AND head_sha=?
             ORDER BY attempt_number DESC LIMIT 1""",
@@ -80,8 +117,9 @@ class SQLiteCIRepository:
                 """INSERT INTO ci_runs
                 (id,project_id,milestone_id,pull_request_id,head_sha,attempt_number,overall_status,
                  failure_classification,external_workflow_run_id,started_at,completed_at,
-                 last_checked_at,summary_json,retry_count,next_check_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 last_checked_at,summary_json,retry_count,next_check_at,unknown_since,
+                 unknown_deadline_at,unknown_observation_count,diagnosis,diagnosis_summary)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     run_id,
                     project_id,
@@ -98,6 +136,7 @@ class SQLiteCIRepository:
                     payload,
                     retry_count,
                     next_check_at.isoformat() if next_check_at else None,
+                    *unknown_values,
                 ),
             )
         else:
@@ -105,6 +144,15 @@ class SQLiteCIRepository:
                 raise sqlite3.IntegrityError(
                     "CI identity conflicts with pull request ownership"
                 )
+            if row["unknown_since"] is not None and unknown_since is not None:
+                if (row["unknown_since"], row["unknown_deadline_at"]) != unknown_values[
+                    :2
+                ]:
+                    raise sqlite3.IntegrityError("active CI grace period is immutable")
+                if unknown_observation_count < row["unknown_observation_count"]:
+                    raise sqlite3.IntegrityError(
+                        "active CI observation count cannot regress"
+                    )
             run_id = row["id"]
             # A terminal run may be observed again but never regressed.
             previous = CIOverallStatus(row["overall_status"])
@@ -121,7 +169,9 @@ class SQLiteCIRepository:
             self.connection.execute(
                 """UPDATE ci_runs SET overall_status=?,failure_classification=?,
                 external_workflow_run_id=?,completed_at=COALESCE(completed_at,?),last_checked_at=?,
-                summary_json=?,retry_count=?,next_check_at=? WHERE id=?""",
+                summary_json=?,retry_count=?,next_check_at=?,unknown_since=?,
+                unknown_deadline_at=?,unknown_observation_count=?,diagnosis=?,
+                diagnosis_summary=? WHERE id=?""",
                 (
                     status,
                     classification,
@@ -131,6 +181,7 @@ class SQLiteCIRepository:
                     payload,
                     retry_count,
                     next_check_at.isoformat() if next_check_at else None,
+                    *unknown_values,
                     run_id,
                 ),
             )
@@ -222,6 +273,11 @@ class SQLiteCIRepository:
             parse(row["next_check_at"]),
             checks,
             tuple(filter(None, (row["external_workflow_run_id"] or "").split(","))),
+            parse(row["unknown_since"]),
+            parse(row["unknown_deadline_at"]),
+            row["unknown_observation_count"],
+            CIDiagnosis(row["diagnosis"]) if row["diagnosis"] else None,
+            row["diagnosis_summary"],
         )
 
     def latest(self, milestone_id: str) -> CIRunRecord | None:

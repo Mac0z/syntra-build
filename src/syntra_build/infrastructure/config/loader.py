@@ -11,6 +11,7 @@ from syntra_build.infrastructure.config.models import (
     ApplicationConfig,
     ArchitectConfig,
     BackupConfig,
+    CIConfig,
     CodexConfig,
     ConfigurationError,
     DatabaseConfig,
@@ -70,6 +71,8 @@ ENVIRONMENT_KEYS = frozenset(
         "SYNTRA_REPOSITORY_PROVISIONING_CONCURRENCY",
         "SYNTRA_MERGE_CONCURRENCY",
         "SYNTRA_CI_CONCURRENCY",
+        "SYNTRA_CI_MISSING_GRACE_SECONDS",
+        "SYNTRA_CI_MISSING_MAX_OBSERVATIONS",
         "SYNTRA_MESSAGING_CONCURRENCY",
         "SYNTRA_RECOVERY_CONCURRENCY",
         "SYNTRA_INTERNAL_CONCURRENCY",
@@ -219,6 +222,7 @@ def load_config(
     architect = _group(source, "architect")
     codex = _group(source, "codex")
     github = _group(source, "github")
+    ci = _group(source, "ci")
     scheduler = _group(source, "scheduler")
     retries = _group(source, "retries")
     logging = _group(source, "logging")
@@ -321,6 +325,28 @@ def load_config(
             owner=str(_pick(github, "owner", env, "SYNTRA_GITHUB_OWNER", "")) or None,
             api_timeout_seconds=_float(
                 "github.api_timeout_seconds", github.get("api_timeout_seconds", 30.0)
+            ),
+        ),
+        ci=CIConfig(
+            missing_grace_seconds=_float(
+                "ci.missing_grace_seconds",
+                _pick(
+                    ci,
+                    "missing_grace_seconds",
+                    env,
+                    "SYNTRA_CI_MISSING_GRACE_SECONDS",
+                    600.0,
+                ),
+            ),
+            missing_max_observations=_int(
+                "ci.missing_max_observations",
+                _pick(
+                    ci,
+                    "missing_max_observations",
+                    env,
+                    "SYNTRA_CI_MISSING_MAX_OBSERVATIONS",
+                    20,
+                ),
             ),
         ),
         scheduler=SchedulerConfig(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
 from syntra_build.domain.identifiers import MilestoneId, ProjectId
@@ -17,6 +18,23 @@ class CIOverallStatus(StrEnum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     UNKNOWN = "UNKNOWN"
+
+
+class CIWorkflowPresence(StrEnum):
+    UNKNOWN = "UNKNOWN"
+    MISSING = "MISSING"
+    CONFIGURED = "CONFIGURED"
+
+
+class CIDiagnosis(StrEnum):
+    MISSING_WORKFLOW = "MISSING_WORKFLOW"
+    NO_APPLICABLE_RUN = "NO_APPLICABLE_RUN"
+    NO_REQUIRED_CHECKS = "NO_REQUIRED_CHECKS"
+    UNRESOLVED_CHECKS = "UNRESOLVED_CHECKS"
+    PROVIDER_AUTHENTICATION = "PROVIDER_AUTHENTICATION"
+    PROVIDER_REJECTION = "PROVIDER_REJECTION"
+    PROVIDER_MALFORMED = "PROVIDER_MALFORMED"
+    PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
 
 
 class CICheckStatus(StrEnum):
@@ -61,6 +79,8 @@ class CIObservation:
 
     checks: tuple[CICheck, ...]
     external_workflow_run_ids: tuple[str, ...] = ()
+    workflow_presence: CIWorkflowPresence = CIWorkflowPresence.UNKNOWN
+    workflow_status: CIOverallStatus | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +92,9 @@ class CIProgress:
     head_sha: str
     overall_status: CIOverallStatus
     required_checks: tuple[CICheck, ...]
+    diagnosis: CIDiagnosis | None = None
+    diagnosis_summary: str | None = None
+    next_check_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -25,6 +25,8 @@ from syntra_build.domain.ci import (
     CICheckConclusion,
     CICheckStatus,
     CIObservation,
+    CIOverallStatus,
+    CIWorkflowPresence,
 )
 from syntra_build.infrastructure.config import ApplicationConfig
 
@@ -63,7 +65,9 @@ class GitHubActionsAdapter:
         self._transport = transport
         self._metrics = metrics or NoOpMetricsRecorder()
 
-    def _request(self, method: str, path: str) -> Mapping[str, object] | None:
+    def _request(
+        self, method: str, path: str, *, allow_not_found: bool = False
+    ) -> Mapping[str, object] | list[object] | None:
         request = Request(
             f"{_API_ROOT}{path}",
             method=method,
@@ -88,6 +92,8 @@ class GitHubActionsAdapter:
             raise CIProviderError(
                 CIProviderFailure.TRANSIENT, "GitHub CI is temporarily unavailable"
             )
+        if response.status == 404 and allow_not_found:
+            return None
         expected = {200} if method == "GET" else {201}
         if response.status not in expected:
             raise CIProviderError(
@@ -101,7 +107,7 @@ class GitHubActionsAdapter:
             raise CIProviderError(
                 CIProviderFailure.MALFORMED, "GitHub CI response was malformed"
             ) from error
-        if not isinstance(payload, Mapping):
+        if not isinstance(payload, Mapping | list):
             raise CIProviderError(
                 CIProviderFailure.MALFORMED, "GitHub CI response was unexpected"
             )
@@ -109,9 +115,9 @@ class GitHubActionsAdapter:
 
     def _get(self, path: str) -> Mapping[str, object]:
         payload = self._request("GET", path)
-        if payload is None:
+        if not isinstance(payload, Mapping):
             raise CIProviderError(
-                CIProviderFailure.MALFORMED, "GitHub CI response was empty"
+                CIProviderFailure.MALFORMED, "GitHub CI response was unexpected"
             )
         return payload
 
@@ -159,11 +165,23 @@ class GitHubActionsAdapter:
                     CIProviderFailure.MALFORMED,
                     "workflow run pull-request identity was missing",
                 )
-            numbers = {
-                item.get("number")
-                for item in pull_requests
-                if isinstance(item, Mapping)
-            }
+            numbers: set[int] = set()
+            for pull_request in pull_requests:
+                number = (
+                    pull_request.get("number")
+                    if isinstance(pull_request, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(number, int)
+                    or isinstance(number, bool)
+                    or number < 1
+                ):
+                    raise CIProviderError(
+                        CIProviderFailure.MALFORMED,
+                        "workflow run pull-request identity was malformed",
+                    )
+                numbers.add(number)
             if (
                 run.get("head_sha") == head_sha
                 and run.get("event") == "pull_request"
@@ -197,7 +215,83 @@ class GitHubActionsAdapter:
                 job_page += 1
         # Stable identity removes duplicate jobs returned during page movement.
         unique = {item.external_check_id: item for item in checks}
-        return CIObservation(tuple(unique.values()), tuple(run_ids))
+        presence = (
+            CIWorkflowPresence.UNKNOWN
+            if unique
+            else self._workflow_presence(repo, head_sha)
+        )
+        return CIObservation(
+            tuple(unique.values()),
+            tuple(run_ids),
+            presence,
+            self._workflow_status(applicable),
+        )
+
+    def _workflow_presence(self, repo: str, head_sha: str) -> CIWorkflowPresence:
+        """Discover workflow files at the monitored revision, not the default branch."""
+        query = urlencode({"ref": head_sha})
+        payload = self._request(
+            "GET",
+            f"/repos/{repo}/contents/.github/workflows?{query}",
+            allow_not_found=True,
+        )
+        # GitHub can hide inaccessible Contents behind a 404 even while Actions
+        # remains readable. Prove Contents access at the exact head before using
+        # a workflow-directory 404 as evidence of missing infrastructure.
+        if payload is None:
+            root = self._request("GET", f"/repos/{repo}/contents?{query}")
+            self._directory_entries(root, "")
+            return CIWorkflowPresence.MISSING
+        entries = self._directory_entries(payload, ".github/workflows/")
+        return (
+            CIWorkflowPresence.CONFIGURED
+            if any(
+                item["type"] == "file" and str(item["name"]).endswith((".yml", ".yaml"))
+                for item in entries
+            )
+            else CIWorkflowPresence.MISSING
+        )
+
+    @staticmethod
+    def _directory_entries(
+        payload: Mapping[str, object] | list[object] | None, prefix: str
+    ) -> list[Mapping[str, object]]:
+        if not isinstance(payload, list):
+            raise CIProviderError(
+                CIProviderFailure.MALFORMED, "workflow contents were malformed"
+            )
+        entries: list[Mapping[str, object]] = []
+        for item in payload:
+            if not isinstance(item, Mapping):
+                raise CIProviderError(
+                    CIProviderFailure.MALFORMED, "workflow contents were malformed"
+                )
+            name, path, kind = item.get("name"), item.get("path"), item.get("type")
+            if (
+                not isinstance(name, str)
+                or not name
+                or "/" in name
+                or path != f"{prefix}{name}"
+                or not isinstance(kind, str)
+                or kind not in {"file", "dir", "symlink", "submodule"}
+            ):
+                raise CIProviderError(
+                    CIProviderFailure.MALFORMED, "workflow file identity was malformed"
+                )
+            entries.append(item)
+        return entries
+
+    @staticmethod
+    def _workflow_status(runs: list[Mapping[str, object]]) -> CIOverallStatus | None:
+        """Expose startup only: workflow conclusions cannot prove required jobs passed."""
+        statuses = {
+            status for run in runs if isinstance(status := run.get("status"), str)
+        }
+        if "in_progress" in statuses:
+            return CIOverallStatus.RUNNING
+        if statuses.intersection({"queued", "waiting", "requested", "pending"}):
+            return CIOverallStatus.QUEUED
+        return None
 
     def rerun(self, repository_full_name: str, workflow_run_id: str) -> None:
         self._recorded(lambda: self._rerun(repository_full_name, workflow_run_id))

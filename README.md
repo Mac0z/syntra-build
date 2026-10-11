@@ -42,8 +42,8 @@ files.
 The application-facing configuration entry point is
 `syntra_build.infrastructure.config.load_config`. It returns one immutable,
 validated configuration object with groups for filesystem and database paths,
-external integrations, scheduling, retries, logging, metrics, backups, and
-resource thresholds. Production defaults use `/opt/syntra-build`,
+external integrations, CI monitoring, scheduling, retries, logging, metrics,
+backups, and resource thresholds. Production defaults use `/opt/syntra-build`,
 `/etc/syntra-build`, `/var/lib/syntra-build`, and `/var/log/syntra-build`;
 tests and development tools should inject temporary absolute roots instead.
 
@@ -157,6 +157,7 @@ and protected GitHub token configuration.
 - [M6A target-host development deployment](docs/DEVELOPMENT_DEPLOYMENT.md)
 - [M30 service, administration, backup, and systemd operations](docs/OPERATIONS_M30.md)
 - [Trusted CI bootstrap for generated repositories](docs/trusted-ci-bootstrap.md)
+- [Bounded monitoring for missing required CI](docs/missing-ci-monitoring.md)
 - [Implementation specification](SPEC.md)
 - [Engineering instructions](AGENTS.md)
 - [Design documents](docs/)

@@ -1323,6 +1323,24 @@ MIGRATIONS: tuple[Migration, ...] = (
                 SELECT RAISE(ABORT,'CI intents are preservation-oriented'); END""",
         ),
     ),
+    Migration(
+        version=30,
+        name="030_bounded_unknown_ci",
+        statements=(
+            "ALTER TABLE ci_runs ADD COLUMN unknown_since TEXT",
+            """ALTER TABLE ci_runs ADD COLUMN unknown_deadline_at TEXT
+                CHECK((unknown_since IS NULL AND unknown_deadline_at IS NULL)
+                    OR (unknown_since IS NOT NULL AND unknown_deadline_at IS NOT NULL
+                        AND unknown_deadline_at>=unknown_since))""",
+            """ALTER TABLE ci_runs ADD COLUMN unknown_observation_count INTEGER
+                NOT NULL DEFAULT 0 CHECK(unknown_observation_count>=0)""",
+            """ALTER TABLE ci_runs ADD COLUMN diagnosis TEXT CHECK(diagnosis IS NULL OR
+                diagnosis IN ('MISSING_WORKFLOW','NO_APPLICABLE_RUN','NO_REQUIRED_CHECKS',
+                    'UNRESOLVED_CHECKS','PROVIDER_AUTHENTICATION','PROVIDER_REJECTION',
+                    'PROVIDER_MALFORMED','PROVIDER_UNAVAILABLE'))""",
+            "ALTER TABLE ci_runs ADD COLUMN diagnosis_summary TEXT",
+        ),
+    ),
 )
 
 
